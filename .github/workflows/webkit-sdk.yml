@@ -27,7 +27,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     env:
-      WEBKIT_DIR: C:\w\WebKit
+      WEBKIT_DIR: D:\w\WebKit
     steps:
       - name: Checkout
         uses: actions/checkout@v4
