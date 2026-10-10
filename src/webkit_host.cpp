@@ -1,0 +1,225 @@
+#include "webkit_host.h"
+
+#include "util.h"
+
+namespace lumen {
+
+namespace {
+
+std::wstring toWide(WKStringRef string)
+{
+    if (!string)
+        return { };
+
+    const size_t maximumSize = WKStringGetMaximumUTF8CStringSize(string);
+    if (!maximumSize)
+        return { };
+
+    std::string utf8(maximumSize, '\0');
+    const size_t written = WKStringGetUTF8CString(string, utf8.data(), maximumSize);
+    // The returned count includes the terminating NUL.
+    utf8.resize(written > 0 ? written - 1 : 0);
+    return fromUtf8(utf8);
+}
+
+std::wstring toWide(WKURLRef url)
+{
+    if (!url)
+        return { };
+
+    auto string = adoptWK(WKURLCopyString(url));
+    return toWide(string.get());
+}
+
+WKRetainPtr<WKURLRef> makeUrl(const std::wstring& value)
+{
+    const std::string utf8 = toUtf8(value);
+    return adoptWK(WKURLCreateWithUTF8CString(utf8.c_str()));
+}
+
+} // namespace
+
+// ---------------------------------------------------------------- WebView
+
+WebView::~WebView()
+{
+    // Stop callbacks from reaching a destroyed object.
+    if (auto* webPage = page())
+        WKPageSetPageStateClient(webPage, nullptr);
+}
+
+HWND WebView::hwnd() const
+{
+    return m_view ? WKViewGetWindow(m_view.get()) : nullptr;
+}
+
+WKPageRef WebView::page() const
+{
+    return m_view ? WKViewGetPage(m_view.get()) : nullptr;
+}
+
+void WebView::load(const std::wstring& address)
+{
+    auto* webPage = page();
+    auto url = makeUrl(address);
+    if (webPage && url)
+        WKPageLoadURL(webPage, url.get());
+}
+
+void WebView::goBack()
+{
+    if (auto* webPage = page(); webPage && WKPageCanGoBack(webPage))
+        WKPageGoBack(webPage);
+}
+
+void WebView::goForward()
+{
+    if (auto* webPage = page(); webPage && WKPageCanGoForward(webPage))
+        WKPageGoForward(webPage);
+}
+
+void WebView::reloadOrStop()
+{
+    auto* webPage = page();
+    if (!webPage)
+        return;
+
+    if (WKPageGetEstimatedProgress(webPage) < 1.0)
+        WKPageStopLoading(webPage);
+    else
+        WKPageReload(webPage);
+}
+
+bool WebView::canGoBack() const
+{
+    auto* webPage = page();
+    return webPage && WKPageCanGoBack(webPage);
+}
+
+bool WebView::canGoForward() const
+{
+    auto* webPage = page();
+    return webPage && WKPageCanGoForward(webPage);
+}
+
+double WebView::progress() const
+{
+    auto* webPage = page();
+    return webPage ? WKPageGetEstimatedProgress(webPage) : 1.0;
+}
+
+void WebView::refreshState()
+{
+    auto* webPage = page();
+    if (!webPage)
+        return;
+
+    auto title = adoptWK(WKPageCopyTitle(webPage));
+    auto url = adoptWK(WKPageCopyActiveURL(webPage));
+    m_title = toWide(title.get());
+    m_url = toWide(url.get());
+}
+
+void WebView::didChange(const void* clientInfo)
+{
+    auto* self = const_cast<WebView*>(static_cast<const WebView*>(clientInfo));
+    if (self && self->onChanged)
+        self->onChanged();
+}
+
+void WebView::didChangeTitleOrUrl(const void* clientInfo)
+{
+    auto* self = const_cast<WebView*>(static_cast<const WebView*>(clientInfo));
+    if (!self)
+        return;
+
+    self->refreshState();
+    if (self->onChanged)
+        self->onChanged();
+}
+
+// ------------------------------------------------------------- WebKitHost
+
+bool WebKitHost::initialize(std::wstring& error)
+{
+    m_dataStoreConfiguration = adoptWK(WKWebsiteDataStoreConfigurationCreate());
+    if (!m_dataStoreConfiguration) {
+        error = L"Could not create the website data store configuration.";
+        return false;
+    }
+
+    m_dataStore = adoptWK(WKWebsiteDataStoreCreateWithConfiguration(m_dataStoreConfiguration.get()));
+    if (!m_dataStore) {
+        error = L"Could not create the website data store.";
+        return false;
+    }
+
+    m_contextConfiguration = adoptWK(WKContextConfigurationCreate());
+    if (!m_contextConfiguration) {
+        error = L"Could not create the WebKit context configuration.";
+        return false;
+    }
+
+    m_context = adoptWK(WKContextCreateWithConfiguration(m_contextConfiguration.get()));
+    if (!m_context) {
+        error = L"Could not create the WebKit context.";
+        return false;
+    }
+
+    m_preferences = adoptWK(WKPreferencesCreate());
+    if (!m_preferences) {
+        error = L"Could not create WebKit preferences.";
+        return false;
+    }
+
+    m_pageConfiguration = adoptWK(WKPageConfigurationCreate());
+    if (!m_pageConfiguration) {
+        error = L"Could not create the page configuration.";
+        return false;
+    }
+
+    WKPageConfigurationSetWebsiteDataStore(m_pageConfiguration.get(), m_dataStore.get());
+    WKPageConfigurationSetContext(m_pageConfiguration.get(), m_context.get());
+    WKPageConfigurationSetPreferences(m_pageConfiguration.get(), m_preferences.get());
+
+    log(L"WebKit initialized.");
+    return true;
+}
+
+std::unique_ptr<WebView> WebKitHost::createView(HWND parent)
+{
+    auto webView = std::make_unique<WebView>();
+
+    RECT initialRect { };
+    webView->m_view = adoptWK(WKViewCreate(initialRect, m_pageConfiguration.get(), parent));
+    if (!webView->m_view) {
+        log(L"WKViewCreate failed.");
+        return nullptr;
+    }
+
+    WKViewSetIsInWindow(webView->m_view.get(), true);
+
+    auto* webPage = webView->page();
+    if (!webPage) {
+        log(L"WKViewGetPage returned null.");
+        return nullptr;
+    }
+
+    WKPageStateClientV0 client { };
+    client.base.version = 0;
+    client.base.clientInfo = webView.get();
+    client.didChangeIsLoading = &WebView::didChange;
+    client.didChangeTitle = &WebView::didChangeTitleOrUrl;
+    client.didChangeActiveURL = &WebView::didChangeTitleOrUrl;
+    client.didChangeEstimatedProgress = &WebView::didChange;
+    client.didChangeCanGoBack = &WebView::didChange;
+    client.didChangeCanGoForward = &WebView::didChange;
+    WKPageSetPageStateClient(webPage, &client.base);
+
+    const UINT dpi = GetDpiForWindow(parent);
+    WKPageSetCustomBackingScaleFactor(webPage, dpi ? static_cast<double>(dpi) / 96.0 : 1.0);
+
+    return webView;
+}
+
+} // namespace lumen

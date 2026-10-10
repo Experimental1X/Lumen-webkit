@@ -1,0 +1,7 @@
+build/
+dist/
+sdk/
+sdk-dl/
+sdk-out/
+*.user
+.vs/
