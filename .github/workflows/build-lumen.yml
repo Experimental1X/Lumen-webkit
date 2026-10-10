@@ -1,0 +1,67 @@
+name: build-lumen
+
+# Compiles Lumen against the prebuilt WebKit SDK. Run the webkit-sdk workflow
+# first; this one fails early with a clear message if no SDK release exists.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_tag:
+        description: "SDK release tag to use (blank = latest release)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download WebKit SDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SDK_TAG: ${{ github.event.inputs.sdk_tag }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path sdk-dl | Out-Null
+          if ($env:SDK_TAG) {
+            gh release download $env:SDK_TAG --repo $env:GITHUB_REPOSITORY --pattern "webkit-sdk-win-x64.zip" --dir sdk-dl --clobber
+          } else {
+            gh release download --repo $env:GITHUB_REPOSITORY --pattern "webkit-sdk-win-x64.zip" --dir sdk-dl --clobber
+          }
+          if ($LASTEXITCODE -ne 0) { throw "No WebKit SDK release found. Run the 'webkit-sdk' workflow first." }
+          Expand-Archive -Path sdk-dl\webkit-sdk-win-x64.zip -DestinationPath sdk -Force
+          Get-Content sdk\VERSION.txt
+
+      - name: Configure
+        shell: powershell
+        run: |
+          cmake -S . -B build -A x64 "-DLUMEN_SDK_DIR=$env:GITHUB_WORKSPACE\sdk" -DLUMEN_COPY_RUNTIME=OFF
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed." }
+
+      - name: Build
+        shell: powershell
+        run: |
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "Build failed." }
+
+      - name: Package
+        shell: powershell
+        run: |
+          $pkg = "dist\Lumen"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item -Path "sdk\runtime\*" -Destination $pkg -Recurse -Force
+          Copy-Item -Path "build\Release\Lumen.exe" -Destination $pkg -Force
+          Compress-Archive -Path "$pkg\*" -DestinationPath "dist\Lumen-windows-x64.zip" -Force
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-windows-x64
+          path: dist/Lumen-windows-x64.zip
+          if-no-files-found: error
