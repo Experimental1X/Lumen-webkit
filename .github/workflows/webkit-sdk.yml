@@ -1,0 +1,175 @@
+name: webkit-sdk
+
+# Builds WebKit once and publishes a "WebKit SDK" zip as a GitHub Release.
+# The build-lumen workflow then compiles the app against that SDK in minutes.
+#
+# A full WebKit build can take longer than a single hosted-runner job allows,
+# so the build is resumable: the build directory is cached even when the step
+# times out. If the run ends with "WebKit build incomplete", just run the
+# workflow again and it continues where it stopped.
+
+on:
+  workflow_dispatch:
+    inputs:
+      webkit_sha:
+        description: "Optional full 40-character WebKit commit SHA (blank = current main)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: webkit-sdk
+  cancel-in-progress: false
+
+jobs:
+  sdk:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      WEBKIT_DIR: C:\w\WebKit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Report disk space
+        shell: powershell
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+
+      - name: Configure git
+        shell: powershell
+        run: |
+          git config --global core.autocrlf input
+          git config --global core.longpaths true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        shell: powershell
+        run: |
+          $common = @("--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity", "--silent")
+          foreach ($pkg in @("Git.Git", "Kitware.CMake", "Ninja-build.Ninja", "RubyInstallerTeam.Ruby.3.2", "ApacheFriends.Xampp.8.2", "LLVM.LLVM")) {
+            winget install @common --scope=machine --id $pkg
+          }
+          winget install @common --id GnuWin32.Gperf
+          python -m pip install --upgrade pip
+          python -m pip install pywin32
+
+      - name: Resolve WebKit commit
+        id: webkit-sha
+        env:
+          WEBKIT_SHA_INPUT: ${{ github.event.inputs.webkit_sha }}
+        shell: powershell
+        run: |
+          $sha = $env:WEBKIT_SHA_INPUT
+          if ([string]::IsNullOrWhiteSpace($sha)) {
+            $head = git ls-remote https://github.com/WebKit/WebKit.git HEAD
+            if ($LASTEXITCODE -ne 0) { throw "Could not query the WebKit repository." }
+            $sha = $head.Split("`t")[0].Trim()
+          }
+          $sha = $sha.Trim().ToLowerInvariant()
+          if ($sha -notmatch '^[0-9a-f]{40}$') { throw "WebKit revision must be a full 40-character SHA." }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sha=$sha"
+
+      - name: Restore WebKit source cache
+        id: cache-src
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WEBKIT_DIR }}
+          key: lumen-webkit-src-${{ steps.webkit-sha.outputs.sha }}
+
+      - name: Clone WebKit
+        if: steps.cache-src.outputs.cache-hit != 'true'
+        env:
+          WEBKIT_SHA: ${{ steps.webkit-sha.outputs.sha }}
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path (Split-Path $env:WEBKIT_DIR) | Out-Null
+          git -c core.longpaths=true clone --depth 1 --single-branch https://github.com/WebKit/WebKit.git $env:WEBKIT_DIR
+          git -C $env:WEBKIT_DIR fetch --depth 1 origin $env:WEBKIT_SHA
+          git -C $env:WEBKIT_DIR checkout --force $env:WEBKIT_SHA
+          $actual = (git -C $env:WEBKIT_DIR rev-parse HEAD).Trim()
+          if ($actual -ne $env:WEBKIT_SHA) { throw "Checkout mismatch: expected $env:WEBKIT_SHA, got $actual" }
+
+      - name: Patch rewrite-compile-commands (Windows guard)
+        shell: powershell
+        run: |
+          $script = Join-Path $env:WEBKIT_DIR "Tools\Scripts\rewrite-compile-commands"
+          if (-not (Test-Path $script)) { Write-Host "rewrite-compile-commands not present; skipping."; exit 0 }
+          $content = Get-Content -Raw $script
+          $old = "    parent_dir_1, parent_dir_2 = entry_file.rsplit(os.path.sep, maxsplit=4)[1:3]"
+          $new = "    parts = entry_file.rsplit(os.path.sep, maxsplit=4)`n    if len(parts) < 3:`n        continue`n    parent_dir_1, parent_dir_2 = parts[1:3]"
+          if ($content.Contains($old)) {
+            Set-Content -Path $script -Value $content.Replace($old, $new) -NoNewline
+          } else {
+            Write-Host "Patch target not found; skipping."
+          }
+
+      - name: Restore WebKit build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.WEBKIT_DIR }}/WebKitBuild
+          key: lumen-webkit-build-${{ steps.webkit-sha.outputs.sha }}-none
+          restore-keys: |
+            lumen-webkit-build-${{ steps.webkit-sha.outputs.sha }}-
+
+      - name: Build WebKit
+        id: build
+        continue-on-error: true
+        timeout-minutes: 285
+        shell: powershell
+        run: .\scripts\build-webkit.ps1 -WebKitDir $env:WEBKIT_DIR
+
+      - name: Save WebKit build cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.WEBKIT_DIR }}/WebKitBuild
+          key: lumen-webkit-build-${{ steps.webkit-sha.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Stop if the build is incomplete
+        if: steps.build.outcome != 'success'
+        shell: powershell
+        run: |
+          Write-Host "WebKit build incomplete (it failed or ran out of time)."
+          Write-Host "If it only ran out of time, run this workflow again: progress was cached."
+          Write-Host "If it failed with a compiler or script error, copy that error from the 'Build WebKit' step."
+          exit 1
+
+      - name: Package SDK
+        env:
+          WEBKIT_SHA: ${{ steps.webkit-sha.outputs.sha }}
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path sdk-out | Out-Null
+          .\scripts\package-sdk.ps1 -WebKitDir $env:WEBKIT_DIR -OutDir "$env:GITHUB_WORKSPACE\sdk-out" -WebKitSha $env:WEBKIT_SHA
+
+      - name: Upload SDK (backup copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkit-sdk-win-x64
+          path: sdk-out/webkit-sdk-win-x64.zip
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Publish SDK release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBKIT_SHA: ${{ steps.webkit-sha.outputs.sha }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $tag = "webkit-sdk-" + $env:WEBKIT_SHA.Substring(0, 12)
+          $zip = Join-Path $env:GITHUB_WORKSPACE "sdk-out\webkit-sdk-win-x64.zip"
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag $zip --repo $env:GITHUB_REPOSITORY --title "WebKit SDK $tag" --notes "Prebuilt WebKit (Windows x64, Release) at commit $env:WEBKIT_SHA."
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the SDK release failed." }
