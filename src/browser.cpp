@@ -9,6 +9,11 @@
 #include <cstring>
 #include <cwchar>
 
+// Defined in <commctrl.h>, which is not included with WIN32_LEAN_AND_MEAN.
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER 0x1501
+#endif
+
 namespace lumen {
 
 using namespace gfx;
