@@ -1,12 +1,10 @@
-// Lumen: a WebKit-based browser for Windows.
+// Lumen: a WebKit-based browser for Windows with a Safari-style interface.
 //
-// This file is deliberately small. The window currently hosts a single web
-// view with no custom chrome; the browser UI is added in later milestones
-// (see docs/ROADMAP.md). Its job right now is to prove that the app links
-// against the prebuilt WebKit SDK and that WebKit actually renders a page.
+// This file owns the main window and forwards messages to Browser (see
+// browser.h), which draws the chrome and manages the tabs.
 
+#include "browser.h"
 #include "util.h"
-#include "webkit_host.h"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -18,17 +16,9 @@ namespace {
 
 constexpr wchar_t kWindowClass[] = L"LumenMainWindow";
 constexpr wchar_t kAppName[] = L"Lumen";
-constexpr wchar_t kStartUrl[] = L"https://www.wikipedia.org";
-
-struct App {
-    lumen::WebKitHost host;
-    std::unique_ptr<lumen::WebView> view;
-    HWND window { nullptr };
-};
 
 // WebKit starts helper processes from the same folder as the executable.
-// Check up front so a missing file produces a readable message instead of a
-// blank window.
+// Check up front so a missing file produces a readable message.
 bool verifyRuntimeFiles(std::wstring& missing)
 {
     static const wchar_t* const required[] = {
@@ -48,86 +38,180 @@ bool verifyRuntimeFiles(std::wstring& missing)
     return missing.empty();
 }
 
-void layoutViews(App& app)
+HACCEL createAccelerators()
 {
-    if (!app.view)
-        return;
+    using namespace lumen;
 
-    RECT client { };
-    GetClientRect(app.window, &client);
-    MoveWindow(app.view->hwnd(), 0, 0, client.right, client.bottom, TRUE);
-}
-
-void updateTitle(App& app)
-{
-    if (!app.view)
-        return;
-
-    std::wstring title = app.view->title();
-    title = title.empty() ? std::wstring(kAppName) : title + L" \u2014 " + kAppName;
-    SetWindowTextW(app.window, title.c_str());
+    ACCEL keys[] = {
+        { FCONTROL | FVIRTKEY, 'T', kCmdNewTab },
+        { FCONTROL | FVIRTKEY, 'W', kCmdCloseTab },
+        { FCONTROL | FVIRTKEY, 'L', kCmdFocusAddress },
+        { FCONTROL | FVIRTKEY, 'R', kCmdReload },
+        { FVIRTKEY, VK_F5, kCmdReload },
+        { FALT | FVIRTKEY, VK_LEFT, kCmdBack },
+        { FALT | FVIRTKEY, VK_RIGHT, kCmdForward },
+        { FCONTROL | FVIRTKEY, VK_OEM_4, kCmdBack },
+        { FCONTROL | FVIRTKEY, VK_OEM_6, kCmdForward },
+        { FCONTROL | FVIRTKEY, VK_OEM_PLUS, kCmdZoomIn },
+        { FCONTROL | FVIRTKEY, VK_ADD, kCmdZoomIn },
+        { FCONTROL | FVIRTKEY, VK_OEM_MINUS, kCmdZoomOut },
+        { FCONTROL | FVIRTKEY, VK_SUBTRACT, kCmdZoomOut },
+        { FCONTROL | FVIRTKEY, '0', kCmdZoomReset },
+        { FCONTROL | FVIRTKEY, VK_TAB, kCmdNextTab },
+        { FCONTROL | FSHIFT | FVIRTKEY, VK_TAB, kCmdPrevTab },
+    };
+    return CreateAcceleratorTableW(keys, static_cast<int>(sizeof(keys) / sizeof(keys[0])));
 }
 
 LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     if (message == WM_NCCREATE) {
         auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        auto* app = static_cast<App*>(create->lpCreateParams);
-        app->window = window;
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-        return TRUE;
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        return DefWindowProcW(window, message, wParam, lParam);
     }
 
-    auto* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    auto* browser = reinterpret_cast<lumen::Browser*>(GetWindowLongPtrW(window, GWLP_USERDATA));
 
     switch (message) {
     case WM_CREATE: {
         std::wstring error;
-        if (!app->host.initialize(error)) {
-            lumen::log(L"Initialization failed: " + error);
+        if (!browser->create(window, error)) {
+            lumen::log(L"Startup failed: " + error);
             MessageBoxW(window, error.c_str(), kAppName, MB_OK | MB_ICONERROR);
             return -1;
         }
+        return 0;
+    }
 
-        app->view = app->host.createView(window);
-        if (!app->view) {
-            MessageBoxW(window, L"Could not create a web view. See lumen.log.", kAppName, MB_OK | MB_ICONERROR);
-            return -1;
+    case WM_NCCALCSIZE:
+        if (wParam) {
+            // Remove the native title bar but keep the thin resize borders,
+            // shadow and snapping: let the default procedure compute the
+            // client rectangle, then give the caption height back to us.
+            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            const LONG originalTop = params->rgrc[0].top;
+            const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
+            if (IsZoomed(window)) {
+                const UINT dpi = GetDpiForWindow(window);
+                const int frame = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)
+                    + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                params->rgrc[0].top = originalTop + frame;
+            } else
+                params->rgrc[0].top = originalTop;
+            return result;
         }
+        break;
 
-        app->view->onChanged = [app] { updateTitle(*app); };
-        layoutViews(*app);
-        app->view->load(kStartUrl);
+    case WM_NCHITTEST: {
+        const LRESULT hit = DefWindowProcW(window, message, wParam, lParam);
+        if (browser)
+            return browser->onNcHitTest(hit, POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+        return hit;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT paint { };
+        HDC dc = BeginPaint(window, &paint);
+        if (browser)
+            browser->onPaint(dc);
+        EndPaint(window, &paint);
         return 0;
     }
 
     case WM_SIZE:
-        if (app)
-            layoutViews(*app);
+        if (browser)
+            browser->onSize();
         return 0;
+
+    case WM_LBUTTONDOWN:
+        if (browser && browser->onLeftButtonDown(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }))
+            return 0;
+        break;
+
+    case WM_MOUSEMOVE:
+        if (browser) {
+            if (!browser->trackingMouse()) {
+                TRACKMOUSEEVENT track { sizeof(track), TME_LEAVE, window, 0 };
+                if (TrackMouseEvent(&track))
+                    browser->setTrackingMouse(true);
+            }
+            browser->onMouseMove(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        if (browser) {
+            browser->setTrackingMouse(false);
+            browser->onMouseLeave();
+        }
+        return 0;
+
+    case WM_NCMOUSEMOVE:
+        if (browser)
+            browser->onNcMouseMove();
+        break;
+
+    case WM_MOUSEWHEEL:
+        if (browser && browser->onMouseWheel(wParam, lParam))
+            return 0;
+        break;
+
+    case WM_SETFOCUS:
+        if (browser)
+            browser->onSetFocus();
+        return 0;
+
+    case WM_ACTIVATE:
+        if (browser && LOWORD(wParam) != WA_INACTIVE)
+            browser->onSetFocus();
+        break;
+
+    case WM_CTLCOLOREDIT:
+        if (browser) {
+            const LRESULT brush = browser->onCtlColorEdit(reinterpret_cast<HDC>(wParam), reinterpret_cast<HWND>(lParam));
+            if (brush)
+                return brush;
+        }
+        break;
+
+    case WM_SETTINGCHANGE:
+        if (browser)
+            browser->onSettingChange(lParam);
+        break;
+
+    case WM_COMMAND:
+        // lParam is zero for menu and accelerator commands; notifications
+        // from child controls (the address field) are ignored.
+        if (browser && lParam == 0) {
+            browser->onCommand(LOWORD(wParam));
+            return 0;
+        }
+        break;
 
     case WM_DPICHANGED: {
         const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(window, nullptr, suggested->left, suggested->top,
             suggested->right - suggested->left, suggested->bottom - suggested->top,
             SWP_NOZORDER | SWP_NOACTIVATE);
-        if (app && app->view) {
-            const UINT dpi = HIWORD(wParam);
-            WKPageSetCustomBackingScaleFactor(app->view->page(), static_cast<double>(dpi) / 96.0);
-        }
+        if (browser)
+            browser->onDpiChanged();
         return 0;
     }
 
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-        info->ptMinTrackSize.x = 640;
-        info->ptMinTrackSize.y = 420;
+        info->ptMinTrackSize.x = 780;
+        info->ptMinTrackSize.y = 480;
         return 0;
     }
 
     case WM_DESTROY:
-        if (app)
-            app->view.reset();
+        if (browser)
+            browser->destroy();
         PostQuitMessage(0);
         return 0;
 
@@ -138,14 +222,8 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-} // namespace
-
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
+int run(HINSTANCE instance, int showCommand)
 {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-    lumen::log(L"Starting Lumen.");
-
     std::wstring missing;
     if (!verifyRuntimeFiles(missing)) {
         const std::wstring text = L"These WebKit files are missing next to Lumen.exe:\n\n" + missing
@@ -160,32 +238,57 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     windowClass.lpfnWndProc = windowProcedure;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    windowClass.hbrBackground = nullptr;
     windowClass.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&windowClass)) {
         MessageBoxW(nullptr, L"Could not register the window class.", kAppName, MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    App app;
+    lumen::Browser browser;
     HWND window = CreateWindowExW(
         0,
         kWindowClass,
         kAppName,
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 840,
-        nullptr, nullptr, instance, &app);
+        nullptr, nullptr, instance, &browser);
     if (!window)
         return 1;
+
+    HACCEL accelerators = createAccelerators();
 
     ShowWindow(window, showCommand);
     UpdateWindow(window);
 
     MSG message { };
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (accelerators && TranslateAcceleratorW(window, accelerators, &message))
+            continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
 
+    if (accelerators)
+        DestroyAcceleratorTable(accelerators);
+
     return static_cast<int>(message.wParam);
+}
+
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
+{
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    lumen::log(L"Starting Lumen.");
+
+    ULONG_PTR gdiplusToken = 0;
+    Gdiplus::GdiplusStartupInput gdiplusInput;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusInput, nullptr);
+
+    const int exitCode = run(instance, showCommand);
+
+    Gdiplus::GdiplusShutdown(gdiplusToken);
+    return exitCode;
 }

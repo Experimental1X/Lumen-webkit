@@ -2,6 +2,8 @@
 
 #include "util.h"
 
+#include <algorithm>
+
 namespace lumen {
 
 namespace {
@@ -64,6 +66,51 @@ void WebView::load(const std::wstring& address)
     auto url = makeUrl(address);
     if (webPage && url)
         WKPageLoadURL(webPage, url.get());
+}
+
+void WebView::loadHtml(const std::string& utf8Html)
+{
+    auto* webPage = page();
+    if (!webPage)
+        return;
+
+    auto html = adopt(WKStringCreateWithUTF8CString(utf8Html.c_str()));
+    auto baseUrl = makeUrl(L"about:blank");
+    WKPageLoadHTMLString(webPage, html.get(), baseUrl.get());
+}
+
+void WebView::setVisible(bool visible)
+{
+    if (!m_view)
+        return;
+
+    WKViewSetIsInWindow(m_view.get(), visible);
+    if (HWND window = hwnd())
+        ShowWindow(window, visible ? SW_SHOW : SW_HIDE);
+}
+
+void WebView::focus()
+{
+    if (HWND window = hwnd())
+        SetFocus(window);
+}
+
+void WebView::setBackingScale(double scale)
+{
+    if (auto* webPage = page())
+        WKPageSetCustomBackingScaleFactor(webPage, scale);
+}
+
+double WebView::zoom() const
+{
+    auto* webPage = page();
+    return webPage ? WKPageGetPageZoomFactor(webPage) : 1.0;
+}
+
+void WebView::setZoom(double factor)
+{
+    if (auto* webPage = page())
+        WKPageSetPageZoomFactor(webPage, std::clamp(factor, 0.3, 5.0));
 }
 
 void WebView::goBack()
@@ -142,6 +189,14 @@ void WebView::didChangeTitleOrUrl(const void* clientInfo)
 
 bool WebKitHost::initialize(std::wstring& error)
 {
+    // Experiment for the rendering glitches seen in the first build: ask
+    // WebKit to paint on the CPU instead of the GPU. Helper processes inherit
+    // this environment variable. Set LUMEN_GPU=1 before launching to skip it.
+    if (!GetEnvironmentVariableW(L"LUMEN_GPU", nullptr, 0)) {
+        SetEnvironmentVariableW(L"WEBKIT_SKIA_ENABLE_CPU_RENDERING", L"1");
+        log(L"CPU rendering requested (set LUMEN_GPU=1 to disable).");
+    }
+
     m_dataStoreConfiguration = adopt(WKWebsiteDataStoreConfigurationCreate());
     if (!m_dataStoreConfiguration) {
         error = L"Could not create the website data store configuration.";

@@ -32,6 +32,12 @@ public:
     WKPageRef page() const;
 
     void load(const std::wstring& url);
+    void loadHtml(const std::string& utf8Html);
+    void setVisible(bool visible);
+    void focus();
+    void setBackingScale(double scale);
+    double zoom() const;
+    void setZoom(double factor);
     void goBack();
     void goForward();
     void reloadOrStop();

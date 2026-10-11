@@ -30,6 +30,7 @@ endif ()
 
 add_executable(Lumen WIN32
     src/main.cpp
+    src/browser.cpp
     src/util.cpp
     src/webkit_host.cpp
 )
@@ -50,6 +51,8 @@ target_link_libraries(Lumen PRIVATE
     "${_lumen_webkit_lib}"
     user32
     gdi32
+    gdiplus
+    advapi32
     shell32
 )
 

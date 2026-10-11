@@ -7,6 +7,9 @@ namespace lumen {
 std::string toUtf8(const std::wstring& value);
 std::wstring fromUtf8(const std::string& value);
 
+// Percent-encodes a string for use in a URL query.
+std::wstring percentEncode(const std::wstring& value);
+
 // Appends a timestamped line to lumen.log next to the executable. Used to
 // diagnose problems on machines without a debugger.
 void log(const std::wstring& message);

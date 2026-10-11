@@ -35,6 +35,26 @@ std::wstring fromUtf8(const std::string& value)
     return result;
 }
 
+std::wstring percentEncode(const std::wstring& value)
+{
+    static constexpr char hex[] = "0123456789ABCDEF";
+    const std::string utf8 = toUtf8(value);
+
+    std::string encoded;
+    encoded.reserve(utf8.size() * 3);
+    for (unsigned char byte : utf8) {
+        if ((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9')
+            || byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+            encoded.push_back(static_cast<char>(byte));
+            continue;
+        }
+        encoded.push_back('%');
+        encoded.push_back(hex[(byte >> 4) & 0x0F]);
+        encoded.push_back(hex[byte & 0x0F]);
+    }
+    return fromUtf8(encoded);
+}
+
 std::wstring executableDirectory()
 {
     wchar_t path[MAX_PATH * 2] { };
