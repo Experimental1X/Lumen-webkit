@@ -36,6 +36,7 @@ constexpr int kTabGap = 4;
 constexpr int kTabMinWidth = 96;
 constexpr int kTrafficLightSize = 12;
 constexpr int kTrafficLightGap = 8;
+constexpr int kSidebarWidth = 280;
 
 bool isStartPage(const std::wstring& url)
 {
@@ -107,6 +108,7 @@ bool Browser::create(HWND window, std::wstring& error)
     m_window = window;
     updateFont();
     applyTheme(systemUsesDarkMode());
+    m_library.load();
 
     if (!m_host.initialize(error))
         return false;
@@ -123,6 +125,13 @@ bool Browser::create(HWND window, std::wstring& error)
 void Browser::destroy()
 {
     m_tabs.clear();
+    m_closedTabs.clear();
+}
+
+void Browser::reapTabs()
+{
+    // Safe point: no message about these tabs is on the stack any more.
+    m_closedTabs.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -306,11 +315,12 @@ void Browser::resize()
         if (!viewWindow)
             continue;
 
+        const int viewLeft = m_sidebarVisible ? std::min(px(kSidebarWidth), static_cast<int>(client.right)) : 0;
         MoveWindow(
             viewWindow,
-            0,
+            viewLeft,
             l.totalHeight,
-            client.right,
+            std::max<int>(0, static_cast<int>(client.right) - viewLeft),
             std::max<int>(0, static_cast<int>(client.bottom - l.totalHeight)),
             TRUE);
     }
@@ -329,6 +339,9 @@ WebView* Browser::active() const
 
 bool Browser::newTab(const std::wstring& url)
 {
+    // Opening a tab leaves the overview; activateTab shows the right view.
+    m_overview = false;
+
     auto view = m_host.createView(m_window);
     if (!view)
         return false;
@@ -344,6 +357,7 @@ bool Browser::newTab(const std::wstring& url)
     else
         raw->load(url);
 
+    InvalidateRect(m_window, nullptr, FALSE);
     return true;
 }
 
@@ -357,6 +371,10 @@ void Browser::closeTab(size_t index)
         return;
     }
 
+    // Take the tab out of the list first, so nothing that runs while it is
+    // being hidden can reach it, and destroy it later (see reapTabs). Destroying
+    // a web view in the middle of the message that closed it was crashing.
+    std::unique_ptr<WebView> closing = std::move(m_tabs[index]);
     m_tabs.erase(m_tabs.begin() + static_cast<std::ptrdiff_t>(index));
 
     if (m_active >= m_tabs.size())
@@ -364,7 +382,17 @@ void Browser::closeTab(size_t index)
     else if (m_active > index)
         --m_active;
 
+    m_hover = HitResult { };
+    m_overviewHoverCard = -1;
+    m_overviewHoverClose = false;
+
+    closing->onChanged = nullptr;
+    closing->setVisible(false);
+    m_closedTabs.push_back(std::move(closing));
+    PostMessageW(m_window, kMsgReapTabs, 0, 0);
+
     activateTab(m_active);
+    InvalidateRect(m_window, nullptr, FALSE);
 }
 
 void Browser::activateTab(size_t index)
@@ -372,14 +400,23 @@ void Browser::activateTab(size_t index)
     if (index >= m_tabs.size())
         return;
 
+    // Remember what the tab we are leaving looks like, for the overview.
+    if (!m_overview && index != m_active) {
+        WebView* leaving = active();
+        if (leaving && leaving->hwnd() && IsWindowVisible(leaving->hwnd()) && !IsIconic(m_window))
+            captureThumbnail(*leaving);
+    }
+
     m_active = index;
     for (size_t i = 0; i < m_tabs.size(); ++i)
-        m_tabs[i]->setVisible(i == index);
+        m_tabs[i]->setVisible(!m_overview && i == index);
 
     resize();
     updateWindowTitle();
 
-    if (!m_editing)
+    if (m_overview)
+        SetFocus(m_window);
+    else if (!m_editing)
         m_tabs[index]->focus();
     invalidateChrome();
 }
@@ -393,6 +430,10 @@ void Browser::onViewChanged(WebView* view)
 {
     if (view == active())
         updateWindowTitle();
+
+    if (view && m_library.visit(view->url(), view->title()) && m_sidebarVisible && m_sidebarMode == 2 && !m_overview)
+        InvalidateRect(m_window, nullptr, FALSE);
+
     invalidateChrome();
 }
 
@@ -586,16 +627,28 @@ void Browser::showPageMenu()
     if (!menu)
         return;
 
+    auto* view = active();
+    const int zoomPercent = view ? static_cast<int>(view->zoom() * 100.0 + 0.5) : 100;
+
     AppendMenuW(menu, MF_STRING, kCmdNewTab, L"New Tab\tCtrl+T");
     AppendMenuW(menu, MF_STRING, kCmdCloseTab, L"Close Tab\tCtrl+W");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kCmdReload, L"Reload Page\tCtrl+R");
-    AppendMenuW(menu, MF_STRING, kCmdStartPage, L"Show Start Page");
+    AppendMenuW(menu, MF_STRING, kCmdSidebar, m_sidebarVisible ? L"Hide Sidebar\tCtrl+Shift+L" : L"Show Sidebar\tCtrl+Shift+L");
+    AppendMenuW(menu, MF_STRING, kCmdTabOverview, m_overview ? L"Hide Tab Overview\tCtrl+Shift+\\" : L"Show Tab Overview\tCtrl+Shift+\\");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdBookmarkPage, L"Add Bookmark\tCtrl+D");
+    AppendMenuW(menu, MF_STRING, kCmdReadingList, L"Add to Reading List\tCtrl+Shift+D");
     AppendMenuW(menu, MF_STRING, kCmdCopyLink, L"Copy Link");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdReload, L"Reload Page\tCtrl+R");
+    AppendMenuW(menu, MF_STRING, kCmdStartPage, L"Show Start Page");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, (L"Zoom: " + std::to_wstring(zoomPercent) + L"%").c_str());
     AppendMenuW(menu, MF_STRING, kCmdZoomIn, L"Zoom In\tCtrl++");
     AppendMenuW(menu, MF_STRING, kCmdZoomOut, L"Zoom Out\tCtrl+-");
     AppendMenuW(menu, MF_STRING, kCmdZoomReset, L"Actual Size\tCtrl+0");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdClearHistory, L"Clear History");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdCloseWindow, L"Quit Lumen");
 
@@ -606,38 +659,20 @@ void Browser::showPageMenu()
     DestroyMenu(menu);
 }
 
-void Browser::showTabOverview(const ChromeLayout& l)
+void Browser::showShareMenu()
 {
     HMENU menu = CreatePopupMenu();
     if (!menu)
         return;
 
-    for (size_t i = 0; i < m_tabs.size(); ++i) {
-        std::wstring label = tabTitle(*m_tabs[i]);
-        if (label.size() > 48) {
-            label.resize(45);
-            label += L"...";
-        }
+    AppendMenuW(menu, MF_STRING, kCmdCopyLink, L"Copy Link");
+    AppendMenuW(menu, MF_STRING, kCmdBookmarkPage, L"Add Bookmark");
+    AppendMenuW(menu, MF_STRING, kCmdReadingList, L"Add to Reading List");
 
-        std::wstring escaped;
-        for (wchar_t ch : label) {
-            escaped += ch;
-            if (ch == L'&')
-                escaped += L'&';
-        }
-
-        UINT flags = MF_STRING;
-        if (i == m_active)
-            flags |= MF_CHECKED;
-        AppendMenuW(menu, flags, static_cast<UINT_PTR>(kCmdTabBase + i), escaped.c_str());
-    }
-
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kCmdNewTab, L"New Tab");
-
-    POINT point { l.overviewButton.right, l.rightGroup.bottom + px(4) };
+    const ChromeLayout l = layout();
+    POINT point { l.shareButton.left, l.rightGroup.bottom + px(4) };
     ClientToScreen(m_window, &point);
-    TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_TOPALIGN, point.x, point.y, 0, m_window, nullptr);
+    TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, point.x, point.y, 0, m_window, nullptr);
     DestroyMenu(menu);
 }
 
@@ -729,7 +764,20 @@ void Browser::onCommand(UINT command)
         copyLink();
         break;
     case kCmdSidebar:
-        MessageBoxW(m_window, L"The sidebar (bookmarks, reading list, history) is planned for a later milestone.", L"Lumen", MB_OK | MB_ICONINFORMATION);
+        toggleSidebar();
+        break;
+    case kCmdTabOverview:
+        showOverview();
+        break;
+    case kCmdBookmarkPage:
+        bookmarkCurrent();
+        break;
+    case kCmdReadingList:
+        readingListCurrent();
+        break;
+    case kCmdClearHistory:
+        m_library.clearHistory();
+        InvalidateRect(m_window, nullptr, FALSE);
         break;
     case kCmdMinimize:
         ShowWindow(m_window, SW_MINIMIZE);
@@ -816,13 +864,76 @@ void Browser::clearHover()
     invalidateChrome();
 }
 
-void Browser::onMouseMove(POINT point) { updateHover(point); }
-void Browser::onMouseLeave() { clearHover(); }
-void Browser::onNcMouseMove() { clearHover(); }
+void Browser::onMouseMove(POINT point)
+{
+    const int top = chromeHeight();
+    if (point.y < top) {
+        updateHover(point);
+        return;
+    }
+
+    clearHover();
+
+    RECT client { };
+    GetClientRect(m_window, &client);
+    const POINT local { point.x, point.y - top };
+    if (m_overview)
+        overviewMove(local, client.right);
+    else if (m_sidebarVisible)
+        sidebarMove(local, std::max(0, static_cast<int>(client.bottom) - top));
+}
+
+void Browser::onMouseLeave()
+{
+    clearHover();
+
+    if (m_overviewHoverCard != -1 || m_sidebarHoverRow != -1) {
+        m_overviewHoverCard = -1;
+        m_overviewHoverClose = false;
+        m_sidebarHoverRow = -1;
+        m_sidebarHoverClose = false;
+        InvalidateRect(m_window, nullptr, FALSE);
+    }
+}
+
+void Browser::onNcMouseMove()
+{
+    clearHover();
+}
+
+bool Browser::onKeyDown(WPARAM key)
+{
+    if (m_overview && key == VK_ESCAPE) {
+        hideOverview();
+        return true;
+    }
+    return false;
+}
 
 bool Browser::onLeftButtonDown(POINT point)
 {
     const ChromeLayout l = layout();
+
+    // Below the toolbar: only reached when the main window itself is clicked
+    // (the sidebar or the tab overview), not a page.
+    if (point.y >= l.totalHeight) {
+        if (m_editing) {
+            SetFocus(m_window);
+            endAddressEdit();
+        }
+
+        RECT client { };
+        GetClientRect(m_window, &client);
+        const int height = std::max(0, static_cast<int>(client.bottom - l.totalHeight));
+        const POINT local { point.x, point.y - l.totalHeight };
+
+        if (m_overview)
+            return overviewClick(local, client.right, height);
+        if (m_sidebarVisible)
+            return sidebarClick(local, height);
+        return false;
+    }
+
     const HitResult hit = hitTest(point, l);
 
     if (m_editing && hit.target != Target::Address) {
@@ -861,13 +972,13 @@ bool Browser::onLeftButtonDown(POINT point)
         beginAddressEdit();
         return true;
     case Target::Share:
-        onCommand(kCmdCopyLink);
+        showShareMenu();
         return true;
     case Target::NewTab:
         onCommand(kCmdNewTab);
         return true;
     case Target::TabOverview:
-        showTabOverview(l);
+        onCommand(kCmdTabOverview);
         return true;
     case Target::Tab:
         activateTab(hit.tab);
@@ -945,15 +1056,38 @@ void Browser::onSetFocus()
 
 bool Browser::onMouseWheel(WPARAM wParam, LPARAM lParam)
 {
-    // If the main window receives the wheel (focus was not on the page),
-    // hand it to the page. The guard stops a forwarding loop, since an
-    // unhandled wheel message is passed back up to this window.
+    // If the main window receives the wheel (focus was not on the page, or the
+    // cursor is over the sidebar or the tab overview), handle it here;
+    // otherwise hand it to the page. The guard stops a forwarding loop, since
+    // an unhandled wheel message is passed back up to this window.
     if (m_forwardingWheel)
         return false;
 
+    POINT point { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    ScreenToClient(m_window, &point);
+
+    RECT client { };
+    GetClientRect(m_window, &client);
+    const int top = chromeHeight();
+    const int height = std::max(0, static_cast<int>(client.bottom) - top);
+    const int step = MulDiv(GET_WHEEL_DELTA_WPARAM(wParam), px(60), 120);
+
+    if (point.y >= top) {
+        if (m_overview) {
+            m_overviewScroll = std::clamp(m_overviewScroll - step, 0, overviewMaxScroll(client.right, height));
+            InvalidateRect(m_window, nullptr, FALSE);
+            return true;
+        }
+        if (m_sidebarVisible && point.x < px(kSidebarWidth)) {
+            m_sidebarScroll = std::clamp(m_sidebarScroll - step, 0, sidebarMaxScroll(height));
+            InvalidateRect(m_window, nullptr, FALSE);
+            return true;
+        }
+    }
+
     auto* view = active();
     HWND target = view ? view->hwnd() : nullptr;
-    if (!target)
+    if (!target || m_overview)
         return false;
 
     m_forwardingWheel = true;
@@ -982,14 +1116,31 @@ void Browser::onPaint(HDC target)
     GetClientRect(m_window, &client);
 
     const ChromeLayout l = layout();
+    const int width = client.right;
+    const int contentHeight = std::max(0, static_cast<int>(client.bottom - l.totalHeight));
+    const RECT content { 0, l.totalHeight, width, l.totalHeight + contentHeight };
 
-    // Page area behind the web views.
-    const RECT below { 0, l.totalHeight, client.right, client.bottom };
-    fillSolid(target, below, m_theme.page);
+    if (m_overview) {
+        paintBuffered(target, content, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
+    } else {
+        // Page area behind the web views.
+        fillSolid(target, content, m_theme.page);
+
+        if (m_sidebarVisible) {
+            const RECT panel { 0, l.totalHeight, std::min(px(kSidebarWidth), width), l.totalHeight + contentHeight };
+            paintBuffered(target, panel, [&](HDC dc) { paintSidebar(dc, panel.right - panel.left, contentHeight); });
+        }
+    }
 
     // The chrome is drawn into an off-screen bitmap to avoid flicker.
-    const int width = client.right;
-    const int height = l.totalHeight;
+    const RECT chrome { 0, 0, width, l.totalHeight };
+    paintBuffered(target, chrome, [&](HDC dc) { paintChrome(dc, l); });
+}
+
+void Browser::paintBuffered(HDC target, const RECT& area, const std::function<void(HDC)>& draw)
+{
+    const int width = area.right - area.left;
+    const int height = area.bottom - area.top;
     if (width <= 0 || height <= 0)
         return;
 
@@ -997,12 +1148,32 @@ void Browser::onPaint(HDC target)
     HBITMAP bitmap = CreateCompatibleBitmap(target, width, height);
     HGDIOBJ previous = SelectObject(memory, bitmap);
 
-    paintChrome(memory, l);
-    BitBlt(target, 0, 0, width, height, memory, 0, 0, SRCCOPY);
+    draw(memory);
+    BitBlt(target, area.left, area.top, width, height, memory, 0, 0, SRCCOPY);
 
     SelectObject(memory, previous);
     DeleteObject(bitmap);
     DeleteDC(memory);
+}
+
+void Browser::drawLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text, RECT rect, COLORREF color, UINT flags) const
+{
+    g.Flush(Gdiplus::FlushIntentionSync);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dc, m_font));
+    DrawTextW(dc, text.c_str(), -1, &rect, flags);
+    SelectObject(dc, oldFont);
+}
+
+int Browser::measureLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text) const
+{
+    g.Flush(Gdiplus::FlushIntentionSync);
+    RECT rect { 0, 0, 0, 0 };
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dc, m_font));
+    DrawTextW(dc, text.c_str(), -1, &rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, oldFont);
+    return static_cast<int>(rect.right - rect.left);
 }
 
 void Browser::paintChrome(HDC dc, const ChromeLayout& l)
@@ -1103,14 +1274,21 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     fillRoundedRect(g, l.pill, pillRadius, pillColor);
 
     if (!m_editing && loading) {
+        // Safari shows load progress as a thin line along the bottom edge of
+        // the address field, clipped to the field's rounded shape.
         Gdiplus::GraphicsPath clipPath;
         addRoundedRect(clipPath, toRectF(l.pill), static_cast<Gdiplus::REAL>(pillRadius));
         g.SetClip(&clipPath);
 
-        RECT bar = l.pill;
+        const int lineHeight = std::max(2, px(2));
         const double shown = std::clamp(progress, 0.06, 1.0);
-        bar.right = bar.left + static_cast<LONG>((l.pill.right - l.pill.left) * shown);
-        Gdiplus::SolidBrush progressBrush(toGdiColor(m_theme.accent, m_theme.dark ? 90 : 60));
+        const RECT bar {
+            l.pill.left,
+            l.pill.bottom - lineHeight,
+            l.pill.left + static_cast<LONG>((l.pill.right - l.pill.left) * shown),
+            l.pill.bottom
+        };
+        Gdiplus::SolidBrush progressBrush(toGdiColor(m_theme.accent));
         g.FillRectangle(&progressBrush, toRectF(bar));
         g.ResetClip();
     }
@@ -1206,5 +1384,551 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
 
     g.Flush(Gdiplus::FlushIntentionSync);
 }
+
+// ---------------------------------------------------------------------------
+// Library actions
+// ---------------------------------------------------------------------------
+
+RECT Browser::contentArea() const
+{
+    RECT client { };
+    GetClientRect(m_window, &client);
+    client.top = chromeHeight();
+    return client;
+}
+
+void Browser::bookmarkCurrent()
+{
+    auto* view = active();
+    if (!view || isStartPage(view->url()))
+        return;
+
+    m_library.addBookmark(view->url(), tabTitle(*view));
+
+    // Show the result, like Safari opening the sidebar on Bookmarks.
+    m_sidebarVisible = true;
+    m_sidebarMode = 0;
+    m_sidebarScroll = 0;
+    if (m_overview)
+        hideOverview();
+    resize();
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+void Browser::readingListCurrent()
+{
+    auto* view = active();
+    if (!view || isStartPage(view->url()))
+        return;
+
+    m_library.addToReadingList(view->url(), tabTitle(*view));
+
+    m_sidebarVisible = true;
+    m_sidebarMode = 1;
+    m_sidebarScroll = 0;
+    if (m_overview)
+        hideOverview();
+    resize();
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// Tab overview
+// ---------------------------------------------------------------------------
+
+void Browser::captureThumbnail(WebView& view)
+{
+    HWND window = view.hwnd();
+    if (!window || !IsWindowVisible(window) || IsIconic(m_window))
+        return;
+
+    RECT rect { };
+    if (!GetWindowRect(window, &rect))
+        return;
+
+    const int sourceWidth = static_cast<int>(rect.right - rect.left);
+    const int sourceHeight = static_cast<int>(rect.bottom - rect.top);
+    if (sourceWidth <= 0 || sourceHeight <= 0)
+        return;
+
+    const int thumbWidth = 480;
+    const int thumbHeight = std::max(1, sourceHeight * thumbWidth / sourceWidth);
+
+    // Copy what is on screen: the page is composited by the graphics system,
+    // so reading the window's own surface would not work reliably.
+    HDC screen = GetDC(nullptr);
+    if (!screen)
+        return;
+
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    SetStretchBltMode(memory, HALFTONE);
+    SetBrushOrgEx(memory, 0, 0, nullptr);
+    const BOOL copied = StretchBlt(
+        memory, 0, 0, thumbWidth, thumbHeight,
+        screen, rect.left, rect.top, sourceWidth, sourceHeight,
+        SRCCOPY | CAPTUREBLT);
+    SelectObject(memory, previous);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+
+    if (copied)
+        view.setThumbnail(bitmap);
+    else
+        DeleteObject(bitmap);
+}
+
+void Browser::showOverview()
+{
+    if (m_overview) {
+        hideOverview();
+        return;
+    }
+
+    endAddressEdit();
+
+    if (auto* view = active())
+        captureThumbnail(*view);
+
+    m_overview = true;
+    m_overviewScroll = 0;
+    m_overviewHoverCard = -1;
+    m_overviewHoverClose = false;
+
+    for (const auto& tab : m_tabs)
+        tab->setVisible(false);
+
+    SetFocus(m_window);
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+void Browser::hideOverview()
+{
+    if (!m_overview)
+        return;
+
+    m_overview = false;
+    m_overviewHoverCard = -1;
+    m_overviewHoverClose = false;
+
+    for (size_t i = 0; i < m_tabs.size(); ++i)
+        m_tabs[i]->setVisible(i == m_active);
+
+    resize();
+    if (auto* view = active())
+        view->focus();
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+std::vector<Browser::OverviewCard> Browser::overviewLayout(int width) const
+{
+    std::vector<OverviewCard> cards;
+
+    const int count = static_cast<int>(m_tabs.size());
+    if (count == 0)
+        return cards;
+
+    const int cardWidth = px(260);
+    const int thumbHeight = cardWidth * 10 / 16;
+    const int titleHeight = px(34);
+    const int gap = px(28);
+    const int margin = px(48);
+    const int top = px(40);
+
+    const int columns = std::clamp((width - margin * 2 + gap) / (cardWidth + gap), 1, count);
+    const int gridWidth = columns * cardWidth + (columns - 1) * gap;
+    const int left = (width - gridWidth) / 2;
+
+    for (int i = 0; i < count; ++i) {
+        const int row = i / columns;
+        const int column = i % columns;
+        const int x = left + column * (cardWidth + gap);
+        const int y = top + row * (thumbHeight + titleHeight + gap) - m_overviewScroll;
+
+        OverviewCard card;
+        card.thumb = { x, y, x + cardWidth, y + thumbHeight };
+        card.card = { x, y, x + cardWidth, y + thumbHeight + titleHeight };
+        card.close = { x + px(8), y + px(8), x + px(8) + px(24), y + px(8) + px(24) };
+        card.title = { x, y + thumbHeight + px(6), x + cardWidth, y + thumbHeight + titleHeight };
+        cards.push_back(card);
+    }
+
+    return cards;
+}
+
+int Browser::overviewMaxScroll(int width, int height) const
+{
+    const int count = static_cast<int>(m_tabs.size());
+    if (count == 0)
+        return 0;
+
+    const int cardWidth = px(260);
+    const int rowHeight = cardWidth * 10 / 16 + px(34) + px(28);
+    const int columns = std::clamp((width - px(48) * 2 + px(28)) / (cardWidth + px(28)), 1, count);
+    const int rows = (count + columns - 1) / columns;
+    const int total = px(40) + rows * rowHeight + px(20);
+    return std::max(0, total - height);
+}
+
+bool Browser::overviewClick(POINT local, int width, int height)
+{
+    (void)height;
+    const std::vector<OverviewCard> cards = overviewLayout(width);
+
+    for (size_t i = 0; i < cards.size(); ++i) {
+        if (PtInRect(&cards[i].close, local)) {
+            closeTab(i);
+            return true;
+        }
+        if (PtInRect(&cards[i].card, local)) {
+            m_overview = false;
+            m_overviewHoverCard = -1;
+            m_overviewHoverClose = false;
+            activateTab(i);
+            InvalidateRect(m_window, nullptr, FALSE);
+            return true;
+        }
+    }
+
+    // A click on the empty background returns to the page.
+    hideOverview();
+    return true;
+}
+
+void Browser::overviewMove(POINT local, int width)
+{
+    const std::vector<OverviewCard> cards = overviewLayout(width);
+
+    int hoverCard = -1;
+    bool hoverClose = false;
+    for (size_t i = 0; i < cards.size(); ++i) {
+        if (PtInRect(&cards[i].card, local)) {
+            hoverCard = static_cast<int>(i);
+            hoverClose = PtInRect(&cards[i].close, local) != FALSE;
+            break;
+        }
+    }
+
+    if (hoverCard == m_overviewHoverCard && hoverClose == m_overviewHoverClose)
+        return;
+
+    m_overviewHoverCard = hoverCard;
+    m_overviewHoverClose = hoverClose;
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+void Browser::paintOverview(HDC dc, int width, int height)
+{
+    const RECT whole { 0, 0, width, height };
+    fillSolid(dc, whole, m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
+
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+    const float k = scaleFactor();
+    const int radius = px(10);
+    const std::vector<OverviewCard> cards = overviewLayout(width);
+
+    for (size_t i = 0; i < cards.size(); ++i) {
+        const OverviewCard& card = cards[i];
+        if (card.card.bottom < 0 || card.card.top > height)
+            continue;
+
+        const WebView& view = *m_tabs[i];
+        const bool isActive = i == m_active;
+        const bool hot = static_cast<int>(i) == m_overviewHoverCard;
+
+        // Picture of the page.
+        fillRoundedRect(g, card.thumb, radius, m_theme.page);
+        if (HBITMAP bitmap = view.thumbnail()) {
+            Gdiplus::GraphicsPath path;
+            addRoundedRect(path, toRectF(card.thumb), static_cast<Gdiplus::REAL>(radius));
+            g.SetClip(&path);
+            Gdiplus::Bitmap image(bitmap, nullptr);
+            g.DrawImage(&image, toRectF(card.thumb));
+            g.ResetClip();
+        } else if (isStartPage(view.url())) {
+            drawStartPageIcon(g, card.thumb, m_theme.textSecondary, k * 3.0f);
+        }
+
+        strokeRoundedRect(
+            g, card.thumb, radius,
+            isActive ? m_theme.accent : m_theme.tabBorder,
+            isActive ? 3.0f * k : std::max(1.0f, k));
+
+        // Close button, shown on hover (and always for the active tab).
+        if (hot || isActive) {
+            fillRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2,
+                (hot && m_overviewHoverClose) ? m_theme.glassHover : m_theme.glass);
+            strokeRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2, m_theme.glassBorder, std::max(1.0f, k));
+            drawCloseIcon(g, card.close, m_theme.text, k);
+        }
+
+        // Title with the site badge, centered under the picture.
+        const std::wstring title = tabTitle(view);
+        const int iconSize = px(14);
+        const int textWidth = std::min(measureLabel(dc, g, title), std::max(0, static_cast<int>(card.title.right - card.title.left) - iconSize - px(6)));
+        const int groupWidth = iconSize + px(6) + textWidth;
+        const int groupLeft = card.title.left + ((card.title.right - card.title.left) - groupWidth) / 2;
+        const int centerY = (card.title.top + card.title.bottom) / 2;
+        const RECT iconRect { groupLeft, centerY - iconSize / 2, groupLeft + iconSize, centerY - iconSize / 2 + iconSize };
+
+        if (isStartPage(view.url())) {
+            drawStartPageIcon(g, iconRect, m_theme.textSecondary, k);
+        } else {
+            const std::wstring host = hostOf(view.url());
+            drawSiteBadge(g, iconRect, badgeLetter(host), colorFromHue(hueOf(host)), k);
+        }
+
+        const RECT textRect { iconRect.right + px(6), card.title.top, iconRect.right + px(6) + textWidth, card.title.bottom };
+        drawLabel(dc, g, title, textRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+
+    g.Flush(Gdiplus::FlushIntentionSync);
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar
+// ---------------------------------------------------------------------------
+
+const std::vector<LibraryEntry>& Browser::sidebarEntries() const
+{
+    if (m_sidebarMode == 0)
+        return m_library.bookmarks();
+    if (m_sidebarMode == 1)
+        return m_library.readingList();
+    return m_library.history();
+}
+
+Browser::SidebarLayout Browser::sidebarLayout(int height) const
+{
+    SidebarLayout s;
+    s.width = px(kSidebarWidth);
+    s.height = height;
+    s.rowHeight = px(46);
+
+    const int margin = px(12);
+    s.segmented = { margin, margin, s.width - margin, margin + px(30) };
+
+    const int segmentWidth = (s.segmented.right - s.segmented.left) / 3;
+    for (int i = 0; i < 3; ++i) {
+        const int left = s.segmented.left + i * segmentWidth;
+        const int right = i == 2 ? s.segmented.right : left + segmentWidth;
+        s.segments[i] = { left, s.segmented.top, right, s.segmented.bottom };
+    }
+
+    const int footer = m_sidebarMode == 2 ? px(52) : 0;
+    const int listTop = s.segmented.bottom + margin;
+    s.list = { 0, listTop, s.width, std::max(listTop, height - footer) };
+    s.clearButton = { margin, height - px(42), s.width - margin, height - px(12) };
+    return s;
+}
+
+RECT Browser::sidebarRow(const SidebarLayout& layout, size_t index) const
+{
+    const int top = layout.list.top + static_cast<int>(index) * layout.rowHeight - m_sidebarScroll;
+    return { 0, top, layout.width, top + layout.rowHeight };
+}
+
+RECT Browser::sidebarRowClose(const RECT& row) const
+{
+    const int size = px(20);
+    const int right = row.right - px(14);
+    const int top = row.top + ((row.bottom - row.top) - size) / 2;
+    return { right - size, top, right, top + size };
+}
+
+int Browser::sidebarMaxScroll(int height) const
+{
+    const SidebarLayout s = sidebarLayout(height);
+    const int total = static_cast<int>(sidebarEntries().size()) * s.rowHeight;
+    return std::max(0, total - static_cast<int>(s.list.bottom - s.list.top));
+}
+
+void Browser::toggleSidebar()
+{
+    m_sidebarVisible = !m_sidebarVisible;
+    m_sidebarScroll = 0;
+    m_sidebarHoverRow = -1;
+    m_sidebarHoverClose = false;
+
+    if (m_overview)
+        hideOverview();
+
+    resize();
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+bool Browser::sidebarClick(POINT local, int height)
+{
+    const SidebarLayout s = sidebarLayout(height);
+    if (local.x < 0 || local.x >= s.width)
+        return false;
+
+    for (int i = 0; i < 3; ++i) {
+        if (PtInRect(&s.segments[i], local)) {
+            m_sidebarMode = i;
+            m_sidebarScroll = 0;
+            m_sidebarHoverRow = -1;
+            InvalidateRect(m_window, nullptr, FALSE);
+            return true;
+        }
+    }
+
+    if (m_sidebarMode == 2 && PtInRect(&s.clearButton, local)) {
+        m_library.clearHistory();
+        m_sidebarScroll = 0;
+        InvalidateRect(m_window, nullptr, FALSE);
+        return true;
+    }
+
+    if (PtInRect(&s.list, local)) {
+        const std::vector<LibraryEntry>& entries = sidebarEntries();
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const RECT row = sidebarRow(s, i);
+            if (!PtInRect(&row, local))
+                continue;
+
+            const RECT closeRect = sidebarRowClose(row);
+            if (PtInRect(&closeRect, local)) {
+                if (m_sidebarMode == 0)
+                    m_library.removeBookmark(i);
+                else if (m_sidebarMode == 1)
+                    m_library.removeFromReadingList(i);
+                else
+                    m_library.removeFromHistory(i);
+
+                m_sidebarScroll = std::clamp(m_sidebarScroll, 0, sidebarMaxScroll(height));
+                InvalidateRect(m_window, nullptr, FALSE);
+                return true;
+            }
+
+            const std::wstring url = entries[i].url;
+            if (auto* view = active())
+                view->load(url);
+            return true;
+        }
+    }
+
+    return true;
+}
+
+void Browser::sidebarMove(POINT local, int height)
+{
+    const SidebarLayout s = sidebarLayout(height);
+
+    int hoverRow = -1;
+    bool hoverClose = false;
+    if (local.x >= 0 && local.x < s.width && PtInRect(&s.list, local)) {
+        const std::vector<LibraryEntry>& entries = sidebarEntries();
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const RECT row = sidebarRow(s, i);
+            if (!PtInRect(&row, local))
+                continue;
+
+            hoverRow = static_cast<int>(i);
+            const RECT closeRect = sidebarRowClose(row);
+            hoverClose = PtInRect(&closeRect, local) != FALSE;
+            break;
+        }
+    }
+
+    if (hoverRow == m_sidebarHoverRow && hoverClose == m_sidebarHoverClose)
+        return;
+
+    m_sidebarHoverRow = hoverRow;
+    m_sidebarHoverClose = hoverClose;
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+void Browser::paintSidebar(HDC dc, int width, int height)
+{
+    const RECT whole { 0, 0, width, height };
+    fillSolid(dc, whole, m_theme.tabBar);
+
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+    const float k = scaleFactor();
+    const SidebarLayout s = sidebarLayout(height);
+    const std::vector<LibraryEntry>& entries = sidebarEntries();
+
+    // Rows first; the header and footer are painted over them afterwards, so
+    // rows scrolled past the edges are hidden without clipping.
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const RECT row = sidebarRow(s, i);
+        if (row.bottom < s.list.top || row.top > s.list.bottom)
+            continue;
+
+        const bool hot = static_cast<int>(i) == m_sidebarHoverRow;
+        if (hot) {
+            RECT inset = row;
+            InflateRect(&inset, -px(8), -px(2));
+            fillRoundedRect(g, inset, px(8), m_theme.pill);
+        }
+
+        const std::wstring host = hostOf(entries[i].url);
+        const int badge = px(18);
+        const RECT badgeRect { row.left + px(18), row.top + (s.rowHeight - badge) / 2, row.left + px(18) + badge, row.top + (s.rowHeight - badge) / 2 + badge };
+        drawSiteBadge(g, badgeRect, badgeLetter(host), colorFromHue(hueOf(host)), k);
+
+        const int textLeft = badgeRect.right + px(10);
+        const int textRight = row.right - px(44);
+        const std::wstring title = entries[i].title.empty() ? host : entries[i].title;
+        const RECT titleRect { textLeft, row.top + px(5), textRight, row.top + px(5) + px(19) };
+        const RECT hostRect { textLeft, row.top + px(5) + px(19), textRight, row.top + px(5) + px(19) + px(17) };
+        drawLabel(dc, g, title, titleRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        drawLabel(dc, g, host, hostRect, m_theme.textSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        if (hot) {
+            const RECT closeRect = sidebarRowClose(row);
+            if (m_sidebarHoverClose)
+                fillRoundedRect(g, closeRect, (closeRect.bottom - closeRect.top) / 2, m_theme.glassHover);
+            drawCloseIcon(g, closeRect, m_theme.textSecondary, k);
+        }
+    }
+
+    if (entries.empty()) {
+        static const wchar_t* const messages[3] = { L"No Bookmarks", L"No Reading List Items", L"No History" };
+        RECT message { 0, s.list.top, width, s.list.top + px(60) };
+        drawLabel(dc, g, messages[m_sidebarMode], message, m_theme.textSecondary, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    // Header band with the segmented control.
+    const RECT header { 0, 0, width, s.list.top };
+    fillSolid(dc, header, m_theme.tabBar);
+
+    fillRoundedRect(g, s.segmented, px(8), m_theme.pill);
+    static const wchar_t* const names[3] = { L"Bookmarks", L"Reading List", L"History" };
+    for (int i = 0; i < 3; ++i) {
+        const bool selected = i == m_sidebarMode;
+        if (selected) {
+            RECT inset = s.segments[i];
+            InflateRect(&inset, -px(2), -px(2));
+            fillRoundedRect(g, inset, px(6), m_theme.glass);
+            strokeRoundedRect(g, inset, px(6), m_theme.glassBorder, std::max(1.0f, k));
+        }
+        drawLabel(dc, g, names[i], s.segments[i], selected ? m_theme.text : m_theme.textSecondary,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+
+    // Footer with "Clear History" on the History tab.
+    if (m_sidebarMode == 2) {
+        const RECT footer { 0, s.list.bottom, width, height };
+        fillSolid(dc, footer, m_theme.tabBar);
+        fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
+        drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
+    g.Flush(Gdiplus::FlushIntentionSync);
+}
+
 
 } // namespace lumen

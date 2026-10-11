@@ -31,6 +31,7 @@ endif ()
 add_executable(Lumen WIN32
     src/main.cpp
     src/browser.cpp
+    src/library.cpp
     src/util.cpp
     src/webkit_host.cpp
 )

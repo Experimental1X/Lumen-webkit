@@ -22,11 +22,23 @@
 namespace lumen {
 
 class WebKitHost;
+class WebView;
+
+// What WebKit's callbacks point at. It outlives the WebView (a few bytes per
+// tab) so that a late callback after the view is gone finds `owner == nullptr`
+// instead of a dangling pointer.
+struct CallbackTarget {
+    WebView* owner { nullptr };
+};
 
 // One web view (one tab's worth of content). The browser UI owns these.
 class WebView {
 public:
     ~WebView();
+
+    // Last captured picture of the page, shown in the tab overview.
+    HBITMAP thumbnail() const { return m_thumbnail; }
+    void setThumbnail(HBITMAP bitmap);
 
     HWND hwnd() const;
     WKPageRef page() const;
@@ -63,6 +75,8 @@ private:
     Ref<WKViewRef> m_view;
     std::wstring m_title;
     std::wstring m_url;
+    HBITMAP m_thumbnail { nullptr };
+    CallbackTarget* m_target { nullptr };
 };
 
 // Owns the WebKit context shared by every view in the process.

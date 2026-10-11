@@ -45,9 +45,21 @@ Ref<WKURLRef> makeUrl(const std::wstring& value)
 
 WebView::~WebView()
 {
-    // Stop callbacks from reaching a destroyed object.
-    if (auto* webPage = page())
-        WKPageSetPageStateClient(webPage, nullptr);
+    // Detach the callbacks without calling back into WebKit: any late
+    // notification finds a null owner and does nothing.
+    if (m_target)
+        m_target->owner = nullptr;
+    onChanged = nullptr;
+
+    if (m_thumbnail)
+        DeleteObject(m_thumbnail);
+}
+
+void WebView::setThumbnail(HBITMAP bitmap)
+{
+    if (m_thumbnail)
+        DeleteObject(m_thumbnail);
+    m_thumbnail = bitmap;
 }
 
 HWND WebView::hwnd() const
@@ -169,14 +181,16 @@ void WebView::refreshState()
 
 void WebView::didChange(const void* clientInfo)
 {
-    auto* self = const_cast<WebView*>(static_cast<const WebView*>(clientInfo));
+    auto* target = static_cast<const CallbackTarget*>(clientInfo);
+    WebView* self = target ? target->owner : nullptr;
     if (self && self->onChanged)
         self->onChanged();
 }
 
 void WebView::didChangeTitleOrUrl(const void* clientInfo)
 {
-    auto* self = const_cast<WebView*>(static_cast<const WebView*>(clientInfo));
+    auto* target = static_cast<const CallbackTarget*>(clientInfo);
+    WebView* self = target ? target->owner : nullptr;
     if (!self)
         return;
 
@@ -260,9 +274,11 @@ std::unique_ptr<WebView> WebKitHost::createView(HWND parent)
         return nullptr;
     }
 
+    webView->m_target = new CallbackTarget { webView.get() };
+
     WKPageStateClientV0 client { };
     client.base.version = 0;
-    client.base.clientInfo = webView.get();
+    client.base.clientInfo = webView->m_target;
     client.didChangeIsLoading = &WebView::didChange;
     client.didChangeTitle = &WebView::didChangeTitleOrUrl;
     client.didChangeActiveURL = &WebView::didChangeTitleOrUrl;

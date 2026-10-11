@@ -59,6 +59,10 @@ HACCEL createAccelerators()
         { FCONTROL | FVIRTKEY, '0', kCmdZoomReset },
         { FCONTROL | FVIRTKEY, VK_TAB, kCmdNextTab },
         { FCONTROL | FSHIFT | FVIRTKEY, VK_TAB, kCmdPrevTab },
+        { FCONTROL | FVIRTKEY, 'D', kCmdBookmarkPage },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'D', kCmdReadingList },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'L', kCmdSidebar },
+        { FCONTROL | FSHIFT | FVIRTKEY, VK_OEM_5, kCmdTabOverview },
     };
     return CreateAcceleratorTableW(keys, static_cast<int>(sizeof(keys) / sizeof(keys[0])));
 }
@@ -159,6 +163,16 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         if (browser && browser->onMouseWheel(wParam, lParam))
             return 0;
         break;
+
+    case WM_KEYDOWN:
+        if (browser && browser->onKeyDown(wParam))
+            return 0;
+        break;
+
+    case lumen::Browser::kMsgReapTabs:
+        if (browser)
+            browser->reapTabs();
+        return 0;
 
     case WM_SETFOCUS:
         if (browser)
