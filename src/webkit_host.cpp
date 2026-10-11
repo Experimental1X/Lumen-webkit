@@ -27,14 +27,14 @@ std::wstring toWide(WKURLRef url)
     if (!url)
         return { };
 
-    auto string = adoptWK(WKURLCopyString(url));
+    auto string = adopt(WKURLCopyString(url));
     return toWide(string.get());
 }
 
-WKRetainPtr<WKURLRef> makeUrl(const std::wstring& value)
+Ref<WKURLRef> makeUrl(const std::wstring& value)
 {
     const std::string utf8 = toUtf8(value);
-    return adoptWK(WKURLCreateWithUTF8CString(utf8.c_str()));
+    return adopt(WKURLCreateWithUTF8CString(utf8.c_str()));
 }
 
 } // namespace
@@ -114,8 +114,8 @@ void WebView::refreshState()
     if (!webPage)
         return;
 
-    auto title = adoptWK(WKPageCopyTitle(webPage));
-    auto url = adoptWK(WKPageCopyActiveURL(webPage));
+    auto title = adopt(WKPageCopyTitle(webPage));
+    auto url = adopt(WKPageCopyActiveURL(webPage));
     m_title = toWide(title.get());
     m_url = toWide(url.get());
 }
@@ -142,37 +142,37 @@ void WebView::didChangeTitleOrUrl(const void* clientInfo)
 
 bool WebKitHost::initialize(std::wstring& error)
 {
-    m_dataStoreConfiguration = adoptWK(WKWebsiteDataStoreConfigurationCreate());
+    m_dataStoreConfiguration = adopt(WKWebsiteDataStoreConfigurationCreate());
     if (!m_dataStoreConfiguration) {
         error = L"Could not create the website data store configuration.";
         return false;
     }
 
-    m_dataStore = adoptWK(WKWebsiteDataStoreCreateWithConfiguration(m_dataStoreConfiguration.get()));
+    m_dataStore = adopt(WKWebsiteDataStoreCreateWithConfiguration(m_dataStoreConfiguration.get()));
     if (!m_dataStore) {
         error = L"Could not create the website data store.";
         return false;
     }
 
-    m_contextConfiguration = adoptWK(WKContextConfigurationCreate());
+    m_contextConfiguration = adopt(WKContextConfigurationCreate());
     if (!m_contextConfiguration) {
         error = L"Could not create the WebKit context configuration.";
         return false;
     }
 
-    m_context = adoptWK(WKContextCreateWithConfiguration(m_contextConfiguration.get()));
+    m_context = adopt(WKContextCreateWithConfiguration(m_contextConfiguration.get()));
     if (!m_context) {
         error = L"Could not create the WebKit context.";
         return false;
     }
 
-    m_preferences = adoptWK(WKPreferencesCreate());
+    m_preferences = adopt(WKPreferencesCreate());
     if (!m_preferences) {
         error = L"Could not create WebKit preferences.";
         return false;
     }
 
-    m_pageConfiguration = adoptWK(WKPageConfigurationCreate());
+    m_pageConfiguration = adopt(WKPageConfigurationCreate());
     if (!m_pageConfiguration) {
         error = L"Could not create the page configuration.";
         return false;
@@ -191,7 +191,7 @@ std::unique_ptr<WebView> WebKitHost::createView(HWND parent)
     auto webView = std::make_unique<WebView>();
 
     RECT initialRect { };
-    webView->m_view = adoptWK(WKViewCreate(initialRect, m_pageConfiguration.get(), parent));
+    webView->m_view = adopt(WKViewCreate(initialRect, m_pageConfiguration.get(), parent));
     if (!webView->m_view) {
         log(L"WKViewCreate failed.");
         return nullptr;
