@@ -8,7 +8,7 @@
 #include <WebKit/WKPageConfigurationRef.h>
 #include <WebKit/WKPageStateClient.h>
 #include <WebKit/WKPreferencesRef.h>
-#include <WebKit/WKRetainPtr.h>
+#include "webkit_ref.h"
 #include <WebKit/WKString.h>
 #include <WebKit/WKURL.h>
 #include <WebKit/WKView.h>
@@ -54,7 +54,7 @@ private:
     static void didChange(const void* clientInfo);
     static void didChangeTitleOrUrl(const void* clientInfo);
 
-    WKRetainPtr<WKViewRef> m_view;
+    Ref<WKViewRef> m_view;
     std::wstring m_title;
     std::wstring m_url;
 };
@@ -66,12 +66,12 @@ public:
     std::unique_ptr<WebView> createView(HWND parent);
 
 private:
-    WKRetainPtr<WKWebsiteDataStoreConfigurationRef> m_dataStoreConfiguration;
-    WKRetainPtr<WKWebsiteDataStoreRef> m_dataStore;
-    WKRetainPtr<WKContextConfigurationRef> m_contextConfiguration;
-    WKRetainPtr<WKContextRef> m_context;
-    WKRetainPtr<WKPreferencesRef> m_preferences;
-    WKRetainPtr<WKPageConfigurationRef> m_pageConfiguration;
+    Ref<WKWebsiteDataStoreConfigurationRef> m_dataStoreConfiguration;
+    Ref<WKWebsiteDataStoreRef> m_dataStore;
+    Ref<WKContextConfigurationRef> m_contextConfiguration;
+    Ref<WKContextRef> m_context;
+    Ref<WKPreferencesRef> m_preferences;
+    Ref<WKPageConfigurationRef> m_pageConfiguration;
 };
 
 } // namespace lumen
