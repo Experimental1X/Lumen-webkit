@@ -1,0 +1,55 @@
+name: export-sdk-headers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download WebKit SDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path dl | Out-Null
+          gh release download --repo $env:GITHUB_REPOSITORY --pattern "webkit-sdk-win-x64.zip" --dir dl --clobber
+          if ($LASTEXITCODE -ne 0) { throw "No WebKit SDK release found. Run the webkit-sdk workflow first." }
+
+      - name: Unpack
+        shell: powershell
+        run: |
+          Expand-Archive -Path dl\webkit-sdk-win-x64.zip -DestinationPath sdk -Force
+
+      - name: Collect headers and exports
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item -Path sdk\include -Destination out\include -Recurse
+          Copy-Item -Path sdk\MANIFEST.txt, sdk\VERSION.txt -Destination out
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+
+          if ($dumpbin) {
+            & $dumpbin.FullName /exports sdk\runtime\WebKit2.dll | Out-File -Encoding utf8 out\webkit2-exports.txt
+          } else {
+            "dumpbin was not found on this runner." | Out-File -Encoding utf8 out\webkit2-exports.txt
+          }
+
+          Get-ChildItem out -Recurse -File | Measure-Object -Property Length -Sum | Format-List
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkit-headers
+          path: out
+          retention-days: 14
+          if-no-files-found: error
