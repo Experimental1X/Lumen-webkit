@@ -51,8 +51,40 @@ WebView::~WebView()
         m_target->owner = nullptr;
     onChanged = nullptr;
 
+    closePage();
+
+    // A view whose page could not be closed is never released: leaking it is
+    // better than letting WebKit call into freed memory.
+    if (m_leakOnDestroy)
+        m_view.leak();
+
     if (m_thumbnail)
         DeleteObject(m_thumbnail);
+}
+
+void WebView::closePage()
+{
+    if (m_closed)
+        return;
+    m_closed = true;
+
+    auto* webPage = page();
+    if (!webPage)
+        return;
+
+    // WKPageClose is looked up at run time, so a WebKit build without it
+    // cannot break linking; in that case the view is leaked instead.
+    using PageCloseFunction = void (*)(WKPageRef);
+    static const auto pageClose = reinterpret_cast<PageCloseFunction>(
+        GetProcAddress(GetModuleHandleW(L"WebKit2.dll"), "WKPageClose"));
+
+    if (pageClose) {
+        pageClose(webPage);
+        log(L"WKPageClose called.");
+    } else {
+        m_leakOnDestroy = true;
+        log(L"WKPageClose is not exported by WebKit2.dll; the view will be leaked instead of released.");
+    }
 }
 
 void WebView::setThumbnail(HBITMAP bitmap)
@@ -175,8 +207,13 @@ void WebView::refreshState()
 
     auto title = adopt(WKPageCopyTitle(webPage));
     auto url = adopt(WKPageCopyActiveURL(webPage));
-    m_title = toWide(title.get());
-    m_url = toWide(url.get());
+    const std::wstring newTitle = toWide(title.get());
+    const std::wstring newUrl = toWide(url.get());
+
+    // When the address changes before the new page's title arrives, WebKit
+    // still reports the old title. Do not attach it to the new address.
+    m_title = (newUrl != m_url && newTitle == m_title) ? std::wstring() : newTitle;
+    m_url = newUrl;
 }
 
 void WebView::didChange(const void* clientInfo)

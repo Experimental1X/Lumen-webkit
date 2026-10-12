@@ -124,14 +124,33 @@ bool Browser::create(HWND window, std::wstring& error)
 
 void Browser::destroy()
 {
+    if (m_window)
+        KillTimer(m_window, kReapTimer);
     m_tabs.clear();
     m_closedTabs.clear();
 }
 
+void Browser::onTimer(UINT_PTR id)
+{
+    if (id == kReapTimer)
+        reapTabs();
+}
+
 void Browser::reapTabs()
 {
-    // Safe point: no message about these tabs is on the stack any more.
-    m_closedTabs.clear();
+    // Release tabs that have been closed for a while, long after the message
+    // that closed them and after WebKit had time to shut their pages down.
+    const ULONGLONG now = GetTickCount64();
+    for (auto it = m_closedTabs.begin(); it != m_closedTabs.end();) {
+        if (now - it->closedAt >= 5000) {
+            log(L"Releasing a closed tab.");
+            it = m_closedTabs.erase(it);
+        } else
+            ++it;
+    }
+
+    if (m_closedTabs.empty() && m_window)
+        KillTimer(m_window, kReapTimer);
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +344,9 @@ void Browser::resize()
             TRUE);
     }
 
-    invalidateChrome();
+    // Repaint everything: the sidebar and the tab overview are drawn by this
+    // window and must follow every size change.
+    InvalidateRect(m_window, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,8 +409,10 @@ void Browser::closeTab(size_t index)
 
     closing->onChanged = nullptr;
     closing->setVisible(false);
-    m_closedTabs.push_back(std::move(closing));
-    PostMessageW(m_window, kMsgReapTabs, 0, 0);
+    closing->closePage();
+    log(L"Tab closed; it will be released in a few seconds.");
+    m_closedTabs.push_back(ClosedTab { std::move(closing), GetTickCount64() });
+    SetTimer(m_window, kReapTimer, 2000, nullptr);
 
     activateTab(m_active);
     InvalidateRect(m_window, nullptr, FALSE);

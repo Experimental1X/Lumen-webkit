@@ -40,6 +40,10 @@ public:
     HBITMAP thumbnail() const { return m_thumbnail; }
     void setThumbnail(HBITMAP bitmap);
 
+    // Tells WebKit this page is finished. Must happen before the view is
+    // released, otherwise WebKit keeps calling into a destroyed view.
+    void closePage();
+
     HWND hwnd() const;
     WKPageRef page() const;
 
@@ -77,6 +81,8 @@ private:
     std::wstring m_url;
     HBITMAP m_thumbnail { nullptr };
     CallbackTarget* m_target { nullptr };
+    bool m_closed { false };
+    bool m_leakOnDestroy { false };
 };
 
 // Owns the WebKit context shared by every view in the process.

@@ -50,6 +50,9 @@ public:
         m_value = nullptr;
     }
 
+    // Gives up ownership without releasing the object.
+    T leak() { return std::exchange(m_value, nullptr); }
+
     T get() const { return m_value; }
     explicit operator bool() const { return m_value != nullptr; }
 

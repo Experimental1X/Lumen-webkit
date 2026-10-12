@@ -9,10 +9,37 @@
 #include <windows.h>
 #include <windowsx.h>
 
+#include <cstdint>
+#include <cwchar>
+#include <iterator>
 #include <memory>
 #include <string>
 
 namespace {
+
+// Writes where a crash happened to lumen.log (module and offset), so a crash
+// can be diagnosed from the log alone.
+LONG WINAPI crashFilter(EXCEPTION_POINTERS* info)
+{
+    wchar_t module[MAX_PATH] = L"?";
+    unsigned long long offset = 0;
+    const void* address = (info && info->ExceptionRecord) ? info->ExceptionRecord->ExceptionAddress : nullptr;
+    const unsigned long code = (info && info->ExceptionRecord) ? info->ExceptionRecord->ExceptionCode : 0;
+
+    HMODULE handle = nullptr;
+    if (address
+        && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCWSTR>(address), &handle)
+        && handle) {
+        GetModuleFileNameW(handle, module, static_cast<DWORD>(std::size(module)));
+        offset = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(address) - reinterpret_cast<std::uintptr_t>(handle));
+    }
+
+    wchar_t line[MAX_PATH + 160] { };
+    std::swprintf(line, std::size(line), L"CRASH: exception 0x%08lX at %p in %ls +0x%llX", code, address, module, offset);
+    lumen::log(line);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 constexpr wchar_t kWindowClass[] = L"LumenMainWindow";
 constexpr wchar_t kAppName[] = L"Lumen";
@@ -169,9 +196,9 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             return 0;
         break;
 
-    case lumen::Browser::kMsgReapTabs:
+    case WM_TIMER:
         if (browser)
-            browser->reapTabs();
+            browser->onTimer(wParam);
         return 0;
 
     case WM_SETFOCUS:
@@ -295,6 +322,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    SetUnhandledExceptionFilter(crashFilter);
     lumen::log(L"Starting Lumen.");
 
     ULONG_PTR gdiplusToken = 0;

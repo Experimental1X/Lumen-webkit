@@ -99,10 +99,6 @@ struct ChromeLayout {
 // input for the main window. main.cpp forwards window messages to it.
 class Browser {
 public:
-    // Posted to the main window to destroy closed tabs outside of the message
-    // that closed them.
-    static constexpr UINT kMsgReapTabs = WM_APP + 1;
-
     ~Browser();
 
     bool create(HWND window, std::wstring& error);
@@ -123,7 +119,7 @@ public:
     LRESULT onCtlColorEdit(HDC dc, HWND control);
     void onCommand(UINT command);
     bool onKeyDown(WPARAM key);
-    void reapTabs();
+    void onTimer(UINT_PTR id);
 
     int chromeHeight() const;
     bool trackingMouse() const { return m_trackingMouse; }
@@ -229,7 +225,15 @@ private:
     WebKitHost m_host;
     Library m_library;
     std::vector<std::unique_ptr<WebView>> m_tabs;
-    std::vector<std::unique_ptr<WebView>> m_closedTabs;
+    // Closed tabs wait here for a few seconds before being released, so that
+    // WebKit can finish shutting their pages down.
+    struct ClosedTab {
+        std::unique_ptr<WebView> view;
+        ULONGLONG closedAt { 0 };
+    };
+    static constexpr UINT_PTR kReapTimer = 1;
+    std::vector<ClosedTab> m_closedTabs;
+    void reapTabs();
     size_t m_active { 0 };
 
     bool m_overview { false };
