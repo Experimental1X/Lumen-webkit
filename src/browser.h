@@ -211,6 +211,7 @@ private:
     void downloadsWheel(int delta);
     void openDownloadedFile(const std::wstring& path);
     void revealDownloadedFile(const std::wstring& path);
+    void showDownloadsPage();
     static LRESULT CALLBACK downloadsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
     // --- input and popups ---
@@ -282,6 +283,7 @@ private:
     int m_downloadsHoverRow { -1 };
     bool m_downloadsHoverAction { false };
     bool m_downloadsHoverClear { false };
+    bool m_downloadsHoverShowAll { false };
     ULONGLONG m_downloadsHiddenAt { 0 };
     gfx::Theme m_theme;
 

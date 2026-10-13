@@ -2,6 +2,7 @@
 
 #include "start_page.h"
 #include "downloads.h"
+#include "downloads_page.h"
 #include "util.h"
 
 #include <windowsx.h>
@@ -677,7 +678,15 @@ std::wstring Browser::addressDisplayText(bool& secure) const
     secure = false;
 
     auto* view = active();
-    if (!view || isStartPage(view->url()))
+    if (!view)
+        return L"";
+
+    // The downloads page is loaded via loadHtml and so its URL reads as
+    // "about:blank"; show its title in the address bar instead.
+    if (view->title() == L"Downloads")
+        return L"Downloads";
+
+    if (isStartPage(view->url()))
         return L"";
 
     secure = view->url().rfind(L"https://", 0) == 0;
@@ -2264,6 +2273,7 @@ namespace {
 constexpr int kDownloadsWidth = 380;
 constexpr int kDownloadsHeader = 48;
 constexpr int kDownloadsRow = 68;
+constexpr int kDownloadsFooter = 44;
 constexpr int kDownloadsMaxHeight = 460;
 
 RECT downloadsActionRect(const RECT& row, int size, int margin)
@@ -2391,15 +2401,15 @@ LRESULT CALLBACK Browser::downloadsProc(HWND window, UINT message, WPARAM wParam
 int Browser::downloadsPanelHeight() const
 {
     const int rows = static_cast<int>(Downloads::instance().items().size());
-    const int content = px(kDownloadsHeader) + rows * px(kDownloadsRow) + px(8);
+    const int content = px(kDownloadsHeader) + rows * px(kDownloadsRow) + px(kDownloadsFooter) + px(8);
     return std::min(content, px(kDownloadsMaxHeight));
 }
 
 int Browser::downloadsMaxScroll() const
 {
     const int rows = static_cast<int>(Downloads::instance().items().size());
-    const int visible = downloadsPanelHeight() - px(kDownloadsHeader) - px(8);
-    return std::max(0, rows * px(kDownloadsRow) - visible);
+    const int listHeight = downloadsPanelHeight() - px(kDownloadsHeader) - px(kDownloadsFooter) - px(8);
+    return std::max(0, rows * px(kDownloadsRow) - listHeight);
 }
 
 void Browser::layoutDownloadsPanel()
@@ -2452,6 +2462,7 @@ void Browser::hideDownloadsPanel(bool refocusPage)
     m_downloadsHoverRow = -1;
     m_downloadsHoverAction = false;
     m_downloadsHoverClear = false;
+    m_downloadsHoverShowAll = false;
 
     if (m_downloadsPanel)
         ShowWindow(m_downloadsPanel, SW_HIDE);
@@ -2546,7 +2557,12 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
         std::wstring status;
         switch (item.state) {
         case DownloadItem::State::Active:
-            status = item.total > 0 ? formatBytes(item.received) + L" of " + formatBytes(item.total) : formatBytes(item.received);
+            if (item.total > 0)
+                status = formatBytes(item.received) + L" of " + formatBytes(item.total);
+            else if (item.received > 0)
+                status = formatBytes(item.received) + L" \u2014 Downloading";
+            else
+                status = L"Starting\u2026";
             break;
         case DownloadItem::State::Finished:
             status = formatBytes(item.total > 0 ? item.total : item.received);
@@ -2572,6 +2588,13 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
                 const double fraction = std::clamp(static_cast<double>(item.received) / static_cast<double>(item.total), 0.0, 1.0);
                 const RECT fill { textLeft, barTop, textLeft + static_cast<LONG>((textRight - textLeft) * fraction), barTop + barHeight };
                 fillRoundedRect(g, fill, barHeight / 2, m_theme.accent);
+            } else {
+                // Total size unknown (chunked transfer, no Content-Length):
+                // draw a centred "pulse" so the row still reads as in-progress.
+                const int pulseWidth = std::max(px(48), (textRight - textLeft) / 3);
+                const int pulseLeft = textLeft + ((textRight - textLeft) - pulseWidth) / 2;
+                const RECT pulse { pulseLeft, barTop, pulseLeft + pulseWidth, barTop + barHeight };
+                fillRoundedRect(g, pulse, barHeight / 2, m_theme.accent, 200);
             }
         }
 
@@ -2602,6 +2625,20 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
 
     fillSolid(dc, RECT { 0, header - 1, width, header }, m_theme.separator);
     strokeRoundedRect(g, RECT { 0, 0, width, height }, px(14), m_theme.glassBorder, std::max(1.0f, k));
+
+    // Footer with the "Show in Page" link, painted last so it covers any
+    // row that has scrolled past the bottom edge.
+    const int footer = px(kDownloadsFooter);
+    const RECT footerRect { 0, height - footer, width, height };
+    fillSolid(dc, footerRect, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    fillSolid(dc, RECT { 0, height - footer, width, height - footer + 1 }, m_theme.separator);
+
+    const RECT showAllRect { px(16), height - footer + px(6), width - px(16), height - px(6) };
+    if (m_downloadsHoverShowAll)
+        fillRoundedRect(g, showAllRect, px(8), m_theme.pill);
+    drawLabel(dc, g, L"Show All in Page", showAllRect, m_theme.accent,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
     g.Flush(Gdiplus::FlushIntentionSync);
 }
 
@@ -2609,6 +2646,8 @@ void Browser::downloadsClick(POINT point)
 {
     const int width = px(kDownloadsWidth);
     const int header = px(kDownloadsHeader);
+    const int footer = px(kDownloadsFooter);
+    const int panelHeight = downloadsPanelHeight();
     const int rowHeight = px(kDownloadsRow);
     const std::vector<DownloadItem> items = Downloads::instance().items(); // copy: clicks may change the list
 
@@ -2616,6 +2655,15 @@ void Browser::downloadsClick(POINT point)
         const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
         if (PtInRect(&clearRect, point))
             Downloads::instance().clearFinished();
+        return;
+    }
+
+    if (point.y >= panelHeight - footer) {
+        const RECT showAllRect { px(16), panelHeight - footer + px(6), width - px(16), panelHeight - px(6) };
+        if (PtInRect(&showAllRect, point)) {
+            hideDownloadsPanel(false);
+            showDownloadsPage();
+        }
         return;
     }
 
@@ -2649,17 +2697,23 @@ void Browser::downloadsMove(POINT point)
 {
     const int width = px(kDownloadsWidth);
     const int header = px(kDownloadsHeader);
+    const int footer = px(kDownloadsFooter);
+    const int panelHeight = downloadsPanelHeight();
     const int rowHeight = px(kDownloadsRow);
     const std::vector<DownloadItem>& items = Downloads::instance().items();
 
     int hoverRow = -1;
     bool hoverAction = false;
     bool hoverClear = false;
+    bool hoverShowAll = false;
 
     if (point.x >= 0 && point.y >= 0) {
         if (point.y < header) {
             const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
             hoverClear = PtInRect(&clearRect, point) != FALSE;
+        } else if (point.y >= panelHeight - footer) {
+            const RECT showAllRect { px(16), panelHeight - footer + px(6), width - px(16), panelHeight - px(6) };
+            hoverShowAll = PtInRect(&showAllRect, point) != FALSE;
         } else {
             for (size_t i = 0; i < items.size(); ++i) {
                 const int top = header + static_cast<int>(i) * rowHeight - m_downloadsScroll;
@@ -2675,12 +2729,14 @@ void Browser::downloadsMove(POINT point)
         }
     }
 
-    if (hoverRow == m_downloadsHoverRow && hoverAction == m_downloadsHoverAction && hoverClear == m_downloadsHoverClear)
+    if (hoverRow == m_downloadsHoverRow && hoverAction == m_downloadsHoverAction
+        && hoverClear == m_downloadsHoverClear && hoverShowAll == m_downloadsHoverShowAll)
         return;
 
     m_downloadsHoverRow = hoverRow;
     m_downloadsHoverAction = hoverAction;
     m_downloadsHoverClear = hoverClear;
+    m_downloadsHoverShowAll = hoverShowAll;
     InvalidateRect(m_downloadsPanel, nullptr, FALSE);
 }
 
@@ -2710,6 +2766,24 @@ void Browser::revealDownloadedFile(const std::wstring& path)
 {
     const std::wstring arguments = L"/select,\"" + path + L"\"";
     ShellExecuteW(m_window, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+void Browser::showDownloadsPage()
+{
+    // Open a new tab that lists every download. The page auto-reloads every
+    // 1.5 seconds, so an active download's progress is visible without any
+    // push from C++.
+    auto view = m_host.createView(m_window);
+    if (!view)
+        return;
+
+    WebView* raw = view.get();
+    attachCallbacks(raw);
+    m_tabs.push_back(std::move(view));
+
+    activateTab(m_tabs.size() - 1);
+    raw->loadHtml(downloadsPageHtml(m_theme.dark));
+    invalidateChrome();
 }
 
 

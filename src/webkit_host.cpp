@@ -21,6 +21,8 @@
 #include <WebKit/WKURLResponse.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <shellapi.h>
 
 namespace lumen {
 
@@ -30,6 +32,68 @@ Ref<WKURLRef> makeUrl(const std::wstring& value)
 {
     const std::string utf8 = toUtf8(value);
     return adopt(WKURLCreateWithUTF8CString(utf8.c_str()));
+}
+
+// Modern Safari on macOS. YouTube (and a handful of other sites) only unlock
+// HD streams when the UA is one its player recognises as a current Safari
+// on macOS; the default WebKit-on-Windows UA is capped at 360p.
+constexpr wchar_t kSafariUserAgent[] =
+    L"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    L"(KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+
+// Internal lumen: URLs power the action buttons in the downloads page
+// (lumen:cancel?id=N, lumen:open?id=N, lumen:reveal?id=N, lumen:remove?id=N,
+// lumen:clear). They never actually load; the navigation is cancelled and
+// the command is dispatched to the Downloads singleton.
+void handleLumenAction(const std::wstring& url)
+{
+    if (url.rfind(L"lumen:", 0) != 0)
+        return;
+
+    const size_t colon = 5; // "lumen" is five characters; the colon follows.
+    const size_t q = url.find(L'?', colon + 1);
+    const std::wstring action = url.substr(colon + 1, q == std::wstring::npos ? std::wstring::npos : q - colon - 1);
+    const std::wstring query = q == std::wstring::npos ? std::wstring() : url.substr(q + 1);
+
+    auto getParam = [&](const std::wstring& key) -> std::wstring {
+        const std::wstring prefix = key + L"=";
+        size_t pos = query.find(prefix);
+        if (pos == std::wstring::npos)
+            return {};
+        pos += prefix.size();
+        const size_t end = query.find(L'&', pos);
+        return query.substr(pos, end == std::wstring::npos ? std::wstring::npos : end - pos);
+    };
+
+    auto findItem = [](unsigned id) -> const DownloadItem* {
+        for (const auto& item : Downloads::instance().items()) {
+            if (item.id == id)
+                return &item;
+        }
+        return nullptr;
+    };
+
+    Downloads& downloads = Downloads::instance();
+
+    if (action == L"cancel") {
+        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
+        downloads.cancel(id);
+    } else if (action == L"remove") {
+        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
+        downloads.remove(id);
+    } else if (action == L"open") {
+        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
+        if (const DownloadItem* item = findItem(id); item && item->state == DownloadItem::State::Finished)
+            ShellExecuteW(nullptr, L"open", item->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    } else if (action == L"reveal") {
+        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
+        if (const DownloadItem* item = findItem(id); item && !item->path.empty()) {
+            const std::wstring arguments = L"/select,\"" + item->path + L"\"";
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
+        }
+    } else if (action == L"clear") {
+        downloads.clearFinished();
+    }
 }
 
 } // namespace
@@ -243,6 +307,22 @@ void WebView::didChangeTitleOrUrl(const void* clientInfo)
 
 void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
 {
+    // lumen: URLs are caught here so the downloads page buttons can dispatch
+    // commands without round-tripping through real navigation.
+    auto request = adopt(WKNavigationActionCopyRequest(action));
+    if (request) {
+        auto url = adopt(WKURLRequestCopyURL(request.get()));
+        if (url) {
+            auto urlString = adopt(WKURLCopyString(url.get()));
+            const std::wstring wurl = toWide(urlString.get());
+            if (wurl.rfind(L"lumen:", 0) == 0) {
+                handleLumenAction(wurl);
+                WKFramePolicyListenerIgnore(listener);
+                return;
+            }
+        }
+    }
+
     // <a download> and similar requests become downloads; the rest load.
     if (WKNavigationActionShouldPerformDownload(action))
         WKFramePolicyListenerDownload(listener);
@@ -465,6 +545,7 @@ bool WebKitHost::initialize(std::wstring& error)
     log(std::wstring(L"MediaSource enabled by default: ") + (WKPreferencesGetMediaSourceEnabled(m_preferences.get()) ? L"yes" : L"no"));
     WKPreferencesSetMediaSourceEnabled(m_preferences.get(), true);
     WKPreferencesSetMediaCapabilitiesEnabled(m_preferences.get(), true);
+    WKPreferencesSetWebGLEnabled(m_preferences.get(), true);
 
     m_pageConfiguration = adopt(WKPageConfigurationCreate());
     if (!m_pageConfiguration) {
@@ -541,6 +622,12 @@ std::unique_ptr<WebView> WebKitHost::createView(HWND parent, WKPageConfiguration
     findClient.didFailToFindString = &WebView::didFailToFindString;
     findClient.didCountStringMatches = &WebView::didCountStringMatches;
     WKPageSetPageFindClient(webPage, &findClient.base);
+
+    // Set the user agent to current Safari/macOS so YouTube serves HD
+    // streams instead of capping at 360p.
+    auto userAgent = adopt(WKStringCreateWithUTF8CString(toUtf8(kSafariUserAgent).c_str()));
+    WKPageSetCustomUserAgent(webPage, userAgent.get());
+    log(L"Custom user-agent set.");
 
     const UINT dpi = GetDpiForWindow(parent);
     WKPageSetCustomBackingScaleFactor(webPage, dpi ? static_cast<double>(dpi) / 96.0 : 1.0);
