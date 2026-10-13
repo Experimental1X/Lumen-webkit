@@ -28,9 +28,13 @@ if (NOT EXISTS "${LUMEN_SDK_DIR}/include/WebKit/WKView.h")
     message(FATAL_ERROR "WebKit/WKView.h not found in the SDK include directory.")
 endif ()
 
+# Every translation unit in src/. Verified against the patched source:
+# browser, dialogs, downloads, library, util, webkit_host, plus main.
 add_executable(Lumen WIN32
     src/main.cpp
     src/browser.cpp
+    src/dialogs.cpp
+    src/downloads.cpp
     src/library.cpp
     src/util.cpp
     src/webkit_host.cpp
@@ -54,6 +58,7 @@ target_link_libraries(Lumen PRIVATE
     gdi32
     gdiplus
     advapi32
+    comdlg32
     shell32
 )
 
