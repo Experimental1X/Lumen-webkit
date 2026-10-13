@@ -18,7 +18,6 @@
 #include <WebKit/WKPageNavigationClient.h>
 #include <WebKit/WKPageUIClient.h>
 #include <WebKit/WKPreferencesRefPrivate.h>
-#include <WebKit/WKURLRequest.h>
 #include <WebKit/WKURLResponse.h>
 
 #include <algorithm>
@@ -103,18 +102,28 @@ void handleLumenAction(const std::wstring& url)
 
 WebView::~WebView()
 {
-    // Detach the callbacks without calling back into WebKit: any late
-    // notification finds a null owner and does nothing.
+    // Disconnect callbacks before any WebKit state goes away. A late
+    // notification then finds `owner == nullptr` and is a no-op.
     if (m_target)
         m_target->owner = nullptr;
     onChanged = nullptr;
+    onNewPage = nullptr;
+    onCloseRequested = nullptr;
 
-    closePage();
+    // Do NOT call closePage() here: the tab's owner already called it before
+    // stashing the view in m_closedTabs. A second call is a no-op anyway
+    // because m_closed is set.
 
-    // A view whose page could not be closed is never released: leaking it is
-    // better than letting WebKit call into freed memory.
-    if (m_leakOnDestroy)
-        m_view.leak();
+    // Always leak the WKViewRef. After WKPageClose has marked the page for
+    // shutdown on this WinCairo build, releasing the WKView from the main
+    // process side while the helper process is still wrapping up trips an
+    // access violation at a fixed offset inside WebKit2.dll
+    // (the +0x6C7606 crash in lumen.log). The WKView is freed when the
+    // process exits; closing a tab costs ~one WKView's worth of memory
+    // until then. This replaces the conditional leak that only fired when
+    // WKPageClose wasn't exported.
+    m_view.leak();
+    m_leakOnDestroy = true;
 
     if (m_thumbnail)
         DeleteObject(m_thumbnail);
@@ -333,13 +342,16 @@ void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WK
 
 void WebView::decideNavigationResponse(WKPageRef, WKNavigationResponseRef response, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
 {
-    // A response the page cannot display, or one the server marks as an
-    // attachment, is saved as a file instead.
-    bool download = !WKNavigationResponseCanShowMIMEType(response);
-    if (!download) {
-        auto urlResponse = adopt(WKNavigationResponseCopyResponse(response));
-        download = urlResponse && WKURLResponseIsAttachment(urlResponse.get());
-    }
+    // Only an explicit Content-Disposition: attachment becomes a download.
+    // Subresources (the bulk of what a page loads) usually have MIME types
+    // the embedder cannot render inline, but they are not downloads - the
+    // page itself handles them. Treating every unknown-MIME subresource as
+    // a download made a YouTube homepage visit spawn two phantom entries:
+    // one for the page itself, one for a cross-origin fetch.
+    bool download = false;
+    auto urlResponse = adopt(WKNavigationResponseCopyResponse(response));
+    if (urlResponse)
+        download = WKURLResponseIsAttachment(urlResponse.get());
 
     if (download)
         WKFramePolicyListenerDownload(listener);

@@ -55,27 +55,6 @@ std::wstring percentEncode(const std::wstring& value)
     return fromUtf8(encoded);
 }
 
-std::wstring fileUrlFromPath(const std::wstring& path)
-{
-    static constexpr char hex[] = "0123456789ABCDEF";
-    const std::string utf8 = toUtf8(path);
-
-    std::string encoded = "file:///";
-    for (unsigned char byte : utf8) {
-        if (byte == '\\') {
-            encoded.push_back('/');
-        } else if ((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9')
-            || byte == '-' || byte == '_' || byte == '.' || byte == '~' || byte == '/' || byte == ':') {
-            encoded.push_back(static_cast<char>(byte));
-        } else {
-            encoded.push_back('%');
-            encoded.push_back(hex[(byte >> 4) & 0x0F]);
-            encoded.push_back(hex[byte & 0x0F]);
-        }
-    }
-    return fromUtf8(encoded);
-}
-
 std::wstring executableDirectory()
 {
     wchar_t path[MAX_PATH * 2] { };

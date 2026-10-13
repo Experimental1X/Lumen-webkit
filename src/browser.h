@@ -287,6 +287,12 @@ private:
     ULONGLONG m_downloadsHiddenAt { 0 };
     gfx::Theme m_theme;
 
+    // Tab that hosts the full downloads page (lumen:Downloads), or -1 if no
+    // such tab is open. The browser pushes an updated HTML snapshot to the
+    // view whenever Downloads::onChanged fires, so the page itself does not
+    // have to self-reload.
+    size_t m_downloadsPageTab { static_cast<size_t>(-1) };
+
     WebKitHost m_host;
     Library m_library;
     std::vector<std::unique_ptr<WebView>> m_tabs;

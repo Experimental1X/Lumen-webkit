@@ -4,6 +4,7 @@
 // browser.h), which draws the chrome and manages the tabs.
 
 #include "browser.h"
+#include "downloads.h"
 #include "util.h"
 
 #include <windows.h>
@@ -242,6 +243,11 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             return 0;
         }
         break;
+
+    case WM_LUMEN_DOWNLOAD_CHANGED:
+        if (browser)
+            browser->onDownloadsChanged(wParam != 0);
+        return 0;
 
     case WM_DPICHANGED: {
         const RECT* suggested = reinterpret_cast<const RECT*>(lParam);

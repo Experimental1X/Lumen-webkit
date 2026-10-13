@@ -1,0 +1,41 @@
+--- "Update 4/src/main.cpp"	2026-10-12 00:56:31.000000000 +0530
++++ "Update 5 (patched)/src/main.cpp"	2026-10-13 17:38:25.699524600 +0530
+@@ -4,6 +4,7 @@
+ // browser.h), which draws the chrome and manages the tabs.
+ 
+ #include "browser.h"
++#include "downloads.h"
+ #include "util.h"
+ 
+ #include <windows.h>
+@@ -90,6 +91,12 @@
+         { FCONTROL | FSHIFT | FVIRTKEY, 'D', kCmdReadingList },
+         { FCONTROL | FSHIFT | FVIRTKEY, 'L', kCmdSidebar },
+         { FCONTROL | FSHIFT | FVIRTKEY, VK_OEM_5, kCmdTabOverview },
++        { FCONTROL | FVIRTKEY, 'F', kCmdFind },
++        { FCONTROL | FVIRTKEY, 'G', kCmdFindNext },
++        { FCONTROL | FSHIFT | FVIRTKEY, 'G', kCmdFindPrevious },
++        { FVIRTKEY, VK_F3, kCmdFindNext },
++        { FSHIFT | FVIRTKEY, VK_F3, kCmdFindPrevious },
++        { FCONTROL | FVIRTKEY, 'J', kCmdDownloads },
+     };
+     return CreateAcceleratorTableW(keys, static_cast<int>(sizeof(keys) / sizeof(keys[0])));
+ }
+@@ -231,8 +238,17 @@
+             browser->onCommand(LOWORD(wParam));
+             return 0;
+         }
++        if (browser && lParam != 0) {
++            browser->onControlNotify(reinterpret_cast<HWND>(lParam), HIWORD(wParam));
++            return 0;
++        }
+         break;
+ 
++    case WM_LUMEN_DOWNLOAD_CHANGED:
++        if (browser)
++            browser->onDownloadsChanged(wParam != 0);
++        return 0;
++
+     case WM_DPICHANGED: {
+         const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+         SetWindowPos(window, nullptr, suggested->left, suggested->top,

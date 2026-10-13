@@ -122,7 +122,13 @@ bool Browser::create(HWND window, std::wstring& error)
     createAddressControl();
     createFindControl();
     createDownloadsPanel();
-    Downloads::instance().onChanged = [this](bool started) { onDownloadsChanged(started); };
+    Downloads::instance().setOwnerWindow(m_window);
+    // The download callbacks can fire on WebKit's IPC threads; funnel them
+    // through WM_LUMEN_DOWNLOAD_CHANGED so onDownloadsChanged always runs on
+    // the UI thread (its code touches GDI).
+    Downloads::instance().onChanged = [this](bool started) {
+        PostMessageW(m_window, WM_LUMEN_DOWNLOAD_CHANGED, started ? 1 : 0, 0);
+    };
 
     if (!newTab(L"")) {
         error = L"Could not create the first web view. See lumen.log.";
@@ -442,6 +448,13 @@ void Browser::closeTab(size_t index)
     // a web view in the middle of the message that closed it was crashing.
     std::unique_ptr<WebView> closing = std::move(m_tabs[index]);
     m_tabs.erase(m_tabs.begin() + static_cast<std::ptrdiff_t>(index));
+
+    if (m_downloadsPageTab != static_cast<size_t>(-1)) {
+        if (m_downloadsPageTab == index)
+            m_downloadsPageTab = static_cast<size_t>(-1);
+        else if (m_downloadsPageTab > index)
+            --m_downloadsPageTab;
+    }
 
     if (m_active >= m_tabs.size())
         m_active = m_tabs.size() - 1;
@@ -2505,6 +2518,14 @@ void Browser::onDownloadsChanged(bool started)
         InvalidateRect(m_downloadsPanel, nullptr, FALSE);
     }
 
+    // Refresh the full downloads page if it is open, so a download that
+    // starts, finishes or is removed updates without the page having to
+    // self-reload.
+    if (m_downloadsPageTab != static_cast<size_t>(-1) && m_downloadsPageTab < m_tabs.size()) {
+        if (auto* view = m_tabs[m_downloadsPageTab].get())
+            view->loadHtml(downloadsPageHtml(m_theme.dark));
+    }
+
     invalidateChrome();
 }
 
@@ -2770,9 +2791,9 @@ void Browser::revealDownloadedFile(const std::wstring& path)
 
 void Browser::showDownloadsPage()
 {
-    // Open a new tab that lists every download. The page auto-reloads every
-    // 1.5 seconds, so an active download's progress is visible without any
-    // push from C++.
+    // Open a new tab that lists every download. The browser pushes an
+    // updated HTML snapshot to it whenever Downloads::onChanged fires, so
+    // the page itself does not have to self-reload.
     auto view = m_host.createView(m_window);
     if (!view)
         return;
@@ -2780,8 +2801,9 @@ void Browser::showDownloadsPage()
     WebView* raw = view.get();
     attachCallbacks(raw);
     m_tabs.push_back(std::move(view));
+    m_downloadsPageTab = m_tabs.size() - 1;
 
-    activateTab(m_tabs.size() - 1);
+    activateTab(m_downloadsPageTab);
     raw->loadHtml(downloadsPageHtml(m_theme.dark));
     invalidateChrome();
 }

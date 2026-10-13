@@ -162,8 +162,16 @@ DownloadItem* Downloads::findId(unsigned id)
 
 void Downloads::notify(bool started)
 {
-    if (onChanged)
+    if (m_ownerWindow) {
+        // Pump the notification through the message loop onto the UI thread.
+        // The download callbacks can fire on the IPC threads WebKit uses for
+        // network progress; calling Browser code (which touches GDI, the panel
+        // window, etc.) from there would be undefined behaviour, and WebKit's
+        // didWriteData was being silently dropped in tests.
+        PostMessageW(m_ownerWindow, WM_LUMEN_DOWNLOAD_CHANGED, started ? 1 : 0, 0);
+    } else if (onChanged) {
         onChanged(started);
+    }
 }
 
 bool Downloads::hasActive() const

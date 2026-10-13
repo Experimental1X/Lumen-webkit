@@ -42,10 +42,11 @@ inline std::string escapeHtml(const std::string& s)
 } // namespace
 
 // A self-contained HTML page listing every download with live progress, in the
-// same visual style as the start page. Reloads itself every 1.5 s so a new
-// download or a finishing one updates without needing a round trip into C++.
-// The action buttons link to lumen:cancel?id=N, lumen:open?id=N, etc.; those
-// are caught by WebView::decideNavigationAction and dispatched there.
+// same visual style as the start page. The browser pushes an updated HTML
+// snapshot through WebView::loadHtml whenever Downloads::onChanged fires, so
+// the page does not need to self-reload. The action buttons link to
+// lumen:cancel?id=N, lumen:open?id=N, etc.; those are caught by
+// WebView::decideNavigationAction and dispatched there.
 inline std::string downloadsPageHtml(bool dark)
 {
     const std::vector<DownloadItem>& items = Downloads::instance().items();
@@ -56,7 +57,6 @@ inline std::string downloadsPageHtml(bool dark)
     html += "<!doctype html>\n<html class=\"";
     html += dark ? "dark" : "light";
     html += "\">\n<head>\n<meta charset=\"utf-8\">\n";
-    html += "<meta http-equiv=\"refresh\" content=\"1.5\">\n";
     html += "<title>Downloads</title>\n<style>\n";
 
     html +=

@@ -1,0 +1,472 @@
+--- "Update 4/src/webkit_host.cpp"	2026-10-12 00:56:31.000000000 +0530
++++ "Update 5 (patched)/src/webkit_host.cpp"	2026-10-13 17:38:25.710522500 +0530
+@@ -1,42 +1,99 @@
+ #include "webkit_host.h"
+ 
+ #include "util.h"
++#include "webkit_util.h"
++
++#include "dialogs.h"
++#include "downloads.h"
++
++#include <WebKit/WKArray.h>
++#include <WebKit/WKDownloadRef.h>
++#include <WebKit/WKFindOptions.h>
++#include <WebKit/WKFramePolicyListener.h>
++#include <WebKit/WKNavigationActionRef.h>
++#include <WebKit/WKNavigationResponseRef.h>
++#include <WebKit/WKOpenPanelParametersRef.h>
++#include <WebKit/WKOpenPanelResultListener.h>
++#include <WebKit/WKPageFindClient.h>
++#include <WebKit/WKPageNavigationClient.h>
++#include <WebKit/WKPageUIClient.h>
++#include <WebKit/WKPreferencesRefPrivate.h>
++#include <WebKit/WKURLResponse.h>
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <shellapi.h>
+ 
+ namespace lumen {
+ 
+ namespace {
+ 
+-std::wstring toWide(WKStringRef string)
++Ref<WKURLRef> makeUrl(const std::wstring& value)
+ {
+-    if (!string)
+-        return { };
+-
+-    const size_t maximumSize = WKStringGetMaximumUTF8CStringSize(string);
+-    if (!maximumSize)
+-        return { };
+-
+-    std::string utf8(maximumSize, '\0');
+-    const size_t written = WKStringGetUTF8CString(string, utf8.data(), maximumSize);
+-    // The returned count includes the terminating NUL.
+-    utf8.resize(written > 0 ? written - 1 : 0);
+-    return fromUtf8(utf8);
++    const std::string utf8 = toUtf8(value);
++    return adopt(WKURLCreateWithUTF8CString(utf8.c_str()));
+ }
+ 
+-std::wstring toWide(WKURLRef url)
++// Modern Safari on macOS. YouTube (and a handful of other sites) only unlock
++// HD streams when the UA is one its player recognises as a current Safari
++// on macOS; the default WebKit-on-Windows UA is capped at 360p.
++constexpr wchar_t kSafariUserAgent[] =
++    L"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
++    L"(KHTML, like Gecko) Version/26.0 Safari/605.1.15";
++
++// Internal lumen: URLs power the action buttons in the downloads page
++// (lumen:cancel?id=N, lumen:open?id=N, lumen:reveal?id=N, lumen:remove?id=N,
++// lumen:clear). They never actually load; the navigation is cancelled and
++// the command is dispatched to the Downloads singleton.
++void handleLumenAction(const std::wstring& url)
+ {
+-    if (!url)
+-        return { };
++    if (url.rfind(L"lumen:", 0) != 0)
++        return;
+ 
+-    auto string = adopt(WKURLCopyString(url));
+-    return toWide(string.get());
+-}
++    const size_t colon = 5; // "lumen" is five characters; the colon follows.
++    const size_t q = url.find(L'?', colon + 1);
++    const std::wstring action = url.substr(colon + 1, q == std::wstring::npos ? std::wstring::npos : q - colon - 1);
++    const std::wstring query = q == std::wstring::npos ? std::wstring() : url.substr(q + 1);
++
++    auto getParam = [&](const std::wstring& key) -> std::wstring {
++        const std::wstring prefix = key + L"=";
++        size_t pos = query.find(prefix);
++        if (pos == std::wstring::npos)
++            return {};
++        pos += prefix.size();
++        const size_t end = query.find(L'&', pos);
++        return query.substr(pos, end == std::wstring::npos ? std::wstring::npos : end - pos);
++    };
++
++    auto findItem = [](unsigned id) -> const DownloadItem* {
++        for (const auto& item : Downloads::instance().items()) {
++            if (item.id == id)
++                return &item;
++        }
++        return nullptr;
++    };
+ 
+-Ref<WKURLRef> makeUrl(const std::wstring& value)
+-{
+-    const std::string utf8 = toUtf8(value);
+-    return adopt(WKURLCreateWithUTF8CString(utf8.c_str()));
++    Downloads& downloads = Downloads::instance();
++
++    if (action == L"cancel") {
++        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
++        downloads.cancel(id);
++    } else if (action == L"remove") {
++        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
++        downloads.remove(id);
++    } else if (action == L"open") {
++        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
++        if (const DownloadItem* item = findItem(id); item && item->state == DownloadItem::State::Finished)
++            ShellExecuteW(nullptr, L"open", item->path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++    } else if (action == L"reveal") {
++        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
++        if (const DownloadItem* item = findItem(id); item && !item->path.empty()) {
++            const std::wstring arguments = L"/select,\"" + item->path + L"\"";
++            ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
++        }
++    } else if (action == L"clear") {
++        downloads.clearFinished();
++    }
+ }
+ 
+ } // namespace
+@@ -45,18 +102,28 @@
+ 
+ WebView::~WebView()
+ {
+-    // Detach the callbacks without calling back into WebKit: any late
+-    // notification finds a null owner and does nothing.
++    // Disconnect callbacks before any WebKit state goes away. A late
++    // notification then finds `owner == nullptr` and is a no-op.
+     if (m_target)
+         m_target->owner = nullptr;
+     onChanged = nullptr;
++    onNewPage = nullptr;
++    onCloseRequested = nullptr;
+ 
+-    closePage();
+-
+-    // A view whose page could not be closed is never released: leaking it is
+-    // better than letting WebKit call into freed memory.
+-    if (m_leakOnDestroy)
+-        m_view.leak();
++    // Do NOT call closePage() here: the tab's owner already called it before
++    // stashing the view in m_closedTabs. A second call is a no-op anyway
++    // because m_closed is set.
++
++    // Always leak the WKViewRef. After WKPageClose has marked the page for
++    // shutdown on this WinCairo build, releasing the WKView from the main
++    // process side while the helper process is still wrapping up trips an
++    // access violation at a fixed offset inside WebKit2.dll
++    // (the +0x6C7606 crash in lumen.log). The WKView is freed when the
++    // process exits; closing a tab costs ~one WKView's worth of memory
++    // until then. This replaces the conditional leak that only fired when
++    // WKPageClose wasn't exported.
++    m_view.leak();
++    m_leakOnDestroy = true;
+ 
+     if (m_thumbnail)
+         DeleteObject(m_thumbnail);
+@@ -216,18 +283,28 @@
+     m_url = newUrl;
+ }
+ 
+-void WebView::didChange(const void* clientInfo)
++WebView* WebView::ownerOf(const void* clientInfo)
+ {
+     auto* target = static_cast<const CallbackTarget*>(clientInfo);
+-    WebView* self = target ? target->owner : nullptr;
++    return target ? target->owner : nullptr;
++}
++
++HWND WebView::windowOf(WebView* view)
++{
++    HWND window = view ? view->hwnd() : nullptr;
++    return window ? GetAncestor(window, GA_ROOT) : nullptr;
++}
++
++void WebView::didChange(const void* clientInfo)
++{
++    WebView* self = ownerOf(clientInfo);
+     if (self && self->onChanged)
+         self->onChanged();
+ }
+ 
+ void WebView::didChangeTitleOrUrl(const void* clientInfo)
+ {
+-    auto* target = static_cast<const CallbackTarget*>(clientInfo);
+-    WebView* self = target ? target->owner : nullptr;
++    WebView* self = ownerOf(clientInfo);
+     if (!self)
+         return;
+ 
+@@ -236,6 +313,203 @@
+         self->onChanged();
+ }
+ 
++// ---------------------------------------------------------- downloads
++
++void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
++{
++    // lumen: URLs are caught here so the downloads page buttons can dispatch
++    // commands without round-tripping through real navigation.
++    auto request = adopt(WKNavigationActionCopyRequest(action));
++    if (request) {
++        auto url = adopt(WKURLRequestCopyURL(request.get()));
++        if (url) {
++            auto urlString = adopt(WKURLCopyString(url.get()));
++            const std::wstring wurl = toWide(urlString.get());
++            if (wurl.rfind(L"lumen:", 0) == 0) {
++                handleLumenAction(wurl);
++                WKFramePolicyListenerIgnore(listener);
++                return;
++            }
++        }
++    }
++
++    // <a download> and similar requests become downloads; the rest load.
++    if (WKNavigationActionShouldPerformDownload(action))
++        WKFramePolicyListenerDownload(listener);
++    else
++        WKFramePolicyListenerUse(listener);
++}
++
++void WebView::decideNavigationResponse(WKPageRef, WKNavigationResponseRef response, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
++{
++    // Only an explicit Content-Disposition: attachment becomes a download.
++    // Subresources (the bulk of what a page loads) usually have MIME types
++    // the embedder cannot render inline, but they are not downloads - the
++    // page itself handles them. Treating every unknown-MIME subresource as
++    // a download made a YouTube homepage visit spawn two phantom entries:
++    // one for the page itself, one for a cross-origin fetch.
++    bool download = false;
++    auto urlResponse = adopt(WKNavigationResponseCopyResponse(response));
++    if (urlResponse)
++        download = WKURLResponseIsAttachment(urlResponse.get());
++
++    if (download)
++        WKFramePolicyListenerDownload(listener);
++    else
++        WKFramePolicyListenerUse(listener);
++}
++
++void WebView::actionBecameDownload(WKPageRef, WKNavigationActionRef, WKDownloadRef download, const void*)
++{
++    Downloads::instance().attach(download);
++}
++
++void WebView::responseBecameDownload(WKPageRef, WKNavigationResponseRef, WKDownloadRef download, const void*)
++{
++    Downloads::instance().attach(download);
++}
++
++void WebView::contextMenuCreatedDownload(WKPageRef, WKDownloadRef download, const void*)
++{
++    Downloads::instance().attach(download);
++}
++
++// ------------------------------------------------- new windows, dialogs
++
++WKPageRef WebView::createNewPage(WKPageRef, WKPageConfigurationRef configuration, WKNavigationActionRef, WKWindowFeaturesRef, const void* clientInfo)
++{
++    WebView* self = ownerOf(clientInfo);
++    if (!self || !self->onNewPage)
++        return nullptr;
++
++    WKPageRef newPage = self->onNewPage(configuration);
++    if (newPage) {
++        // The caller takes over one reference to the page. If WebKit instead
++        // only borrows it, the cost is one page object that stays alive.
++        WKRetain(newPage);
++    }
++    return newPage;
++}
++
++void WebView::closeRequested(WKPageRef, const void* clientInfo)
++{
++    WebView* self = ownerOf(clientInfo);
++    if (self && self->onCloseRequested)
++        self->onCloseRequested();
++}
++
++void WebView::runAlert(WKPageRef, WKStringRef text, WKFrameRef, WKSecurityOriginRef, WKPageRunJavaScriptAlertResultListenerRef listener, const void* clientInfo)
++{
++    showAlert(windowOf(ownerOf(clientInfo)), toWide(text));
++    WKPageRunJavaScriptAlertResultListenerCall(listener);
++}
++
++void WebView::runConfirm(WKPageRef, WKStringRef text, WKFrameRef, WKSecurityOriginRef, WKPageRunJavaScriptConfirmResultListenerRef listener, const void* clientInfo)
++{
++    const bool accepted = showConfirm(windowOf(ownerOf(clientInfo)), toWide(text));
++    WKPageRunJavaScriptConfirmResultListenerCall(listener, accepted);
++}
++
++void WebView::runPrompt(WKPageRef, WKStringRef text, WKStringRef defaultValue, WKFrameRef, WKSecurityOriginRef, WKPageRunJavaScriptPromptResultListenerRef listener, const void* clientInfo)
++{
++    std::wstring result;
++    if (showPrompt(windowOf(ownerOf(clientInfo)), toWide(text), toWide(defaultValue), result)) {
++        auto string = adopt(WKStringCreateWithUTF8CString(toUtf8(result).c_str()));
++        WKPageRunJavaScriptPromptResultListenerCall(listener, string.get());
++    } else
++        WKPageRunJavaScriptPromptResultListenerCall(listener, nullptr);
++}
++
++void WebView::runOpenPanel(WKPageRef, WKFrameRef, WKOpenPanelParametersRef parameters, WKOpenPanelResultListenerRef listener, const void* clientInfo)
++{
++    const bool multiple = WKOpenPanelParametersGetAllowsMultipleFiles(parameters);
++    const std::vector<std::wstring> files = chooseFiles(windowOf(ownerOf(clientInfo)), multiple);
++    if (files.empty()) {
++        WKOpenPanelResultListenerCancel(listener);
++        return;
++    }
++
++    std::vector<Ref<WKURLRef>> urls;
++    std::vector<WKTypeRef> values;
++    for (const auto& file : files) {
++        urls.push_back(adopt(WKURLCreateWithUTF8CString(toUtf8(fileUrlFromPath(file)).c_str())));
++        values.push_back(urls.back().get());
++    }
++
++    auto array = adopt(WKArrayCreate(values.data(), values.size()));
++    auto mimeTypes = adopt(WKArrayCreate(nullptr, 0));
++    WKOpenPanelResultListenerChooseFiles(listener, array.get(), mimeTypes.get());
++}
++
++// ------------------------------------------------------------ find in page
++
++void WebView::didFindString(WKPageRef, WKStringRef, unsigned matchCount, const void* clientInfo)
++{
++    WebView* self = ownerOf(clientInfo);
++    if (!self)
++        return;
++
++    // Counting reports the real total; a single find reports at least one.
++    self->m_findMatches = std::max(self->m_findMatches, static_cast<int>(matchCount));
++    if (self->onChanged)
++        self->onChanged();
++}
++
++void WebView::didFailToFindString(WKPageRef, WKStringRef, const void* clientInfo)
++{
++    WebView* self = ownerOf(clientInfo);
++    if (!self)
++        return;
++
++    self->m_findMatches = 0;
++    if (self->onChanged)
++        self->onChanged();
++}
++
++void WebView::didCountStringMatches(WKPageRef, WKStringRef, unsigned matchCount, const void* clientInfo)
++{
++    WebView* self = ownerOf(clientInfo);
++    if (!self)
++        return;
++
++    self->m_findMatches = static_cast<int>(matchCount);
++    if (self->onChanged)
++        self->onChanged();
++}
++
++void WebView::find(const std::wstring& text, bool backwards, bool countMatches)
++{
++    auto* webPage = page();
++    if (!webPage)
++        return;
++
++    if (text.empty()) {
++        hideFind();
++        return;
++    }
++
++    auto string = adopt(WKStringCreateWithUTF8CString(toUtf8(text).c_str()));
++
++    WKFindOptions options = kWKFindOptionsCaseInsensitive | kWKFindOptionsWrapAround
++        | kWKFindOptionsShowFindIndicator | kWKFindOptionsShowHighlight;
++    if (backwards)
++        options |= kWKFindOptionsBackwards;
++
++    if (countMatches)
++        m_findMatches = -1;
++
++    WKPageFindString(webPage, string.get(), options, 1000);
++    if (countMatches)
++        WKPageCountStringMatches(webPage, string.get(), options & ~static_cast<WKFindOptions>(kWKFindOptionsBackwards), 1000);
++}
++
++void WebView::hideFind()
++{
++    m_findMatches = -1;
++    if (auto* webPage = page())
++        WKPageHideFindUI(webPage);
++}
++
+ // ------------------------------------------------------------- WebKitHost
+ 
+ bool WebKitHost::initialize(std::wstring& error)
+@@ -278,6 +552,14 @@
+         return false;
+     }
+ 
++    // YouTube only offers resolutions above 360p to browsers with Media
++    // Source support. Record the default (to learn whether this build has it
++    // switched off) and enable it.
++    log(std::wstring(L"MediaSource enabled by default: ") + (WKPreferencesGetMediaSourceEnabled(m_preferences.get()) ? L"yes" : L"no"));
++    WKPreferencesSetMediaSourceEnabled(m_preferences.get(), true);
++    WKPreferencesSetMediaCapabilitiesEnabled(m_preferences.get(), true);
++    WKPreferencesSetWebGLEnabled(m_preferences.get(), true);
++
+     m_pageConfiguration = adopt(WKPageConfigurationCreate());
+     if (!m_pageConfiguration) {
+         error = L"Could not create the page configuration.";
+@@ -292,12 +574,13 @@
+     return true;
+ }
+ 
+-std::unique_ptr<WebView> WebKitHost::createView(HWND parent)
++std::unique_ptr<WebView> WebKitHost::createView(HWND parent, WKPageConfigurationRef configuration)
+ {
+     auto webView = std::make_unique<WebView>();
+ 
+     RECT initialRect { };
+-    webView->m_view = adopt(WKViewCreate(initialRect, m_pageConfiguration.get(), parent));
++    WKPageConfigurationRef pageConfiguration = configuration ? configuration : m_pageConfiguration.get();
++    webView->m_view = adopt(WKViewCreate(initialRect, pageConfiguration, parent));
+     if (!webView->m_view) {
+         log(L"WKViewCreate failed.");
+         return nullptr;
+@@ -324,6 +607,41 @@
+     client.didChangeCanGoForward = &WebView::didChange;
+     WKPageSetPageStateClient(webPage, &client.base);
+ 
++    WKPageNavigationClientV3 navigation { };
++    navigation.base.version = 3;
++    navigation.base.clientInfo = webView->m_target;
++    navigation.decidePolicyForNavigationAction = &WebView::decideNavigationAction;
++    navigation.decidePolicyForNavigationResponse = &WebView::decideNavigationResponse;
++    navigation.navigationActionDidBecomeDownload = &WebView::actionBecameDownload;
++    navigation.navigationResponseDidBecomeDownload = &WebView::responseBecameDownload;
++    navigation.contextMenuDidCreateDownload = &WebView::contextMenuCreatedDownload;
++    WKPageSetPageNavigationClient(webPage, &navigation.base);
++
++    WKPageUIClientV19 ui { };
++    ui.base.version = 19;
++    ui.base.clientInfo = webView->m_target;
++    ui.createNewPage = &WebView::createNewPage;
++    ui.close = &WebView::closeRequested;
++    ui.runJavaScriptAlert = &WebView::runAlert;
++    ui.runJavaScriptConfirm = &WebView::runConfirm;
++    ui.runJavaScriptPrompt = &WebView::runPrompt;
++    ui.runOpenPanel = &WebView::runOpenPanel;
++    WKPageSetPageUIClient(webPage, &ui.base);
++
++    WKPageFindClientV0 findClient { };
++    findClient.base.version = 0;
++    findClient.base.clientInfo = webView->m_target;
++    findClient.didFindString = &WebView::didFindString;
++    findClient.didFailToFindString = &WebView::didFailToFindString;
++    findClient.didCountStringMatches = &WebView::didCountStringMatches;
++    WKPageSetPageFindClient(webPage, &findClient.base);
++
++    // Set the user agent to current Safari/macOS so YouTube serves HD
++    // streams instead of capping at 360p.
++    auto userAgent = adopt(WKStringCreateWithUTF8CString(toUtf8(kSafariUserAgent).c_str()));
++    WKPageSetCustomUserAgent(webPage, userAgent.get());
++    log(L"Custom user-agent set.");
++
+     const UINT dpi = GetDpiForWindow(parent);
+     WKPageSetCustomBackingScaleFactor(webPage, dpi ? static_cast<double>(dpi) / 96.0 : 1.0);
+ 

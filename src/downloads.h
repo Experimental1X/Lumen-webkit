@@ -21,7 +21,15 @@ struct DownloadItem {
     long long received { 0 };
     long long total { 0 }; // 0 when the size is not known
     State state { State::Active };
-};
+}
+
+// Custom message posted to the browser window when download state changes.
+// The download callbacks can fire on the IPC threads WebKit uses for
+// network progress; calling Browser code (which touches GDI, the panel
+// window, etc.) from there would be undefined behaviour. Posting a message
+// turns every notification into a UI-thread call. wParam is 1 if a new
+// download just started, 0 otherwise.
+#define WM_LUMEN_DOWNLOAD_CHANGED (WM_APP + 7)
 
 // Keeps track of every download, whichever tab started it. Newest first.
 class Downloads {
@@ -31,6 +39,11 @@ public:
     // Starts tracking a download that WebKit created (from a link, a page
     // response or a context menu) and installs the callbacks for it.
     void attach(WKDownloadRef download);
+
+    // Window the browser pumps Download notifications through. Set once at
+    // startup; nullptr falls back to a direct call (used by the
+    // Downloads singleton itself in tests).
+    void setOwnerWindow(HWND window) { m_ownerWindow = window; }
 
     const std::vector<DownloadItem>& items() const { return m_items; }
     bool hasActive() const;
@@ -57,6 +70,7 @@ private:
 
     std::vector<DownloadItem> m_items;
     unsigned m_nextId { 1 };
+    HWND m_ownerWindow { nullptr };
 };
 
 // "3.4 MB", "812 KB" ...
