@@ -18,6 +18,7 @@
 #include <WebKit/WKPageNavigationClient.h>
 #include <WebKit/WKPageUIClient.h>
 #include <WebKit/WKPreferencesRefPrivate.h>
+#include <WebKit/WKURLRequest.h>
 #include <WebKit/WKURLResponse.h>
 
 #include <algorithm>

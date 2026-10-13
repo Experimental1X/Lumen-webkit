@@ -209,7 +209,6 @@ private:
     void showDownloadsPanel(bool takeFocus);
     void hideDownloadsPanel(bool refocusPage);
     void toggleDownloadsPanel();
-    void onDownloadsChanged(bool started);
     void paintDownloadsPanel(HDC dc, int width, int height);
     void downloadsClick(POINT point);
     void downloadsMove(POINT point);

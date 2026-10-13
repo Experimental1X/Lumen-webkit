@@ -410,4 +410,81 @@ inline void drawStartPageIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF c
     }
 }
 
+// Downloads button: a downward arrow on a tray, with a coloured progress arc
+// wrapping it when a download is in flight. Minimal placeholder so the
+// toolbar builds; replace with the project's fuller version if it has one.
+inline void drawDownloadsIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF baseColor, COLORREF accentColor, bool hasActive, double progress, float k)
+{
+    const float cx = (rect.left + rect.right) / 2.0f;
+    const float cy = (rect.top + rect.bottom) / 2.0f;
+    const float trayWidth = 10.0f * k;
+    const float trayHeight = 2.4f * k;
+    const float topY = cy - 1.5f * k;
+    const float arrowSize = 3.6f * k;
+
+    Gdiplus::Pen pen(toGdiColor(baseColor), std::max(1.4f, 1.6f * k));
+    g.DrawLine(&pen, cx - trayWidth, topY, cx + trayWidth, topY);
+
+    Gdiplus::GraphicsPath arrow;
+    arrow.AddLine(cx - arrowSize, topY + 0.5f * k, cx, topY + 0.5f * k + arrowSize);
+    arrow.AddLine(cx, topY + 0.5f * k + arrowSize, cx + arrowSize, topY + 0.5f * k);
+    Gdiplus::SolidBrush brush(toGdiColor(baseColor));
+    Gdiplus::GraphicsPath closed;
+    closed.AddLine(cx - arrowSize, topY + 0.5f * k, cx - arrowSize + 0.1f * k, topY + 0.5f * k);
+    closed.AddLine(cx - arrowSize, topY + 0.5f * k, cx, topY + arrowSize + 0.5f * k);
+    closed.AddLine(cx, topY + arrowSize + 0.5f * k, cx + arrowSize, topY + 0.5f * k);
+    closed.AddLine(cx + arrowSize, topY + 0.5f * k, cx + arrowSize - 0.1f * k, topY + 0.5f * k);
+    closed.CloseFigure();
+    g.FillPath(&brush, &closed);
+
+    if (hasActive) {
+        const float radius = 7.6f * k;
+        Gdiplus::RectF arcRect(cx - radius, cy - radius, radius * 2, radius * 2);
+        Gdiplus::GraphicsPath progressPath;
+        progressPath.AddArc(arcRect, -90.0f, static_cast<Gdiplus::REAL>(-360.0 * std::clamp(progress, 0.0, 1.0)));
+        Gdiplus::Pen accentPen(toGdiColor(accentColor), std::max(1.4f, 1.8f * k));
+        g.DrawPath(&accentPen, &progressPath);
+    }
+}
+
+// A small chevron drawn vertically. `up` flips the orientation.
+inline void drawVerticalChevron(Gdiplus::Graphics& g, const RECT& rect, bool up, COLORREF color, float k)
+{
+    const float cx = (rect.left + rect.right) / 2.0f;
+    const float cy = (rect.top + rect.bottom) / 2.0f;
+    const float half = 4.0f * k;
+    Gdiplus::GraphicsPath path;
+    if (up) {
+        path.AddLine(cx - half, cy + half * 0.4f, cx, cy - half * 0.4f);
+        path.AddLine(cx, cy - half * 0.4f, cx + half, cy + half * 0.4f);
+    } else {
+        path.AddLine(cx - half, cy - half * 0.4f, cx, cy + half * 0.4f);
+        path.AddLine(cx, cy + half * 0.4f, cx + half, cy - half * 0.4f);
+    }
+    Gdiplus::Pen pen(toGdiColor(color), std::max(1.4f, 1.6f * k));
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    g.DrawPath(&pen, &path);
+}
+
+// Magnifying-glass icon: open at the find bar's "Find on Page" affordance.
+inline void drawMagnifierIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, float k)
+{
+    const float cx = (rect.left + rect.right) / 2.0f - 1.0f * k;
+    const float cy = (rect.top + rect.bottom) / 2.0f - 1.0f * k;
+    const float radius = 4.6f * k;
+    Gdiplus::GraphicsPath loop;
+    loop.AddEllipse(cx - radius, cy - radius, radius * 2, radius * 2);
+    Gdiplus::Pen pen(toGdiColor(color), std::max(1.4f, 1.6f * k));
+    g.DrawPath(&pen, &loop);
+    Gdiplus::SolidBrush brush(toGdiColor(color));
+    Gdiplus::GraphicsPath handle;
+    handle.AddLine(cx + radius * 0.7f, cy + radius * 0.7f, cx + radius * 0.7f + 3.5f * k, cy + radius * 0.7f + 3.5f * k);
+    pen.SetWidth(std::max(1.6f, 1.8f * k));
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    g.DrawLine(&pen, cx + radius * 0.7f, cy + radius * 0.7f, cx + radius * 0.7f + 3.5f * k, cy + radius * 0.7f + 3.5f * k);
+}
+
 } // namespace lumen::gfx

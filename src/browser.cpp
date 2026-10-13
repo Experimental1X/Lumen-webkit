@@ -1,8 +1,9 @@
 #include "browser.h"
 
-#include "start_page.h"
+#include "dialogs.h"
 #include "downloads.h"
 #include "downloads_page.h"
+#include "start_page.h"
 #include "util.h"
 
 #include <windowsx.h>
