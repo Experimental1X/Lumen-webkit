@@ -90,6 +90,12 @@ HACCEL createAccelerators()
         { FCONTROL | FSHIFT | FVIRTKEY, 'D', kCmdReadingList },
         { FCONTROL | FSHIFT | FVIRTKEY, 'L', kCmdSidebar },
         { FCONTROL | FSHIFT | FVIRTKEY, VK_OEM_5, kCmdTabOverview },
+        { FCONTROL | FVIRTKEY, 'F', kCmdFind },
+        { FCONTROL | FVIRTKEY, 'G', kCmdFindNext },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'G', kCmdFindPrevious },
+        { FVIRTKEY, VK_F3, kCmdFindNext },
+        { FSHIFT | FVIRTKEY, VK_F3, kCmdFindPrevious },
+        { FCONTROL | FVIRTKEY, 'J', kCmdDownloads },
     };
     return CreateAcceleratorTableW(keys, static_cast<int>(sizeof(keys) / sizeof(keys[0])));
 }
@@ -229,6 +235,10 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         // from child controls (the address field) are ignored.
         if (browser && lParam == 0) {
             browser->onCommand(LOWORD(wParam));
+            return 0;
+        }
+        if (browser && lParam != 0) {
+            browser->onControlNotify(reinterpret_cast<HWND>(lParam), HIWORD(wParam));
             return 0;
         }
         break;

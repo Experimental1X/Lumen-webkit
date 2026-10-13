@@ -31,10 +31,15 @@ enum Command : UINT {
     kCmdBookmarkPage,
     kCmdReadingList,
     kCmdClearHistory,
+    kCmdFind,
+    kCmdFindNext,
+    kCmdFindPrevious,
+    kCmdDownloads,
     kCmdMinimize,
     kCmdMaximize,
     kCmdCloseWindow,
     kCmdAddressControl = 1500,
+    kCmdFindControl = 1501,
     kCmdTabBase = 3000,
 };
 
@@ -53,7 +58,11 @@ enum class Target {
     NewTab,
     TabOverview,
     Tab,
-    TabClose
+    TabClose,
+    Downloads,
+    FindPrevious,
+    FindNext,
+    FindDone
 };
 
 struct HitResult {
@@ -71,6 +80,7 @@ struct HitResult {
 struct ChromeLayout {
     int toolbarHeight { 0 };
     int tabBarHeight { 0 };
+    int findBarHeight { 0 };
     int totalHeight { 0 };
 
     RECT closeLight { };
@@ -86,6 +96,9 @@ struct ChromeLayout {
     RECT pageMenu { };
     RECT reload { };
 
+    bool hasDownloads { false };
+    RECT downloadsButton { };
+
     RECT rightGroup { };
     RECT shareButton { };
     RECT newTabButton { };
@@ -93,6 +106,13 @@ struct ChromeLayout {
 
     RECT tabBar { };
     std::vector<RECT> tabs;
+
+    RECT findBar { };
+    RECT findField { };
+    RECT findPrevious { };
+    RECT findNext { };
+    RECT findStatus { };
+    RECT findDone { };
 };
 
 // The browser: owns the tabs, draws the Safari-style chrome, and handles
@@ -120,6 +140,7 @@ public:
     void onCommand(UINT command);
     bool onKeyDown(WPARAM key);
     void onTimer(UINT_PTR id);
+    void onControlNotify(HWND control, UINT code);
 
     int chromeHeight() const;
     bool trackingMouse() const { return m_trackingMouse; }
@@ -145,6 +166,9 @@ private:
     void activateTab(size_t index);
     void loadStartPage(WebView& view);
     void onViewChanged(WebView* view);
+    void attachCallbacks(WebView* view);
+    WKPageRef openPageFromWebKit(WKPageConfigurationRef configuration);
+    void closeTabForView(WebView* view);
     void updateWindowTitle();
     void resize();
     RECT contentArea() const;
@@ -163,6 +187,31 @@ private:
     static std::wstring normalizeInput(const std::wstring& input);
     void navigate(const std::wstring& input);
     static LRESULT CALLBACK addressProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+
+    // --- find in page ---
+    void createFindControl();
+    void placeFindEdit(const ChromeLayout& l) const;
+    void showFind();
+    void hideFind();
+    void runFind(bool backwards, bool newSearch);
+    static LRESULT CALLBACK findProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+
+    // --- downloads panel ---
+    void createDownloadsPanel();
+    int downloadsPanelHeight() const;
+    int downloadsMaxScroll() const;
+    void layoutDownloadsPanel();
+    void showDownloadsPanel(bool takeFocus);
+    void hideDownloadsPanel(bool refocusPage);
+    void toggleDownloadsPanel();
+    void onDownloadsChanged(bool started);
+    void paintDownloadsPanel(HDC dc, int width, int height);
+    void downloadsClick(POINT point);
+    void downloadsMove(POINT point);
+    void downloadsWheel(int delta);
+    void openDownloadedFile(const std::wstring& path);
+    void revealDownloadedFile(const std::wstring& path);
+    static LRESULT CALLBACK downloadsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
     // --- input and popups ---
     HitResult hitTest(POINT point, const ChromeLayout& l) const;
@@ -220,6 +269,20 @@ private:
     WNDPROC m_addressOriginal { nullptr };
     HFONT m_font { nullptr };
     HBRUSH m_addressBrush { nullptr };
+    HBRUSH m_findBrush { nullptr };
+
+    HWND m_find { nullptr };
+    WNDPROC m_findOriginal { nullptr };
+    bool m_findVisible { false };
+
+    HWND m_downloadsPanel { nullptr };
+    bool m_downloadsVisible { false };
+    bool m_hadDownloads { false };
+    int m_downloadsScroll { 0 };
+    int m_downloadsHoverRow { -1 };
+    bool m_downloadsHoverAction { false };
+    bool m_downloadsHoverClear { false };
+    ULONGLONG m_downloadsHiddenAt { 0 };
     gfx::Theme m_theme;
 
     WebKitHost m_host;

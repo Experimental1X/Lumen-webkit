@@ -31,6 +31,8 @@ endif ()
 add_executable(Lumen WIN32
     src/main.cpp
     src/browser.cpp
+    src/dialogs.cpp
+    src/downloads.cpp
     src/library.cpp
     src/util.cpp
     src/webkit_host.cpp
@@ -54,6 +56,7 @@ target_link_libraries(Lumen PRIVATE
     gdi32
     gdiplus
     advapi32
+    comdlg32
     shell32
 )
 

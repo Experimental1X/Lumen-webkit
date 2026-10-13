@@ -1,9 +1,11 @@
 #include "browser.h"
 
 #include "start_page.h"
+#include "downloads.h"
 #include "util.h"
 
 #include <windowsx.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <cstring>
@@ -37,6 +39,7 @@ constexpr int kTabMinWidth = 96;
 constexpr int kTrafficLightSize = 12;
 constexpr int kTrafficLightGap = 8;
 constexpr int kSidebarWidth = 280;
+constexpr int kFindBarHeight = 46;
 
 bool isStartPage(const std::wstring& url)
 {
@@ -101,6 +104,8 @@ Browser::~Browser()
         DeleteObject(m_font);
     if (m_addressBrush)
         DeleteObject(m_addressBrush);
+    if (m_findBrush)
+        DeleteObject(m_findBrush);
 }
 
 bool Browser::create(HWND window, std::wstring& error)
@@ -114,6 +119,9 @@ bool Browser::create(HWND window, std::wstring& error)
         return false;
 
     createAddressControl();
+    createFindControl();
+    createDownloadsPanel();
+    Downloads::instance().onChanged = [this](bool started) { onDownloadsChanged(started); };
 
     if (!newTab(L"")) {
         error = L"Could not create the first web view. See lumen.log.";
@@ -124,6 +132,7 @@ bool Browser::create(HWND window, std::wstring& error)
 
 void Browser::destroy()
 {
+    Downloads::instance().onChanged = nullptr;
     if (m_window)
         KillTimer(m_window, kReapTimer);
     m_tabs.clear();
@@ -175,7 +184,7 @@ float Browser::scaleFactor() const
 
 int Browser::chromeHeight() const
 {
-    return px(kToolbarHeight) + (m_tabs.size() > 1 ? px(kTabBarHeight) : 0);
+    return px(kToolbarHeight) + (m_tabs.size() > 1 ? px(kTabBarHeight) : 0) + (m_findVisible ? px(kFindBarHeight) : 0);
 }
 
 void Browser::invalidateChrome() const
@@ -185,7 +194,7 @@ void Browser::invalidateChrome() const
 
     RECT area { };
     GetClientRect(m_window, &area);
-    area.bottom = std::min<LONG>(area.bottom, px(kToolbarHeight) + px(kTabBarHeight));
+    area.bottom = std::min<LONG>(area.bottom, px(kToolbarHeight) + px(kTabBarHeight) + px(kFindBarHeight));
     InvalidateRect(m_window, &area, FALSE);
 }
 
@@ -197,8 +206,14 @@ void Browser::applyTheme(bool dark)
         DeleteObject(m_addressBrush);
     m_addressBrush = CreateSolidBrush(m_theme.pillFocused);
 
+    if (m_findBrush)
+        DeleteObject(m_findBrush);
+    m_findBrush = CreateSolidBrush(m_theme.pill);
+
     if (m_address)
         InvalidateRect(m_address, nullptr, TRUE);
+    if (m_find)
+        InvalidateRect(m_find, nullptr, TRUE);
 }
 
 void Browser::updateFont()
@@ -212,6 +227,8 @@ void Browser::updateFont()
     m_font = font;
     if (m_address)
         SendMessageW(m_address, WM_SETFONT, reinterpret_cast<WPARAM>(m_font), TRUE);
+    if (m_find)
+        SendMessageW(m_find, WM_SETFONT, reinterpret_cast<WPARAM>(m_font), TRUE);
     if (previous)
         DeleteObject(previous);
 }
@@ -229,7 +246,8 @@ ChromeLayout Browser::layout() const
 
     l.toolbarHeight = px(kToolbarHeight);
     l.tabBarHeight = m_tabs.size() > 1 ? px(kTabBarHeight) : 0;
-    l.totalHeight = l.toolbarHeight + l.tabBarHeight;
+    l.findBarHeight = m_findVisible ? px(kFindBarHeight) : 0;
+    l.totalHeight = l.toolbarHeight + l.tabBarHeight + l.findBarHeight;
 
     const int pad = px(kToolbarSidePadding);
     const int light = px(kTrafficLightSize);
@@ -261,8 +279,15 @@ ChromeLayout Browser::layout() const
     l.forward = { l.back.right, controlTop, l.navGroup.right, controlBottom };
 
     // Right glass group: share, new tab, tab overview.
-    l.rightGroup = { width - pad - button * 3, controlTop, width - pad, controlBottom };
-    l.shareButton = { l.rightGroup.left, controlTop, l.rightGroup.left + button, controlBottom };
+    l.hasDownloads = !Downloads::instance().items().empty();
+    const int rightButtons = l.hasDownloads ? 4 : 3;
+    l.rightGroup = { width - pad - button * rightButtons, controlTop, width - pad, controlBottom };
+    int buttonX = l.rightGroup.left;
+    if (l.hasDownloads) {
+        l.downloadsButton = { buttonX, controlTop, buttonX + button, controlBottom };
+        buttonX += button;
+    }
+    l.shareButton = { buttonX, controlTop, buttonX + button, controlBottom };
     l.newTabButton = { l.shareButton.right, controlTop, l.shareButton.right + button, controlBottom };
     l.overviewButton = { l.newTabButton.right, controlTop, l.rightGroup.right, controlBottom };
 
@@ -292,6 +317,21 @@ ChromeLayout Browser::layout() const
             const int left = outer + i * (tabWidth + gap);
             l.tabs.push_back(RECT { left, top, left + tabWidth, bottom });
         }
+    }
+
+    // Find bar (a third row, shown with Ctrl+F).
+    if (l.findBarHeight > 0) {
+        const int top = l.toolbarHeight + l.tabBarHeight;
+        l.findBar = { 0, top, width, l.totalHeight };
+        const int fieldHeight = px(30);
+        const int fieldTop = top + (l.findBarHeight - fieldHeight) / 2;
+        const int fieldWidth = std::clamp(width - px(360), px(140), px(320));
+        const int step = px(32);
+        l.findField = { pad, fieldTop, pad + fieldWidth, fieldTop + fieldHeight };
+        l.findPrevious = { l.findField.right + px(8), fieldTop, l.findField.right + px(8) + step, fieldTop + fieldHeight };
+        l.findNext = { l.findPrevious.right, fieldTop, l.findPrevious.right + step, fieldTop + fieldHeight };
+        l.findStatus = { l.findNext.right + px(12), fieldTop, l.findNext.right + px(12) + px(150), fieldTop + fieldHeight };
+        l.findDone = { width - pad - px(64), fieldTop, width - pad, fieldTop + fieldHeight };
     }
 
     return l;
@@ -328,6 +368,7 @@ void Browser::resize()
 
     const ChromeLayout l = layout();
     placeAddressBar(l);
+    placeFindEdit(l);
 
     for (const auto& tab : m_tabs) {
         HWND viewWindow = tab->hwnd();
@@ -347,6 +388,9 @@ void Browser::resize()
     // Repaint everything: the sidebar and the tab overview are drawn by this
     // window and must follow every size change.
     InvalidateRect(m_window, nullptr, FALSE);
+
+    if (m_downloadsVisible)
+        layoutDownloadsPanel();
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +412,7 @@ bool Browser::newTab(const std::wstring& url)
         return false;
 
     WebView* raw = view.get();
-    raw->onChanged = [this, raw] { onViewChanged(raw); };
+    attachCallbacks(raw);
     m_tabs.push_back(std::move(view));
 
     activateTab(m_tabs.size() - 1);
@@ -663,6 +707,9 @@ void Browser::showPageMenu()
     AppendMenuW(menu, MF_STRING, kCmdReadingList, L"Add to Reading List\tCtrl+Shift+D");
     AppendMenuW(menu, MF_STRING, kCmdCopyLink, L"Copy Link");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdFind, L"Find on Page...\tCtrl+F");
+    AppendMenuW(menu, MF_STRING, kCmdDownloads, L"Show Downloads\tCtrl+J");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdReload, L"Reload Page\tCtrl+R");
     AppendMenuW(menu, MF_STRING, kCmdStartPage, L"Show Start Page");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -802,6 +849,24 @@ void Browser::onCommand(UINT command)
         m_library.clearHistory();
         InvalidateRect(m_window, nullptr, FALSE);
         break;
+    case kCmdFind:
+        showFind();
+        break;
+    case kCmdFindNext:
+        if (m_findVisible)
+            runFind(false, false);
+        else
+            showFind();
+        break;
+    case kCmdFindPrevious:
+        if (m_findVisible)
+            runFind(true, false);
+        else
+            showFind();
+        break;
+    case kCmdDownloads:
+        toggleDownloadsPanel();
+        break;
     case kCmdMinimize:
         ShowWindow(m_window, SW_MINIMIZE);
         break;
@@ -846,9 +911,16 @@ HitResult Browser::hitTest(POINT point, const ChromeLayout& l) const
     }
     if (contains(l.pill)) return { Target::Address, 0 };
 
+    if (l.hasDownloads && contains(l.downloadsButton)) return { Target::Downloads, 0 };
     if (contains(l.shareButton)) return { Target::Share, 0 };
     if (contains(l.newTabButton)) return { Target::NewTab, 0 };
     if (contains(l.overviewButton)) return { Target::TabOverview, 0 };
+
+    if (l.findBarHeight > 0) {
+        if (contains(l.findPrevious)) return { Target::FindPrevious, 0 };
+        if (contains(l.findNext)) return { Target::FindNext, 0 };
+        if (contains(l.findDone)) return { Target::FindDone, 0 };
+    }
 
     for (size_t i = 0; i < l.tabs.size(); ++i) {
         if (!contains(l.tabs[i]))
@@ -940,6 +1012,8 @@ bool Browser::onLeftButtonDown(POINT point)
     // Below the toolbar: only reached when the main window itself is clicked
     // (the sidebar or the tab overview), not a page.
     if (point.y >= l.totalHeight) {
+        if (m_downloadsVisible)
+            hideDownloadsPanel(false);
         if (m_editing) {
             SetFocus(m_window);
             endAddressEdit();
@@ -958,6 +1032,9 @@ bool Browser::onLeftButtonDown(POINT point)
     }
 
     const HitResult hit = hitTest(point, l);
+
+    if (m_downloadsVisible && hit.target != Target::Downloads)
+        hideDownloadsPanel(false);
 
     if (m_editing && hit.target != Target::Address) {
         SetFocus(m_window);
@@ -1008,6 +1085,18 @@ bool Browser::onLeftButtonDown(POINT point)
         return true;
     case Target::TabClose:
         closeTab(hit.tab);
+        return true;
+    case Target::Downloads:
+        toggleDownloadsPanel();
+        return true;
+    case Target::FindPrevious:
+        runFind(true, false);
+        return true;
+    case Target::FindNext:
+        runFind(false, false);
+        return true;
+    case Target::FindDone:
+        hideFind();
         return true;
     }
 
@@ -1121,6 +1210,12 @@ bool Browser::onMouseWheel(WPARAM wParam, LPARAM lParam)
 
 LRESULT Browser::onCtlColorEdit(HDC dc, HWND control)
 {
+    if (control == m_find && m_find) {
+        SetTextColor(dc, m_theme.text);
+        SetBkColor(dc, m_theme.pill);
+        return reinterpret_cast<LRESULT>(m_findBrush);
+    }
+
     if (control != m_address)
         return 0;
 
@@ -1209,6 +1304,8 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     fillSolid(dc, RECT { 0, 0, width, l.toolbarHeight }, m_theme.toolbar);
     if (l.tabBarHeight > 0)
         fillSolid(dc, l.tabBar, m_theme.tabBar);
+    if (l.findBarHeight > 0)
+        fillSolid(dc, l.findBar, m_theme.toolbar);
     fillSolid(dc, RECT { 0, l.totalHeight - 1, width, l.totalHeight }, m_theme.separator);
 
     Gdiplus::Graphics g(dc);
@@ -1278,6 +1375,12 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     drawChevronIcon(g, l.forward, true, canGoForward ? m_theme.text : m_theme.textDisabled, k);
 
     drawGlass(l.rightGroup);
+    if (l.hasDownloads) {
+        if (m_hover.target == Target::Downloads)
+            drawHot(l.downloadsButton);
+        const Downloads& downloads = Downloads::instance();
+        drawDownloadsIcon(g, l.downloadsButton, m_theme.text, m_theme.accent, downloads.hasActive(), downloads.progress(), k);
+    }
     if (m_hover.target == Target::Share)
         drawHot(l.shareButton);
     if (m_hover.target == Target::NewTab)
@@ -1403,6 +1506,40 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
             textRect,
             isActive ? m_theme.text : m_theme.textSecondary,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+
+    // --- find bar ---
+    if (l.findBarHeight > 0) {
+        const int fieldRadius = (l.findField.bottom - l.findField.top) / 2;
+        fillRoundedRect(g, l.findField, fieldRadius, m_theme.pill);
+
+        const int matches = current ? current->findMatches() : -1;
+        const bool canStep = matches > 0;
+
+        auto stepHot = [&](const RECT& rect, Target target) {
+            if (m_hover.target == target && canStep) {
+                RECT inset = rect;
+                InflateRect(&inset, -px(2), -px(2));
+                fillRoundedRect(g, inset, px(8), m_theme.pill);
+            }
+        };
+        stepHot(l.findPrevious, Target::FindPrevious);
+        stepHot(l.findNext, Target::FindNext);
+        drawVerticalChevron(g, l.findPrevious, true, canStep ? m_theme.text : m_theme.textDisabled, k);
+        drawVerticalChevron(g, l.findNext, false, canStep ? m_theme.text : m_theme.textDisabled, k);
+
+        std::wstring status;
+        if (matches == 0)
+            status = L"Not found";
+        else if (matches == 1)
+            status = L"1 match";
+        else if (matches > 1)
+            status = std::to_wstring(matches) + L" matches";
+        drawText(status, l.findStatus, m_theme.textSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        if (m_hover.target == Target::FindDone)
+            fillRoundedRect(g, l.findDone, px(8), m_theme.pill);
+        drawText(L"Done", l.findDone, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
     g.Flush(Gdiplus::FlushIntentionSync);
@@ -1951,6 +2088,628 @@ void Browser::paintSidebar(HDC dc, int width, int height)
 
     fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
     g.Flush(Gdiplus::FlushIntentionSync);
+}
+
+
+// ---------------------------------------------------------------------------
+// Pages opened by web content, and find in page
+// ---------------------------------------------------------------------------
+
+void Browser::attachCallbacks(WebView* view)
+{
+    view->onChanged = [this, view] { onViewChanged(view); };
+    view->onNewPage = [this](WKPageConfigurationRef configuration) { return openPageFromWebKit(configuration); };
+    view->onCloseRequested = [this, view] { closeTabForView(view); };
+}
+
+WKPageRef Browser::openPageFromWebKit(WKPageConfigurationRef configuration)
+{
+    // A link with target=_blank or window.open: show it as a new tab.
+    m_overview = false;
+
+    auto view = m_host.createView(m_window, configuration);
+    if (!view)
+        return nullptr;
+
+    WebView* raw = view.get();
+    attachCallbacks(raw);
+    m_tabs.push_back(std::move(view));
+
+    activateTab(m_tabs.size() - 1);
+    InvalidateRect(m_window, nullptr, FALSE);
+    return raw->page();
+}
+
+void Browser::closeTabForView(WebView* view)
+{
+    // window.close(). The last tab is never closed this way.
+    if (m_tabs.size() <= 1)
+        return;
+
+    for (size_t i = 0; i < m_tabs.size(); ++i) {
+        if (m_tabs[i].get() == view) {
+            closeTab(i);
+            return;
+        }
+    }
+}
+
+void Browser::onControlNotify(HWND control, UINT code)
+{
+    if (control == m_find && code == EN_CHANGE)
+        runFind(false, true);
+}
+
+void Browser::createFindControl()
+{
+    m_find = CreateWindowExW(
+        0, L"EDIT", L"",
+        WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | ES_LEFT,
+        0, 0, 10, 10,
+        m_window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCmdFindControl)),
+        GetModuleHandleW(nullptr),
+        nullptr);
+    if (!m_find)
+        return;
+
+    SendMessageW(m_find, WM_SETFONT, reinterpret_cast<WPARAM>(m_font), TRUE);
+    SendMessageW(m_find, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search on page"));
+
+    SetWindowLongPtrW(m_find, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    m_findOriginal = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(m_find, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&Browser::findProc)));
+}
+
+LRESULT CALLBACK Browser::findProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto* browser = reinterpret_cast<Browser*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!browser || !browser->m_findOriginal)
+        return DefWindowProcW(window, message, wParam, lParam);
+
+    switch (message) {
+    case WM_CHAR:
+        if (wParam == VK_RETURN || wParam == VK_ESCAPE)
+            return 0;
+        break;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_RETURN) {
+            browser->runFind(GetKeyState(VK_SHIFT) < 0, false);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            browser->hideFind();
+            return 0;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    return CallWindowProcW(browser->m_findOriginal, window, message, wParam, lParam);
+}
+
+void Browser::placeFindEdit(const ChromeLayout& l) const
+{
+    if (!m_find || l.findBarHeight <= 0)
+        return;
+
+    const int inset = px(12);
+    const int height = px(20);
+    const int top = l.findField.top + ((l.findField.bottom - l.findField.top) - height) / 2;
+    const int width = std::max(px(40), static_cast<int>(l.findField.right - l.findField.left) - inset * 2);
+    MoveWindow(m_find, l.findField.left + inset, top, width, height, TRUE);
+}
+
+void Browser::showFind()
+{
+    if (!m_find)
+        return;
+
+    if (m_overview)
+        hideOverview();
+    endAddressEdit();
+
+    if (!m_findVisible) {
+        m_findVisible = true;
+        resize();
+        ShowWindow(m_find, SW_SHOW);
+    }
+
+    SetFocus(m_find);
+    SendMessageW(m_find, EM_SETSEL, 0, -1);
+    runFind(false, true);
+    InvalidateRect(m_window, nullptr, FALSE);
+}
+
+void Browser::hideFind()
+{
+    if (!m_findVisible)
+        return;
+
+    m_findVisible = false;
+    for (const auto& tab : m_tabs)
+        tab->hideFind();
+
+    ShowWindow(m_find, SW_HIDE);
+    resize();
+
+    if (auto* view = active())
+        view->focus();
+}
+
+void Browser::runFind(bool backwards, bool newSearch)
+{
+    auto* view = active();
+    if (!view || !m_find || !m_findVisible)
+        return;
+
+    const int length = GetWindowTextLengthW(m_find);
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(m_find, text.data(), length + 1);
+    text.resize(static_cast<size_t>(length));
+
+    view->find(text, backwards, newSearch);
+    invalidateChrome();
+}
+
+// ---------------------------------------------------------------------------
+// Downloads panel
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kDownloadsWidth = 380;
+constexpr int kDownloadsHeader = 48;
+constexpr int kDownloadsRow = 68;
+constexpr int kDownloadsMaxHeight = 460;
+
+RECT downloadsActionRect(const RECT& row, int size, int margin)
+{
+    const int top = row.top + ((row.bottom - row.top) - size) / 2;
+    return { row.right - margin - size, top, row.right - margin, top + size };
+}
+
+bool isRiskyFile(const std::wstring& path)
+{
+    const size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos)
+        return false;
+
+    std::wstring extension = path.substr(dot);
+    for (auto& ch : extension) {
+        if (ch >= L'A' && ch <= L'Z')
+            ch = static_cast<wchar_t>(ch - L'A' + L'a');
+    }
+
+    static const wchar_t* const risky[] = {
+        L".exe", L".msi", L".bat", L".cmd", L".com", L".scr", L".ps1", L".vbs", L".vbe",
+        L".js", L".jse", L".wsf", L".lnk", L".jar", L".hta", L".reg", L".dll", L".msix", L".appx"
+    };
+    for (const wchar_t* item : risky) {
+        if (extension == item)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
+void Browser::createDownloadsPanel()
+{
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW windowClass { };
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = &Browser::downloadsProc;
+        windowClass.hInstance = GetModuleHandleW(nullptr);
+        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.hbrBackground = nullptr;
+        windowClass.lpszClassName = L"LumenDownloads";
+        RegisterClassExW(&windowClass);
+        registered = true;
+    }
+
+    // A small owned pop-up window: it floats above the page views, which a
+    // child window of the main window could not reliably do.
+    m_downloadsPanel = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"LumenDownloads", L"",
+        WS_POPUP,
+        0, 0, 10, 10,
+        m_window, nullptr, GetModuleHandleW(nullptr), this);
+}
+
+LRESULT CALLBACK Browser::downloadsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    auto* browser = reinterpret_cast<Browser*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!browser)
+        return DefWindowProcW(window, message, wParam, lParam);
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT paint { };
+        HDC dc = BeginPaint(window, &paint);
+        RECT client { };
+        GetClientRect(window, &client);
+        browser->paintBuffered(dc, client, [&](HDC memory) {
+            browser->paintDownloadsPanel(memory, static_cast<int>(client.right), static_cast<int>(client.bottom));
+        });
+        EndPaint(window, &paint);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN:
+        browser->downloadsClick(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+        return 0;
+
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT track { sizeof(track), TME_LEAVE, window, 0 };
+        TrackMouseEvent(&track);
+        browser->downloadsMove(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        browser->downloadsMove(POINT { -1, -1 });
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        browser->downloadsWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            browser->hideDownloadsPanel(true);
+            return 0;
+        }
+        break;
+
+    case WM_ACTIVATE:
+        // Like a menu: clicking anywhere else dismisses it.
+        if (LOWORD(wParam) == WA_INACTIVE)
+            browser->hideDownloadsPanel(false);
+        break;
+
+    default:
+        break;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+int Browser::downloadsPanelHeight() const
+{
+    const int rows = static_cast<int>(Downloads::instance().items().size());
+    const int content = px(kDownloadsHeader) + rows * px(kDownloadsRow) + px(8);
+    return std::min(content, px(kDownloadsMaxHeight));
+}
+
+int Browser::downloadsMaxScroll() const
+{
+    const int rows = static_cast<int>(Downloads::instance().items().size());
+    const int visible = downloadsPanelHeight() - px(kDownloadsHeader) - px(8);
+    return std::max(0, rows * px(kDownloadsRow) - visible);
+}
+
+void Browser::layoutDownloadsPanel()
+{
+    if (!m_downloadsPanel)
+        return;
+
+    const ChromeLayout l = layout();
+    RECT client { };
+    GetClientRect(m_window, &client);
+
+    const int width = px(kDownloadsWidth);
+    const int height = downloadsPanelHeight();
+    const int anchorRight = l.hasDownloads ? static_cast<int>(l.downloadsButton.right) : static_cast<int>(client.right) - px(20);
+    const int x = std::clamp(anchorRight - width, px(8), std::max(px(8), static_cast<int>(client.right) - width - px(8)));
+    const int y = l.toolbarHeight - px(4);
+
+    POINT origin { x, y };
+    ClientToScreen(m_window, &origin);
+    SetWindowPos(m_downloadsPanel, HWND_TOP, origin.x, origin.y, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+
+    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, px(28), px(28));
+    SetWindowRgn(m_downloadsPanel, region, TRUE);
+
+    m_downloadsScroll = std::clamp(m_downloadsScroll, 0, downloadsMaxScroll());
+}
+
+void Browser::showDownloadsPanel(bool takeFocus)
+{
+    if (!m_downloadsPanel || Downloads::instance().items().empty())
+        return;
+
+    m_downloadsVisible = true;
+    layoutDownloadsPanel();
+    InvalidateRect(m_downloadsPanel, nullptr, FALSE);
+
+    // Take focus only when this window is in front, so a download that starts
+    // while another program is in use does not steal the keyboard.
+    if (takeFocus && GetForegroundWindow() == m_window)
+        SetForegroundWindow(m_downloadsPanel);
+}
+
+void Browser::hideDownloadsPanel(bool refocusPage)
+{
+    m_downloadsHiddenAt = GetTickCount64();
+    if (!m_downloadsVisible)
+        return;
+
+    m_downloadsVisible = false;
+    m_downloadsHoverRow = -1;
+    m_downloadsHoverAction = false;
+    m_downloadsHoverClear = false;
+
+    if (m_downloadsPanel)
+        ShowWindow(m_downloadsPanel, SW_HIDE);
+
+    if (refocusPage && !m_editing && !m_overview) {
+        if (auto* view = active())
+            view->focus();
+    }
+}
+
+void Browser::toggleDownloadsPanel()
+{
+    if (m_downloadsVisible) {
+        hideDownloadsPanel(true);
+        return;
+    }
+
+    // Clicking the button while the panel is open first deactivates (and
+    // hides) it; do not open it again straight away.
+    if (GetTickCount64() - m_downloadsHiddenAt < 300)
+        return;
+
+    showDownloadsPanel(true);
+}
+
+void Browser::onDownloadsChanged(bool started)
+{
+    const bool has = !Downloads::instance().items().empty();
+    if (has != m_hadDownloads) {
+        m_hadDownloads = has;
+        resize(); // the toolbar button appears or disappears
+    }
+
+    if (!has)
+        hideDownloadsPanel(true);
+    else if (started)
+        showDownloadsPanel(true);
+    else if (m_downloadsVisible) {
+        layoutDownloadsPanel();
+        InvalidateRect(m_downloadsPanel, nullptr, FALSE);
+    }
+
+    invalidateChrome();
+}
+
+void Browser::paintDownloadsPanel(HDC dc, int width, int height)
+{
+    fillSolid(dc, RECT { 0, 0, width, height }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+    const float k = scaleFactor();
+    const int header = px(kDownloadsHeader);
+    const int rowHeight = px(kDownloadsRow);
+    const int actionSize = px(26);
+    const int actionMargin = px(16);
+    const std::vector<DownloadItem>& items = Downloads::instance().items();
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        const DownloadItem& item = items[i];
+        const int top = header + static_cast<int>(i) * rowHeight - m_downloadsScroll;
+        const RECT row { 0, top, width, top + rowHeight };
+        if (row.bottom < header || row.top > height)
+            continue;
+
+        const bool hot = static_cast<int>(i) == m_downloadsHoverRow;
+        if (hot) {
+            RECT inset = row;
+            InflateRect(&inset, -px(8), -px(2));
+            fillRoundedRect(g, inset, px(10), m_theme.pill);
+        }
+
+        // File badge: the extension's first letter.
+        std::wstring extension;
+        const size_t dot = item.filename.find_last_of(L'.');
+        if (dot != std::wstring::npos)
+            extension = item.filename.substr(dot + 1);
+        const int badge = px(36);
+        const RECT badgeRect { row.left + px(18), row.top + (rowHeight - badge) / 2, row.left + px(18) + badge, row.top + (rowHeight - badge) / 2 + badge };
+        drawSiteBadge(g, badgeRect, badgeLetter(extension), colorFromHue(hueOf(extension)), k * 1.6f);
+
+        const RECT action = downloadsActionRect(row, actionSize, actionMargin);
+        const int textLeft = badgeRect.right + px(12);
+        const int textRight = action.left - px(10);
+
+        const RECT nameRect { textLeft, row.top + px(10), textRight, row.top + px(10) + px(20) };
+        drawLabel(dc, g, item.filename, nameRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        std::wstring status;
+        switch (item.state) {
+        case DownloadItem::State::Active:
+            status = item.total > 0 ? formatBytes(item.received) + L" of " + formatBytes(item.total) : formatBytes(item.received);
+            break;
+        case DownloadItem::State::Finished:
+            status = formatBytes(item.total > 0 ? item.total : item.received);
+            if (!item.source.empty())
+                status += L" \u2014 " + item.source;
+            break;
+        case DownloadItem::State::Failed:
+            status = L"Download failed";
+            break;
+        case DownloadItem::State::Cancelled:
+            status = L"Cancelled";
+            break;
+        }
+        const RECT statusRect { textLeft, row.top + px(30), textRight, row.top + px(30) + px(18) };
+        drawLabel(dc, g, status, statusRect, m_theme.textSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        if (item.state == DownloadItem::State::Active) {
+            const int barTop = row.top + px(52);
+            const int barHeight = px(4);
+            const RECT track { textLeft, barTop, textRight, barTop + barHeight };
+            fillRoundedRect(g, track, barHeight / 2, m_theme.pillHover);
+            if (item.total > 0) {
+                const double fraction = std::clamp(static_cast<double>(item.received) / static_cast<double>(item.total), 0.0, 1.0);
+                const RECT fill { textLeft, barTop, textLeft + static_cast<LONG>((textRight - textLeft) * fraction), barTop + barHeight };
+                fillRoundedRect(g, fill, barHeight / 2, m_theme.accent);
+            }
+        }
+
+        // Round button: cancel, show in folder, or remove.
+        const bool actionHot = hot && m_downloadsHoverAction;
+        fillRoundedRect(g, action, actionSize / 2, actionHot ? m_theme.glassHover : m_theme.pillHover);
+        if (item.state == DownloadItem::State::Finished)
+            drawMagnifierIcon(g, action, m_theme.text, k);
+        else
+            drawCloseIcon(g, action, m_theme.text, k);
+    }
+
+    // Header over the rows, so rows scrolled past the top are hidden.
+    fillSolid(dc, RECT { 0, 0, width, header }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    const RECT titleRect { px(18), 0, width / 2, header };
+    drawLabel(dc, g, L"Downloads", titleRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    bool anyFinished = false;
+    for (const auto& item : items) {
+        if (item.state != DownloadItem::State::Active)
+            anyFinished = true;
+    }
+    const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
+    if (m_downloadsHoverClear && anyFinished)
+        fillRoundedRect(g, clearRect, px(8), m_theme.pill);
+    drawLabel(dc, g, L"Clear", clearRect, anyFinished ? m_theme.accent : m_theme.textDisabled,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    fillSolid(dc, RECT { 0, header - 1, width, header }, m_theme.separator);
+    strokeRoundedRect(g, RECT { 0, 0, width, height }, px(14), m_theme.glassBorder, std::max(1.0f, k));
+    g.Flush(Gdiplus::FlushIntentionSync);
+}
+
+void Browser::downloadsClick(POINT point)
+{
+    const int width = px(kDownloadsWidth);
+    const int header = px(kDownloadsHeader);
+    const int rowHeight = px(kDownloadsRow);
+    const std::vector<DownloadItem> items = Downloads::instance().items(); // copy: clicks may change the list
+
+    if (point.y < header) {
+        const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
+        if (PtInRect(&clearRect, point))
+            Downloads::instance().clearFinished();
+        return;
+    }
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        const int top = header + static_cast<int>(i) * rowHeight - m_downloadsScroll;
+        const RECT row { 0, top, width, top + rowHeight };
+        if (!PtInRect(&row, point))
+            continue;
+
+        const DownloadItem& item = items[i];
+        const RECT action = downloadsActionRect(row, px(26), px(16));
+        if (PtInRect(&action, point)) {
+            if (item.state == DownloadItem::State::Active)
+                Downloads::instance().cancel(item.id);
+            else if (item.state == DownloadItem::State::Finished)
+                revealDownloadedFile(item.path);
+            else
+                Downloads::instance().remove(item.id);
+            return;
+        }
+
+        if (item.state == DownloadItem::State::Finished) {
+            hideDownloadsPanel(false);
+            openDownloadedFile(item.path);
+        }
+        return;
+    }
+}
+
+void Browser::downloadsMove(POINT point)
+{
+    const int width = px(kDownloadsWidth);
+    const int header = px(kDownloadsHeader);
+    const int rowHeight = px(kDownloadsRow);
+    const std::vector<DownloadItem>& items = Downloads::instance().items();
+
+    int hoverRow = -1;
+    bool hoverAction = false;
+    bool hoverClear = false;
+
+    if (point.x >= 0 && point.y >= 0) {
+        if (point.y < header) {
+            const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
+            hoverClear = PtInRect(&clearRect, point) != FALSE;
+        } else {
+            for (size_t i = 0; i < items.size(); ++i) {
+                const int top = header + static_cast<int>(i) * rowHeight - m_downloadsScroll;
+                const RECT row { 0, top, width, top + rowHeight };
+                if (!PtInRect(&row, point))
+                    continue;
+
+                hoverRow = static_cast<int>(i);
+                const RECT action = downloadsActionRect(row, px(26), px(16));
+                hoverAction = PtInRect(&action, point) != FALSE;
+                break;
+            }
+        }
+    }
+
+    if (hoverRow == m_downloadsHoverRow && hoverAction == m_downloadsHoverAction && hoverClear == m_downloadsHoverClear)
+        return;
+
+    m_downloadsHoverRow = hoverRow;
+    m_downloadsHoverAction = hoverAction;
+    m_downloadsHoverClear = hoverClear;
+    InvalidateRect(m_downloadsPanel, nullptr, FALSE);
+}
+
+void Browser::downloadsWheel(int delta)
+{
+    const int step = MulDiv(delta, px(60), 120);
+    m_downloadsScroll = std::clamp(m_downloadsScroll - step, 0, downloadsMaxScroll());
+    InvalidateRect(m_downloadsPanel, nullptr, FALSE);
+}
+
+void Browser::openDownloadedFile(const std::wstring& path)
+{
+    if (isRiskyFile(path)) {
+        const int answer = MessageBoxW(
+            m_window,
+            L"This file can run programs on your computer. Only open files from sources you trust.\n\nOpen it anyway?",
+            L"Open Download",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (answer != IDYES)
+            return;
+    }
+
+    ShellExecuteW(m_window, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void Browser::revealDownloadedFile(const std::wstring& path)
+{
+    const std::wstring arguments = L"/select,\"" + path + L"\"";
+    ShellExecuteW(m_window, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
 }
 
 
