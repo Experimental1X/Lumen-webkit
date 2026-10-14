@@ -1,17 +1,8 @@
-// Force-parse <iterator> in the global namespace before anything else. If
-// any later #include pulls it in inside `namespace lumen { ... }`, MSVC's
-// parser tries to instantiate `lumen::std::back_insert_iterator` and the
-// chain of `output_iterator_tag` / `iterator_t` errors starts. Parsing
-// it up front in the global namespace pre-empts that.
-#include <iterator>
-
 #include "browser.h"
 
+#include "start_page.h"
 #include "downloads.h"
 #include "downloads_page.h"
-#include "settings.h"
-#include "settings_page.h"
-#include "start_page.h"
 #include "util.h"
 
 #include <windowsx.h>
@@ -28,7 +19,7 @@
 
 namespace lumen {
 
-// (using namespace gfx removed; every gfx call is now fully qualified)
+using namespace gfx;
 
 namespace {
 
@@ -132,8 +123,6 @@ bool Browser::create(HWND window, std::wstring& error)
     createFindControl();
     createDownloadsPanel();
     Downloads::instance().setOwnerWindow(m_window);
-    // Settings persist across launches (settings.tsv under %APPDATA%\Lumen).
-    Settings::instance().load();
     // The download callbacks can fire on WebKit's IPC threads; funnel them
     // through WM_LUMEN_DOWNLOAD_CHANGED so onDownloadsChanged always runs on
     // the UI thread (its code touches GDI).
@@ -1275,7 +1264,7 @@ void Browser::onPaint(HDC target)
         paintBuffered(target, content, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
     } else {
         // Page area behind the web views.
-        gfx::fillSolid(target, content, m_theme.page);
+        fillSolid(target, content, m_theme.page);
 
         if (m_sidebarVisible) {
             const RECT panel { 0, l.totalHeight, std::min(px(kSidebarWidth), width), l.totalHeight + contentHeight };
@@ -1334,12 +1323,12 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     const int width = client.right;
     const float k = scaleFactor();
 
-    gfx::fillSolid(dc, RECT { 0, 0, width, l.toolbarHeight }, m_theme.toolbar);
+    fillSolid(dc, RECT { 0, 0, width, l.toolbarHeight }, m_theme.toolbar);
     if (l.tabBarHeight > 0)
-        gfx::fillSolid(dc, l.tabBar, m_theme.tabBar);
+        fillSolid(dc, l.tabBar, m_theme.tabBar);
     if (l.findBarHeight > 0)
-        gfx::fillSolid(dc, l.findBar, m_theme.toolbar);
-    gfx::fillSolid(dc, RECT { 0, l.totalHeight - 1, width, l.totalHeight }, m_theme.separator);
+        fillSolid(dc, l.findBar, m_theme.toolbar);
+    fillSolid(dc, RECT { 0, l.totalHeight - 1, width, l.totalHeight }, m_theme.separator);
 
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -1373,46 +1362,46 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     const bool lightsHot = m_hover.target == Target::CloseWindow
         || m_hover.target == Target::MinimizeWindow
         || m_hover.target == Target::MaximizeWindow;
-    gfx::drawTrafficLight(g, l.closeLight, RGB(255, 95, 87));
-    gfx::drawTrafficLight(g, l.minimizeLight, RGB(254, 188, 46));
-    gfx::drawTrafficLight(g, l.maximizeLight, RGB(40, 200, 64));
+    drawTrafficLight(g, l.closeLight, RGB(255, 95, 87));
+    drawTrafficLight(g, l.minimizeLight, RGB(254, 188, 46));
+    drawTrafficLight(g, l.maximizeLight, RGB(40, 200, 64));
     if (lightsHot) {
-        gfx::drawTrafficLightGlyph(g, l.closeLight, gfx::TrafficLight::Close, k);
-        gfx::drawTrafficLightGlyph(g, l.minimizeLight, gfx::TrafficLight::Minimize, k);
-        gfx::drawTrafficLightGlyph(g, l.maximizeLight, gfx::TrafficLight::Maximize, k);
+        drawTrafficLightGlyph(g, l.closeLight, TrafficLight::Close, k);
+        drawTrafficLightGlyph(g, l.minimizeLight, TrafficLight::Minimize, k);
+        drawTrafficLightGlyph(g, l.maximizeLight, TrafficLight::Maximize, k);
     }
 
     // --- glass capsules ---
     auto drawGlass = [&](const RECT& rect) {
         const int radius = (rect.bottom - rect.top) / 2;
-        gfx::fillRoundedRect(g, rect, radius, m_theme.glass);
-        gfx::strokeRoundedRect(g, rect, radius, m_theme.glassBorder, std::max(1.0f, k));
+        fillRoundedRect(g, rect, radius, m_theme.glass);
+        strokeRoundedRect(g, rect, radius, m_theme.glassBorder, std::max(1.0f, k));
     };
     auto drawHot = [&](const RECT& rect) {
         RECT inset = rect;
         InflateRect(&inset, -px(2), -px(2));
-        gfx::fillRoundedRect(g, inset, (inset.bottom - inset.top) / 2, m_theme.glassHover);
+        fillRoundedRect(g, inset, (inset.bottom - inset.top) / 2, m_theme.glassHover);
     };
 
     drawGlass(l.sidebar);
     if (m_hover.target == Target::Sidebar)
         drawHot(l.sidebar);
-    gfx::drawSidebarIcon(g, l.sidebar, m_theme.text, k);
+    drawSidebarIcon(g, l.sidebar, m_theme.text, k);
 
     drawGlass(l.navGroup);
     if (m_hover.target == Target::Back && canGoBack)
         drawHot(l.back);
     if (m_hover.target == Target::Forward && canGoForward)
         drawHot(l.forward);
-    gfx::drawChevronIcon(g, l.back, false, canGoBack ? m_theme.text : m_theme.textDisabled, k);
-    gfx::drawChevronIcon(g, l.forward, true, canGoForward ? m_theme.text : m_theme.textDisabled, k);
+    drawChevronIcon(g, l.back, false, canGoBack ? m_theme.text : m_theme.textDisabled, k);
+    drawChevronIcon(g, l.forward, true, canGoForward ? m_theme.text : m_theme.textDisabled, k);
 
     drawGlass(l.rightGroup);
     if (l.hasDownloads) {
         if (m_hover.target == Target::Downloads)
             drawHot(l.downloadsButton);
         const Downloads& downloads = Downloads::instance();
-        gfx::drawDownloadsIcon(g, l.downloadsButton, m_theme.text, m_theme.accent, downloads.hasActive(), downloads.progress(), k);
+        drawDownloadsIcon(g, l.downloadsButton, m_theme.text, m_theme.accent, downloads.hasActive(), downloads.progress(), k);
     }
     if (m_hover.target == Target::Share)
         drawHot(l.shareButton);
@@ -1420,9 +1409,9 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         drawHot(l.newTabButton);
     if (m_hover.target == Target::TabOverview)
         drawHot(l.overviewButton);
-    gfx::drawShareIcon(g, l.shareButton, m_theme.text, k);
-    gfx::drawPlusIcon(g, l.newTabButton, m_theme.text, k);
-    gfx::drawTabOverviewIcon(g, l.overviewButton, m_theme.text, k);
+    drawShareIcon(g, l.shareButton, m_theme.text, k);
+    drawPlusIcon(g, l.newTabButton, m_theme.text, k);
+    drawTabOverviewIcon(g, l.overviewButton, m_theme.text, k);
 
     // --- address field ---
     const int pillRadius = (l.pill.bottom - l.pill.top) / 2;
@@ -1430,13 +1419,13 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         || m_hover.target == Target::PageMenu
         || m_hover.target == Target::Reload;
     const COLORREF pillColor = m_editing ? m_theme.pillFocused : (pillHot ? m_theme.pillHover : m_theme.pill);
-    gfx::fillRoundedRect(g, l.pill, pillRadius, pillColor);
+    fillRoundedRect(g, l.pill, pillRadius, pillColor);
 
     if (!m_editing && loading) {
         // Safari shows load progress as a thin line along the bottom edge of
         // the address field, clipped to the field's rounded shape.
         Gdiplus::GraphicsPath clipPath;
-        gfx::addRoundedRect(clipPath, gfx::toRectF(l.pill), static_cast<Gdiplus::REAL>(pillRadius));
+        addRoundedRect(clipPath, toRectF(l.pill), static_cast<Gdiplus::REAL>(pillRadius));
         g.SetClip(&clipPath);
 
         const int lineHeight = std::max(2, px(2));
@@ -1447,19 +1436,19 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
             l.pill.left + static_cast<LONG>((l.pill.right - l.pill.left) * shown),
             l.pill.bottom
         };
-        Gdiplus::SolidBrush progressBrush(gfx::toGdiColor(m_theme.accent));
-        g.FillRectangle(&progressBrush, gfx::toRectF(bar));
+        Gdiplus::SolidBrush progressBrush(toGdiColor(m_theme.accent));
+        g.FillRectangle(&progressBrush, toRectF(bar));
         g.ResetClip();
     }
 
     if (m_editing) {
-        gfx::strokeRoundedRect(g, l.pill, pillRadius, m_theme.accent, 2.0f * k, 210);
+        strokeRoundedRect(g, l.pill, pillRadius, m_theme.accent, 2.0f * k, 210);
     } else {
-        gfx::drawPageMenuIcon(g, l.pageMenu, m_theme.textSecondary, k);
+        drawPageMenuIcon(g, l.pageMenu, m_theme.textSecondary, k);
         if (loading)
-            gfx::drawStopIcon(g, l.reload, m_theme.textSecondary, k);
+            drawStopIcon(g, l.reload, m_theme.textSecondary, k);
         else
-            gfx::drawReloadIcon(g, l.reload, m_theme.textSecondary, k);
+            drawReloadIcon(g, l.reload, m_theme.textSecondary, k);
 
         bool secure = false;
         const std::wstring host = addressDisplayText(secure);
@@ -1474,7 +1463,7 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         const int groupLeft = area.left + (areaWidth - groupWidth) / 2;
 
         if (secure) {
-            gfx::drawLockIcon(
+            drawLockIcon(
                 g,
                 static_cast<float>(groupLeft) + 5.0f * k,
                 static_cast<float>((l.pill.top + l.pill.bottom) / 2),
@@ -1498,17 +1487,17 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         const int tabRadius = px(8);
 
         if (isActive) {
-            gfx::fillRoundedRect(g, tabRect, tabRadius, m_theme.tabActive);
-            gfx::strokeRoundedRect(g, tabRect, tabRadius, m_theme.tabBorder, std::max(1.0f, k), 150);
+            fillRoundedRect(g, tabRect, tabRadius, m_theme.tabActive);
+            strokeRoundedRect(g, tabRect, tabRadius, m_theme.tabBorder, std::max(1.0f, k), 150);
         } else if (hot) {
-            gfx::fillRoundedRect(g, tabRect, tabRadius, m_theme.tabHover);
+            fillRoundedRect(g, tabRect, tabRadius, m_theme.tabHover);
         }
 
         if (isActive || hot) {
             const RECT closeRect = tabCloseRect(tabRect);
             if (m_hover.target == Target::TabClose && m_hover.tab == i)
-                gfx::fillRoundedRect(g, closeRect, (closeRect.bottom - closeRect.top) / 2, m_theme.glassHover);
-            gfx::drawCloseIcon(g, closeRect, m_theme.textSecondary, k);
+                fillRoundedRect(g, closeRect, (closeRect.bottom - closeRect.top) / 2, m_theme.glassHover);
+            drawCloseIcon(g, closeRect, m_theme.textSecondary, k);
         }
 
         const WebView& view = *m_tabs[i];
@@ -1527,10 +1516,10 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
 
         const RECT iconRect { groupLeft, centerY - iconSize / 2, groupLeft + iconSize, centerY - iconSize / 2 + iconSize };
         if (isStartPage(view.url())) {
-            gfx::drawStartPageIcon(g, iconRect, m_theme.textSecondary, k);
+            drawStartPageIcon(g, iconRect, m_theme.textSecondary, k);
         } else {
             const std::wstring host = hostOf(view.url());
-            gfx::drawSiteBadge(g, iconRect, badgeLetter(host), gfx::colorFromHue(hueOf(host)), k);
+            drawSiteBadge(g, iconRect, badgeLetter(host), colorFromHue(hueOf(host)), k);
         }
 
         const RECT textRect { iconRect.right + iconGap, tabRect.top, iconRect.right + iconGap + textWidth, tabRect.bottom };
@@ -1544,7 +1533,7 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     // --- find bar ---
     if (l.findBarHeight > 0) {
         const int fieldRadius = (l.findField.bottom - l.findField.top) / 2;
-        gfx::fillRoundedRect(g, l.findField, fieldRadius, m_theme.pill);
+        fillRoundedRect(g, l.findField, fieldRadius, m_theme.pill);
 
         const int matches = current ? current->findMatches() : -1;
         const bool canStep = matches > 0;
@@ -1553,13 +1542,13 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
             if (m_hover.target == target && canStep) {
                 RECT inset = rect;
                 InflateRect(&inset, -px(2), -px(2));
-                gfx::fillRoundedRect(g, inset, px(8), m_theme.pill);
+                fillRoundedRect(g, inset, px(8), m_theme.pill);
             }
         };
         stepHot(l.findPrevious, Target::FindPrevious);
         stepHot(l.findNext, Target::FindNext);
-        gfx::drawVerticalChevron(g, l.findPrevious, true, canStep ? m_theme.text : m_theme.textDisabled, k);
-        gfx::drawVerticalChevron(g, l.findNext, false, canStep ? m_theme.text : m_theme.textDisabled, k);
+        drawVerticalChevron(g, l.findPrevious, true, canStep ? m_theme.text : m_theme.textDisabled, k);
+        drawVerticalChevron(g, l.findNext, false, canStep ? m_theme.text : m_theme.textDisabled, k);
 
         std::wstring status;
         if (matches == 0)
@@ -1571,7 +1560,7 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         drawText(status, l.findStatus, m_theme.textSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
         if (m_hover.target == Target::FindDone)
-            gfx::fillRoundedRect(g, l.findDone, px(8), m_theme.pill);
+            fillRoundedRect(g, l.findDone, px(8), m_theme.pill);
         drawText(L"Done", l.findDone, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
@@ -1814,7 +1803,7 @@ void Browser::overviewMove(POINT local, int width)
 void Browser::paintOverview(HDC dc, int width, int height)
 {
     const RECT whole { 0, 0, width, height };
-    gfx::fillSolid(dc, whole, m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
+    fillSolid(dc, whole, m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
 
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -1836,29 +1825,29 @@ void Browser::paintOverview(HDC dc, int width, int height)
         const bool hot = static_cast<int>(i) == m_overviewHoverCard;
 
         // Picture of the page.
-        gfx::fillRoundedRect(g, card.thumb, radius, m_theme.page);
+        fillRoundedRect(g, card.thumb, radius, m_theme.page);
         if (HBITMAP bitmap = view.thumbnail()) {
             Gdiplus::GraphicsPath path;
-            gfx::addRoundedRect(path, gfx::toRectF(card.thumb), static_cast<Gdiplus::REAL>(radius));
+            addRoundedRect(path, toRectF(card.thumb), static_cast<Gdiplus::REAL>(radius));
             g.SetClip(&path);
             Gdiplus::Bitmap image(bitmap, nullptr);
-            g.DrawImage(&image, gfx::toRectF(card.thumb));
+            g.DrawImage(&image, toRectF(card.thumb));
             g.ResetClip();
         } else if (isStartPage(view.url())) {
-            gfx::drawStartPageIcon(g, card.thumb, m_theme.textSecondary, k * 3.0f);
+            drawStartPageIcon(g, card.thumb, m_theme.textSecondary, k * 3.0f);
         }
 
-        gfx::strokeRoundedRect(
+        strokeRoundedRect(
             g, card.thumb, radius,
             isActive ? m_theme.accent : m_theme.tabBorder,
             isActive ? 3.0f * k : std::max(1.0f, k));
 
         // Close button, shown on hover (and always for the active tab).
         if (hot || isActive) {
-            gfx::fillRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2,
+            fillRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2,
                 (hot && m_overviewHoverClose) ? m_theme.glassHover : m_theme.glass);
-            gfx::strokeRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2, m_theme.glassBorder, std::max(1.0f, k));
-            gfx::drawCloseIcon(g, card.close, m_theme.text, k);
+            strokeRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2, m_theme.glassBorder, std::max(1.0f, k));
+            drawCloseIcon(g, card.close, m_theme.text, k);
         }
 
         // Title with the site badge, centered under the picture.
@@ -1871,10 +1860,10 @@ void Browser::paintOverview(HDC dc, int width, int height)
         const RECT iconRect { groupLeft, centerY - iconSize / 2, groupLeft + iconSize, centerY - iconSize / 2 + iconSize };
 
         if (isStartPage(view.url())) {
-            gfx::drawStartPageIcon(g, iconRect, m_theme.textSecondary, k);
+            drawStartPageIcon(g, iconRect, m_theme.textSecondary, k);
         } else {
             const std::wstring host = hostOf(view.url());
-            gfx::drawSiteBadge(g, iconRect, badgeLetter(host), gfx::colorFromHue(hueOf(host)), k);
+            drawSiteBadge(g, iconRect, badgeLetter(host), colorFromHue(hueOf(host)), k);
         }
 
         const RECT textRect { iconRect.right + px(6), card.title.top, iconRect.right + px(6) + textWidth, card.title.bottom };
@@ -1918,17 +1907,6 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
     const int listTop = s.segmented.bottom + margin;
     s.list = { 0, listTop, s.width, std::max(listTop, height - footer) };
     s.clearButton = { margin, height - px(42), s.width - margin, height - px(12) };
-
-    // Gear is a 32px-tall circle in the bottom-right corner. It sits on top
-    // of the segmented control's left padding and below the list so it
-    // doesn't crowd the entries.
-    const int gearSize = px(32);
-    s.gearButton = {
-        s.width - margin - gearSize,
-        std::max(listTop + margin, height - margin - gearSize),
-        s.width - margin,
-        height - margin
-    };
     return s;
 }
 
@@ -1987,13 +1965,6 @@ bool Browser::sidebarClick(POINT local, int height)
         m_library.clearHistory();
         m_sidebarScroll = 0;
         InvalidateRect(m_window, nullptr, FALSE);
-        return true;
-    }
-
-    // Settings (gear) takes priority over the list because it lives in the
-    // bottom-right corner of the sidebar and the list can scroll into it.
-    if (PtInRect(&s.gearButton, local)) {
-        openSettings();
         return true;
     }
 
@@ -2059,7 +2030,7 @@ void Browser::sidebarMove(POINT local, int height)
 void Browser::paintSidebar(HDC dc, int width, int height)
 {
     const RECT whole { 0, 0, width, height };
-    gfx::fillSolid(dc, whole, m_theme.tabBar);
+    fillSolid(dc, whole, m_theme.tabBar);
 
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -2081,13 +2052,13 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         if (hot) {
             RECT inset = row;
             InflateRect(&inset, -px(8), -px(2));
-            gfx::fillRoundedRect(g, inset, px(8), m_theme.pill);
+            fillRoundedRect(g, inset, px(8), m_theme.pill);
         }
 
         const std::wstring host = hostOf(entries[i].url);
         const int badge = px(18);
         const RECT badgeRect { row.left + px(18), row.top + (s.rowHeight - badge) / 2, row.left + px(18) + badge, row.top + (s.rowHeight - badge) / 2 + badge };
-        gfx::drawSiteBadge(g, badgeRect, badgeLetter(host), gfx::colorFromHue(hueOf(host)), k);
+        drawSiteBadge(g, badgeRect, badgeLetter(host), colorFromHue(hueOf(host)), k);
 
         const int textLeft = badgeRect.right + px(10);
         const int textRight = row.right - px(44);
@@ -2100,8 +2071,8 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         if (hot) {
             const RECT closeRect = sidebarRowClose(row);
             if (m_sidebarHoverClose)
-                gfx::fillRoundedRect(g, closeRect, (closeRect.bottom - closeRect.top) / 2, m_theme.glassHover);
-            gfx::drawCloseIcon(g, closeRect, m_theme.textSecondary, k);
+                fillRoundedRect(g, closeRect, (closeRect.bottom - closeRect.top) / 2, m_theme.glassHover);
+            drawCloseIcon(g, closeRect, m_theme.textSecondary, k);
         }
     }
 
@@ -2113,17 +2084,17 @@ void Browser::paintSidebar(HDC dc, int width, int height)
 
     // Header band with the segmented control.
     const RECT header { 0, 0, width, s.list.top };
-    gfx::fillSolid(dc, header, m_theme.tabBar);
+    fillSolid(dc, header, m_theme.tabBar);
 
-    gfx::fillRoundedRect(g, s.segmented, px(8), m_theme.pill);
+    fillRoundedRect(g, s.segmented, px(8), m_theme.pill);
     static const wchar_t* const names[3] = { L"Bookmarks", L"Reading List", L"History" };
     for (int i = 0; i < 3; ++i) {
         const bool selected = i == m_sidebarMode;
         if (selected) {
             RECT inset = s.segments[i];
             InflateRect(&inset, -px(2), -px(2));
-            gfx::fillRoundedRect(g, inset, px(6), m_theme.glass);
-            gfx::strokeRoundedRect(g, inset, px(6), m_theme.glassBorder, std::max(1.0f, k));
+            fillRoundedRect(g, inset, px(6), m_theme.glass);
+            strokeRoundedRect(g, inset, px(6), m_theme.glassBorder, std::max(1.0f, k));
         }
         drawLabel(dc, g, names[i], s.segments[i], selected ? m_theme.text : m_theme.textSecondary,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -2132,22 +2103,12 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     // Footer with "Clear History" on the History tab.
     if (m_sidebarMode == 2) {
         const RECT footer { 0, s.list.bottom, width, height };
-        gfx::fillSolid(dc, footer, m_theme.tabBar);
-        gfx::fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
+        fillSolid(dc, footer, m_theme.tabBar);
+        fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
         drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
-    // Settings gear in the bottom-right corner, always visible.
-    {
-        RECT gearInset = s.gearButton;
-        InflateRect(&gearInset, -px(2), -px(2));
-        const int gearRadius = std::max(2, static_cast<int>(gearInset.bottom - gearInset.top) / 2);
-        gfx::fillRoundedRect(g, gearInset, gearRadius, m_theme.pill);
-        gfx::strokeRoundedRect(g, gearInset, gearRadius, m_theme.glassBorder, std::max(1.0f, k));
-        gfx::drawGearIcon(g, gearInset, m_theme.textSecondary, k * 0.6f);
-    }
-
-    gfx::fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
+    fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
     g.Flush(Gdiplus::FlushIntentionSync);
 }
 
@@ -2570,7 +2531,7 @@ void Browser::onDownloadsChanged(bool started)
 
 void Browser::paintDownloadsPanel(HDC dc, int width, int height)
 {
-    gfx::fillSolid(dc, RECT { 0, 0, width, height }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    fillSolid(dc, RECT { 0, 0, width, height }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
 
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -2595,7 +2556,7 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
         if (hot) {
             RECT inset = row;
             InflateRect(&inset, -px(8), -px(2));
-            gfx::fillRoundedRect(g, inset, px(10), m_theme.pill);
+            fillRoundedRect(g, inset, px(10), m_theme.pill);
         }
 
         // File badge: the extension's first letter.
@@ -2605,7 +2566,7 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
             extension = item.filename.substr(dot + 1);
         const int badge = px(36);
         const RECT badgeRect { row.left + px(18), row.top + (rowHeight - badge) / 2, row.left + px(18) + badge, row.top + (rowHeight - badge) / 2 + badge };
-        gfx::drawSiteBadge(g, badgeRect, badgeLetter(extension), gfx::colorFromHue(hueOf(extension)), k * 1.6f);
+        drawSiteBadge(g, badgeRect, badgeLetter(extension), colorFromHue(hueOf(extension)), k * 1.6f);
 
         const RECT action = downloadsActionRect(row, actionSize, actionMargin);
         const int textLeft = badgeRect.right + px(12);
@@ -2643,32 +2604,32 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
             const int barTop = row.top + px(52);
             const int barHeight = px(4);
             const RECT track { textLeft, barTop, textRight, barTop + barHeight };
-            gfx::fillRoundedRect(g, track, barHeight / 2, m_theme.pillHover);
+            fillRoundedRect(g, track, barHeight / 2, m_theme.pillHover);
             if (item.total > 0) {
                 const double fraction = std::clamp(static_cast<double>(item.received) / static_cast<double>(item.total), 0.0, 1.0);
                 const RECT fill { textLeft, barTop, textLeft + static_cast<LONG>((textRight - textLeft) * fraction), barTop + barHeight };
-                gfx::fillRoundedRect(g, fill, barHeight / 2, m_theme.accent);
+                fillRoundedRect(g, fill, barHeight / 2, m_theme.accent);
             } else {
                 // Total size unknown (chunked transfer, no Content-Length):
                 // draw a centred "pulse" so the row still reads as in-progress.
                 const int pulseWidth = std::max(px(48), (textRight - textLeft) / 3);
                 const int pulseLeft = textLeft + ((textRight - textLeft) - pulseWidth) / 2;
                 const RECT pulse { pulseLeft, barTop, pulseLeft + pulseWidth, barTop + barHeight };
-                gfx::fillRoundedRect(g, pulse, barHeight / 2, m_theme.accent, 200);
+                fillRoundedRect(g, pulse, barHeight / 2, m_theme.accent, 200);
             }
         }
 
         // Round button: cancel, show in folder, or remove.
         const bool actionHot = hot && m_downloadsHoverAction;
-        gfx::fillRoundedRect(g, action, actionSize / 2, actionHot ? m_theme.glassHover : m_theme.pillHover);
+        fillRoundedRect(g, action, actionSize / 2, actionHot ? m_theme.glassHover : m_theme.pillHover);
         if (item.state == DownloadItem::State::Finished)
-            gfx::drawMagnifierIcon(g, action, m_theme.text, k);
+            drawMagnifierIcon(g, action, m_theme.text, k);
         else
-            gfx::drawCloseIcon(g, action, m_theme.text, k);
+            drawCloseIcon(g, action, m_theme.text, k);
     }
 
     // Header over the rows, so rows scrolled past the top are hidden.
-    gfx::fillSolid(dc, RECT { 0, 0, width, header }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    fillSolid(dc, RECT { 0, 0, width, header }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
     const RECT titleRect { px(18), 0, width / 2, header };
     drawLabel(dc, g, L"Downloads", titleRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
@@ -2679,23 +2640,23 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
     }
     const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
     if (m_downloadsHoverClear && anyFinished)
-        gfx::fillRoundedRect(g, clearRect, px(8), m_theme.pill);
+        fillRoundedRect(g, clearRect, px(8), m_theme.pill);
     drawLabel(dc, g, L"Clear", clearRect, anyFinished ? m_theme.accent : m_theme.textDisabled,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-    gfx::fillSolid(dc, RECT { 0, header - 1, width, header }, m_theme.separator);
-    gfx::strokeRoundedRect(g, RECT { 0, 0, width, height }, px(14), m_theme.glassBorder, std::max(1.0f, k));
+    fillSolid(dc, RECT { 0, header - 1, width, header }, m_theme.separator);
+    strokeRoundedRect(g, RECT { 0, 0, width, height }, px(14), m_theme.glassBorder, std::max(1.0f, k));
 
     // Footer with the "Show in Page" link, painted last so it covers any
     // row that has scrolled past the bottom edge.
     const int footer = px(kDownloadsFooter);
     const RECT footerRect { 0, height - footer, width, height };
-    gfx::fillSolid(dc, footerRect, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
-    gfx::fillSolid(dc, RECT { 0, height - footer, width, height - footer + 1 }, m_theme.separator);
+    fillSolid(dc, footerRect, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    fillSolid(dc, RECT { 0, height - footer, width, height - footer + 1 }, m_theme.separator);
 
     const RECT showAllRect { px(16), height - footer + px(6), width - px(16), height - px(6) };
     if (m_downloadsHoverShowAll)
-        gfx::fillRoundedRect(g, showAllRect, px(8), m_theme.pill);
+        fillRoundedRect(g, showAllRect, px(8), m_theme.pill);
     drawLabel(dc, g, L"Show All in Page", showAllRect, m_theme.accent,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
@@ -2845,39 +2806,6 @@ void Browser::showDownloadsPage()
     activateTab(m_downloadsPageTab);
     raw->loadHtml(downloadsPageHtml(m_theme.dark));
     invalidateChrome();
-}
-
-void Browser::openSettings()
-{
-    // If a Settings tab is already open, just bring it forward.
-    if (m_settingsPageTab != static_cast<size_t>(-1) && m_settingsPageTab < m_tabs.size()) {
-        activateTab(m_settingsPageTab);
-        return;
-    }
-
-    auto view = m_host.createView(m_window);
-    if (!view)
-        return;
-
-    WebView* raw = view.get();
-    attachCallbacks(raw);
-    m_tabs.push_back(std::move(view));
-    m_settingsPageTab = m_tabs.size() - 1;
-
-    activateTab(m_settingsPageTab);
-    raw->loadHtml(settingsPageHtml(m_theme.dark));
-    invalidateChrome();
-}
-
-void Browser::onSettingsChanged()
-{
-    // Re-applied values can land here later (theme switch, default zoom,
-    // etc.). For now, just push a fresh HTML snapshot to the open settings
-    // tab so the user sees the new value they just picked.
-    if (m_settingsPageTab == static_cast<size_t>(-1) || m_settingsPageTab >= m_tabs.size())
-        return;
-    if (auto* view = m_tabs[m_settingsPageTab].get())
-        view->loadHtml(settingsPageHtml(m_theme.dark));
 }
 
 

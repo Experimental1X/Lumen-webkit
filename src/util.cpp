@@ -76,23 +76,6 @@ std::wstring fileUrlFromPath(const std::wstring& path)
     return fromUtf8(encoded);
 }
 
-std::string escapeHtml(const std::string& s)
-{
-    std::string result;
-    result.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-        case '<':  result += "&lt;";  break;
-        case '>':  result += "&gt;";  break;
-        case '&':  result += "&amp;"; break;
-        case '"':  result += "&quot;"; break;
-        case '\'': result += "&#39;"; break;
-        default:   result += c;      break;
-        }
-    }
-    return result;
-}
-
 std::wstring executableDirectory()
 {
     wchar_t path[MAX_PATH * 2] { };

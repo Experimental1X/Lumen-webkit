@@ -410,50 +410,6 @@ inline void drawStartPageIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF c
     }
 }
 
-// Settings affordance: an outlined cog with notches around the rim and a hole
-// in the middle. Same visual idiom as the other chrome icons.
-inline void drawGearIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, float k)
-{
-    const float cx = (rect.left + rect.right) / 2.0f;
-    const float cy = (rect.top + rect.bottom) / 2.0f;
-    const float outer = 8.2f * k;
-    const float inner = 5.6f * k;
-    const float hole = 2.6f * k;
-    const int teeth = 8;
-
-    Gdiplus::GraphicsPath path;
-    for (int i = 0; i < teeth; ++i) {
-        const float a0 = (static_cast<float>(i) / teeth) * 360.0f - 90.0f;
-        const float a1 = ((static_cast<float>(i) + 0.5f) / teeth) * 360.0f - 90.0f;
-        const float a2 = ((static_cast<float>(i) + 1.0f) / teeth) * 360.0f - 90.0f;
-        const float r0x = cx + std::cos(a0 * 3.14159265f / 180.0f) * (outer - 1.4f * k);
-        const float r0y = cy + std::sin(a0 * 3.14159265f / 180.0f) * (outer - 1.4f * k);
-        const float r1x = cx + std::cos(a1 * 3.14159265f / 180.0f) * outer;
-        const float r1y = cy + std::sin(a1 * 3.14159265f / 180.0f) * outer;
-        const float r2x = cx + std::cos(a2 * 3.14159265f / 180.0f) * (outer - 1.4f * k);
-        const float r2y = cy + std::sin(a2 * 3.14159265f / 180.0f) * (outer - 1.4f * k);
-        if (i == 0)
-            path.AddLine(r0x, r0y, r1x, r1y);
-        else
-            path.AddLine(r0x, r0y, r1x, r1y);
-        path.AddLine(r1x, r1y, r2x, r2y);
-    }
-    path.CloseFigure();
-
-    Gdiplus::SolidBrush brush(toGdiColor(color));
-    g.FillPath(&brush, &path);
-
-    // Outer ring outline on top
-    Gdiplus::Pen pen(toGdiColor(color), std::max(1.4f, 1.6f * k));
-    Gdiplus::GraphicsPath ringPath;
-    ringPath.AddEllipse(cx - inner, cy - inner, inner * 2.0f, inner * 2.0f);
-    g.DrawPath(&pen, &ringPath);
-
-    // Centre hole
-    Gdiplus::SolidBrush bg(toGdiColor(0x2b2c32));
-    g.FillEllipse(&bg, cx - hole, cy - hole, hole * 2.0f, hole * 2.0f);
-}
-
 // Circled down arrow with a progress ring while downloads are active.
 inline void drawDownloadsIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, COLORREF accent, bool active, double progress, float k)
 {

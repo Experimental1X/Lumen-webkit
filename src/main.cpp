@@ -5,7 +5,6 @@
 
 #include "browser.h"
 #include "downloads.h"
-#include "settings.h"
 #include "util.h"
 
 #include <windows.h>
@@ -248,11 +247,6 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     case WM_LUMEN_DOWNLOAD_CHANGED:
         if (browser)
             browser->onDownloadsChanged(wParam != 0);
-        return 0;
-
-    case WM_LUMEN_SETTINGS_CHANGED:
-        if (browser)
-            browser->onSettingsChanged();
         return 0;
 
     case WM_DPICHANGED: {

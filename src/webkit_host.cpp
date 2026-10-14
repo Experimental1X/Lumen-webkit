@@ -1,6 +1,5 @@
 #include "webkit_host.h"
 
-#include "settings.h"
 #include "util.h"
 #include "webkit_util.h"
 
@@ -19,7 +18,6 @@
 #include <WebKit/WKPageNavigationClient.h>
 #include <WebKit/WKPageUIClient.h>
 #include <WebKit/WKPreferencesRefPrivate.h>
-#include <WebKit/WKURLRequest.h>
 #include <WebKit/WKURLResponse.h>
 
 #include <algorithm>
@@ -95,12 +93,6 @@ void handleLumenAction(const std::wstring& url)
         }
     } else if (action == L"clear") {
         downloads.clearFinished();
-    } else if (action == L"settings") {
-        // Apply the change to Settings. Browser picks up the message below
-        // and re-renders the open Settings tab so the new value shows up.
-        Settings::instance().set(getParam(L"key"), getParam(L"value"));
-        if (HWND browser = FindWindowW(L"LumenMainWindow", nullptr))
-            PostMessageW(browser, WM_LUMEN_SETTINGS_CHANGED, 0, 0);
     }
 }
 

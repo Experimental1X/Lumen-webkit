@@ -21,7 +21,7 @@ struct DownloadItem {
     long long received { 0 };
     long long total { 0 }; // 0 when the size is not known
     State state { State::Active };
-};
+}
 
 // Custom message posted to the browser window when download state changes.
 // The download callbacks can fire on the IPC threads WebKit uses for

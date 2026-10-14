@@ -2,7 +2,6 @@
 
 #include "gfx.h"
 #include "library.h"
-#include "settings.h"
 #include "webkit_host.h"
 
 #include <functional>
@@ -143,21 +142,6 @@ public:
     void onTimer(UINT_PTR id);
     void onControlNotify(HWND control, UINT code);
 
-    // Pumped by the WM_LUMEN_DOWNLOAD_CHANGED message handler in main.cpp
-    // (download callbacks fire on WebKit's IPC threads, so the resulting
-    // UI work has to land on this thread).
-    void onDownloadsChanged(bool started);
-
-    // Opens the Settings page in a new tab. Subsequent toggles/picker
-    // changes write through to settings.tsv (see lumen:settings URL
-    // handling in webkit_host.cpp).
-    void openSettings();
-
-    // Refreshed by the WM_LUMEN_SETTINGS_CHANGED message handler in
-    // main.cpp after every lumen:settings URL is processed, so the open
-    // Settings tab reflects the new value without a manual reload.
-    void onSettingsChanged();
-
     int chromeHeight() const;
     bool trackingMouse() const { return m_trackingMouse; }
     void setTrackingMouse(bool value) { m_trackingMouse = value; }
@@ -220,6 +204,7 @@ private:
     void showDownloadsPanel(bool takeFocus);
     void hideDownloadsPanel(bool refocusPage);
     void toggleDownloadsPanel();
+    void onDownloadsChanged(bool started);
     void paintDownloadsPanel(HDC dc, int width, int height);
     void downloadsClick(POINT point);
     void downloadsMove(POINT point);
@@ -266,10 +251,6 @@ private:
         RECT segments[3] { };
         RECT list { };
         RECT clearButton { };
-        // Always-visible gear button in the bottom-right corner that opens
-        // the Settings tab. Computed in sidebarLayout; clicked in sidebarClick;
-        // drawn in paintSidebar.
-        RECT gearButton { };
     };
     SidebarLayout sidebarLayout(int height) const;
     const std::vector<LibraryEntry>& sidebarEntries() const;
@@ -311,11 +292,6 @@ private:
     // view whenever Downloads::onChanged fires, so the page itself does not
     // have to self-reload.
     size_t m_downloadsPageTab { static_cast<size_t>(-1) };
-
-    // Same idea for the Settings tab; the Settings HTML uses form submits
-    // and toggles rather than a meta refresh, but the browser refreshes the
-    // page after each lumen:settings URL handler so the new value renders.
-    size_t m_settingsPageTab { static_cast<size_t>(-1) };
 
     WebKitHost m_host;
     Library m_library;
