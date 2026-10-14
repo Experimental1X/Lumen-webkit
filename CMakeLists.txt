@@ -29,13 +29,14 @@ if (NOT EXISTS "${LUMEN_SDK_DIR}/include/WebKit/WKView.h")
 endif ()
 
 # Every translation unit in src/. Verified against the patched source:
-# browser, dialogs, downloads, library, util, webkit_host, plus main.
+# browser, dialogs, downloads, library, settings, util, webkit_host, plus main.
 add_executable(Lumen WIN32
     src/main.cpp
     src/browser.cpp
     src/dialogs.cpp
     src/downloads.cpp
     src/library.cpp
+    src/settings.cpp
     src/util.cpp
     src/webkit_host.cpp
 )

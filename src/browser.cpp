@@ -123,6 +123,8 @@ bool Browser::create(HWND window, std::wstring& error)
     createFindControl();
     createDownloadsPanel();
     Downloads::instance().setOwnerWindow(m_window);
+    // Settings persist across launches (settings.tsv under %APPDATA%\Lumen).
+    Settings::instance().load();
     // The download callbacks can fire on WebKit's IPC threads; funnel them
     // through WM_LUMEN_DOWNLOAD_CHANGED so onDownloadsChanged always runs on
     // the UI thread (its code touches GDI).
@@ -1907,6 +1909,17 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
     const int listTop = s.segmented.bottom + margin;
     s.list = { 0, listTop, s.width, std::max(listTop, height - footer) };
     s.clearButton = { margin, height - px(42), s.width - margin, height - px(12) };
+
+    // Gear is a 32px-tall circle in the bottom-right corner. It sits on top
+    // of the segmented control's left padding and below the list so it
+    // doesn't crowd the entries.
+    const int gearSize = px(32);
+    s.gearButton = {
+        s.width - margin - gearSize,
+        std::max(listTop + margin, height - margin - gearSize),
+        s.width - margin,
+        height - margin
+    };
     return s;
 }
 
@@ -1965,6 +1978,13 @@ bool Browser::sidebarClick(POINT local, int height)
         m_library.clearHistory();
         m_sidebarScroll = 0;
         InvalidateRect(m_window, nullptr, FALSE);
+        return true;
+    }
+
+    // Settings (gear) takes priority over the list because it lives in the
+    // bottom-right corner of the sidebar and the list can scroll into it.
+    if (PtInRect(&s.gearButton, local)) {
+        openSettings();
         return true;
     }
 
@@ -2106,6 +2126,15 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         fillSolid(dc, footer, m_theme.tabBar);
         fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
         drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    // Settings gear in the bottom-right corner, always visible.
+    {
+        RECT gearInset = s.gearButton;
+        InflateRect(&gearInset, -px(2), -px(2));
+        fillRoundedRect(g, gearInset, std::max(2, (gearInset.bottom - gearInset.top) / 2), m_theme.pill);
+        strokeRoundedRect(g, gearInset, std::max(2, (gearInset.bottom - gearInset.top) / 2), m_theme.glassBorder, std::max(1.0f, k));
+        drawGearIcon(g, gearInset, m_theme.textSecondary, k * 0.6f);
     }
 
     fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
@@ -2806,6 +2835,39 @@ void Browser::showDownloadsPage()
     activateTab(m_downloadsPageTab);
     raw->loadHtml(downloadsPageHtml(m_theme.dark));
     invalidateChrome();
+}
+
+void Browser::openSettings()
+{
+    // If a Settings tab is already open, just bring it forward.
+    if (m_settingsPageTab != static_cast<size_t>(-1) && m_settingsPageTab < m_tabs.size()) {
+        activateTab(m_settingsPageTab);
+        return;
+    }
+
+    auto view = m_host.createView(m_window);
+    if (!view)
+        return;
+
+    WebView* raw = view.get();
+    attachCallbacks(raw);
+    m_tabs.push_back(std::move(view));
+    m_settingsPageTab = m_tabs.size() - 1;
+
+    activateTab(m_settingsPageTab);
+    raw->loadHtml(settingsPageHtml(m_theme.dark));
+    invalidateChrome();
+}
+
+void Browser::onSettingsChanged()
+{
+    // Re-applied values can land here later (theme switch, default zoom,
+    // etc.). For now, just push a fresh HTML snapshot to the open settings
+    // tab so the user sees the new value they just picked.
+    if (m_settingsPageTab == static_cast<size_t>(-1) || m_settingsPageTab >= m_tabs.size())
+        return;
+    if (auto* view = m_tabs[m_settingsPageTab].get())
+        view->loadHtml(settingsPageHtml(m_theme.dark));
 }
 
 
