@@ -142,6 +142,11 @@ public:
     void onTimer(UINT_PTR id);
     void onControlNotify(HWND control, UINT code);
 
+    // Pumped by the WM_LUMEN_DOWNLOAD_CHANGED message handler in main.cpp
+    // (download callbacks fire on WebKit's IPC threads, so the resulting
+    // UI work has to land on this thread).
+    void onDownloadsChanged(bool started);
+
     int chromeHeight() const;
     bool trackingMouse() const { return m_trackingMouse; }
     void setTrackingMouse(bool value) { m_trackingMouse = value; }
@@ -204,7 +209,6 @@ private:
     void showDownloadsPanel(bool takeFocus);
     void hideDownloadsPanel(bool refocusPage);
     void toggleDownloadsPanel();
-    void onDownloadsChanged(bool started);
     void paintDownloadsPanel(HDC dc, int width, int height);
     void downloadsClick(POINT point);
     void downloadsMove(POINT point);
