@@ -4,7 +4,6 @@
 #include "util.h"
 
 #include <algorithm>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -197,12 +196,11 @@ inline std::string settingsPageHtml(bool dark)
             {"50", "50%"}, {"67", "67%"}, {"75", "75%"}, {"90", "90%"},
             {"100", "100%"}, {"110", "110%"}, {"125", "125%"}, {"150", "150%"}, {"200", "200%"}
         };
-        std::ostringstream zoomOss;
-        zoomOss << pageZoom;
+        const std::string zoomStr = std::to_string(pageZoom);
         for (auto& o : opts) {
-            if (o.first == zoomOss.str()) o.second = o.first + "%  (current)";
+            if (o.first == zoomStr) o.second = o.first + "%  (current)";
         }
-        html += selectRow(settingKey::kPageZoom, zoomOss.str(), opts);
+        html += selectRow(settingKey::kPageZoom, zoomStr, opts);
     }
     html += "</div>";
     html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Default text encoding</div>"
