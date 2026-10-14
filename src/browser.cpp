@@ -1,8 +1,10 @@
 #include "browser.h"
 
-#include "start_page.h"
 #include "downloads.h"
 #include "downloads_page.h"
+#include "settings.h"
+#include "settings_page.h"
+#include "start_page.h"
 #include "util.h"
 
 #include <windowsx.h>
@@ -2132,8 +2134,9 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     {
         RECT gearInset = s.gearButton;
         InflateRect(&gearInset, -px(2), -px(2));
-        fillRoundedRect(g, gearInset, std::max(2, (gearInset.bottom - gearInset.top) / 2), m_theme.pill);
-        strokeRoundedRect(g, gearInset, std::max(2, (gearInset.bottom - gearInset.top) / 2), m_theme.glassBorder, std::max(1.0f, k));
+        const int gearRadius = std::max(2, static_cast<int>(gearInset.bottom - gearInset.top) / 2);
+        fillRoundedRect(g, gearInset, gearRadius, m_theme.pill);
+        strokeRoundedRect(g, gearInset, gearRadius, m_theme.glassBorder, std::max(1.0f, k));
         drawGearIcon(g, gearInset, m_theme.textSecondary, k * 0.6f);
     }
 
