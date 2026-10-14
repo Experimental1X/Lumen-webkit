@@ -10,24 +10,12 @@
 
 namespace lumen {
 
-namespace {
+// escapeHtml now lives in util.h (included transitively via settings.h).
+// Keeping a single definition across the page headers prevents the duplicate
+// "function already has a body" linker error when both pages are pulled
+// into the same translation unit.
 
-inline std::string escapeHtml(const std::string& s)
-{
-    std::string result;
-    result.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-        case '<': result += "&lt;"; break;
-        case '>': result += "&gt;"; break;
-        case '&': result += "&amp;"; break;
-        case '"': result += "&quot;"; break;
-        case '\'': result += "&#39;"; break;
-        default: result += c; break;
-        }
-    }
-    return result;
-}
+namespace {
 
 std::wstring settingValue(const wchar_t* key, const std::wstring& defaultValue)
 {

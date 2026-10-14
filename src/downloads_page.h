@@ -8,38 +8,10 @@
 
 namespace lumen {
 
+// escapeHtml lives in util.h so both downloads_page.h and settings_page.h
+// can include it without colliding in the same translation unit.
+
 namespace {
-
-inline std::string escapeHtml(const std::string& s)
-{
-    std::string result;
-    result.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-        case '<':
-            result += "&lt;";
-            break;
-        case '>':
-            result += "&gt;";
-            break;
-        case '&':
-            result += "&amp;";
-            break;
-        case '"':
-            result += "&quot;";
-            break;
-        case '\'':
-            result += "&#39;";
-            break;
-        default:
-            result += c;
-            break;
-        }
-    }
-    return result;
-}
-
-} // namespace
 
 // A self-contained HTML page listing every download with live progress, in the
 // same visual style as the start page. The browser pushes an updated HTML
