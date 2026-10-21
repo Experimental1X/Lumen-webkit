@@ -216,14 +216,19 @@ void Downloads::attach(WKDownloadRef download)
 
     m_items.insert(m_items.begin(), std::move(item));
 
-    WKDownloadClientV0 client { };
-    client.base.version = 0;
-    client.base.clientInfo = this;
-    client.decideDestinationWithResponse = &Downloads::decideDestination;
-    client.didWriteData = &Downloads::didWriteData;
-    client.didFinish = &Downloads::didFinish;
-    client.didFailWithError = &Downloads::didFail;
-    WKDownloadSetClient(download, &client.base);
+    // The callback table has to outlive this function: WKDownloadSetClient
+    // keeps the pointer and reads it again on every later callback. See the
+    // m_clients comment in downloads.h for what happens if it does not.
+    auto client = std::make_unique<WKDownloadClientV0>();
+    client->base.version = 0;
+    client->base.clientInfo = this;
+    client->decideDestinationWithResponse = &Downloads::decideDestination;
+    client->didWriteData = &Downloads::didWriteData;
+    client->didFinish = &Downloads::didFinish;
+    client->didFailWithError = &Downloads::didFail;
+
+    m_clients[download] = std::move(client);
+    WKDownloadSetClient(download, &m_clients[download]->base);
 
     log(L"Download started.");
     notify(true);
@@ -262,6 +267,10 @@ void Downloads::didWriteData(WKDownloadRef download, long long, long long totalB
 {
     Downloads& self = instance();
     if (DownloadItem* item = self.find(download)) {
+        // Log the first chunk only, so lumen.log stays readable on a large
+        // file but still proves the callback table was still alive.
+        if (item->received == 0)
+            log(L"Download first bytes received: " + item->filename);
         item->received = totalBytesWritten;
         if (totalBytesExpectedToWrite > 0)
             item->total = totalBytesExpectedToWrite;
@@ -280,6 +289,8 @@ void Downloads::didFinish(WKDownloadRef download, const void*)
         log(L"Download finished: " + item->path);
         self.notify(false);
     }
+    // didFinish is the last callback WebKit makes, so the table is free now.
+    self.m_clients.erase(download);
     WKRelease(download);
 }
 
@@ -293,6 +304,7 @@ void Downloads::didFail(WKDownloadRef download, WKErrorRef, WKDataRef, const voi
         log(L"Download did not complete: " + item->filename);
         self.notify(false);
     }
+    self.m_clients.erase(download);
     WKRelease(download);
 }
 

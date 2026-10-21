@@ -3,8 +3,11 @@
 #include <windows.h>
 
 #include <WebKit/WKBase.h>
+#include <WebKit/WKDownloadClient.h>
 
 #include <functional>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -71,6 +74,15 @@ private:
     std::vector<DownloadItem> m_items;
     unsigned m_nextId { 1 };
     HWND m_ownerWindow { nullptr };
+
+    // WKDownloadSetClient stores a raw pointer to the callback table and
+    // dereferences it for every callback that follows, so the table has to
+    // outlive attach(). Handing it a stack local meant WebKit was reading
+    // reclaimed stack frames by the time the transfer actually started:
+    // decideDestination survived because it fires early, didWriteData never
+    // did, so downloads sat at 0 bytes forever. One table per live download,
+    // released when the download reaches a terminal state.
+    std::map<WKDownloadRef, std::unique_ptr<WKDownloadClientV0>> m_clients;
 };
 
 // "3.4 MB", "812 KB" ...

@@ -163,33 +163,76 @@ inline std::string settingsPageHtml(bool dark)
     };
 
     // ----- sidebar (categories) -----
-    // (id, icon-emoji bytes, tile background color, label)
-    struct Cat { const char* id; const char* icon; const char* color; const char* label; };
+    // Safari 26 / macOS Tahoe dropped the coloured rounded-square emoji tiles
+    // of the Ventura-Sonoma era for monochrome SF-Symbol-style glyphs tinted by
+    // the row state. Emoji cannot be forced monochrome, so the icons are drawn
+    // as inline SVG on a 16x16 grid: one stroke weight, round caps, no fills.
+    auto icon = [](const char* body) {
+        return std::string("<svg class='ic' viewBox='0 0 16 16' fill='none' stroke='currentColor'"
+                           " stroke-width='1.45' stroke-linecap='round' stroke-linejoin='round'>")
+             + body + "</svg>";
+    };
+
+    // (id, label, icon svg)
+    struct Cat { const char* id; const char* label; std::string icon; };
     const Cat sidebar[] = {
-        { "general",        "\xF0\x9F\x9B\xA0", "#0a84ff", "General"        },
-        { "tabs",           "\xF0\x9F\x97\x82", "#5e5ce6", "Tabs"           },
-        { "privacy",        "\xF0\x9F\x9B\xA1", "#30d158", "Privacy & Security" },
-        { "search",         "\xF0\x9F\x94\x8D", "#ff9f0a", "Search"         },
-        { "passwords",      "\xF0\x9F\x94\x91", "#bf5af2", "Passwords"      },
-        { "autofill",       "\xF0\x9F\x93\x8D", "#64d2ff", "AutoFill"       },
-        { "extensions",     "\xF0\x9F\xA7\xA9", "#ff375f", "Extensions"     },
-        { "engines",        "\xF0\x9F\x94\x8E", "#ff9f0a", "Search Engines" },
-        { "advanced",       "\xE2\x9A\x99\xEF\xB8\x8F", "#8e8e93", "Advanced" },
-        { "websites",       "\xF0\x9F\x8C\x90", "#5ac8fa", "Websites"       },
-        { "controllers",    "\xF0\x9F\x8E\xAE", "#30d158", "Game Controllers" },
-        { "reading",        "\xF0\x9F\x93\x96", "#ff9f0a", "Reading List"   },
-        { "downloads",      "\xE2\xAC\x87",      "#0a84ff", "Downloads"      },
+        { "general", "General",
+            icon("<circle cx='8' cy='8' r='4.85'/><circle cx='8' cy='8' r='2.15'/>"
+                 "<path d='M8 1.15v1.9M8 12.95v1.9M1.15 8h1.9M12.95 8h1.9'/>"
+                 "<path d='M3.24 3.24l1.35 1.35M11.41 11.41l1.35 1.35"
+                 "M12.76 3.24l-1.35 1.35M4.59 11.41l-1.35 1.35'/>") },
+        { "tabs", "Tabs",
+            icon("<rect x='1.9' y='2.9' width='12.2' height='10.2' rx='1.9'/>"
+                 "<path d='M1.9 6.3h12.2'/>") },
+        { "privacy", "Privacy & Security",
+            icon("<path d='M8 1.5 13.1 3.4v4.3c0 3.3-2.15 5.9-5.1 6.9'
+                     " -2.95-1-5.1-3.6-5.1-6.9V3.4z'/>") },
+        { "search", "Search",
+            icon("<circle cx='6.9' cy='6.9' r='4.45'/><path d='M10.2 10.2 14 14'/>") },
+        { "passwords", "Passwords",
+            icon("<circle cx='5.6' cy='5.6' r='2.9'/><path d='M7.75 7.75 13.4 13.4'/>"
+                 "<path d='M10.4 10.4l1.5-1.5M12.1 12.1l1.4-1.4'/>") },
+        { "autofill", "AutoFill",
+            icon("<rect x='1.7' y='3.7' width='12.6' height='8.6' rx='1.9'/>"
+                 "<path d='M1.7 6.7h12.6'/><path d='M4.2 9.6h3.2'/>") },
+        { "extensions", "Extensions",
+            icon("<path d='M6.6 2.2h2.8v1.9h2.2a1 1 0 0 1 1 1v2.2h1.9v2.8h-1.9v2.2'
+                     "a1 1 0 0 1-1 1H9.4v1.9H6.6v-1.9H4.4a1 1 0 0 1-1-1V10.1H1.5'
+                     "V7.3h1.9V5.1a1 1 0 0 1 1-1h2.2z'/>") },
+        { "engines", "Search Engines",
+            icon("<circle cx='11.3' cy='11.3' r='2.7'/><path d='M13.4 13.4 15 15'/>"
+                 "<path d='M2.2 3.4h8M2.2 6.8h5.5M2.2 10.2h3.4'/>") },
+        { "advanced", "Advanced",
+            icon("<path d='M1.8 4.9h12.4M1.8 11.1h12.4'/>"
+                 "<circle cx='5.7' cy='4.9' r='2'/><circle cx='10.4' cy='11.1' r='2'/>") },
+        { "websites", "Websites",
+            icon("<circle cx='8' cy='8' r='6.05'/><path d='M1.95 8h12.1'/>"
+                 "<path d='M8 1.95c1.75 2.05 2.7 4 2.7 6.05S9.75 11.95 8 14.05'/>"
+                 "<path d='M8 1.95C6.25 4 5.3 5.95 5.3 8S6.25 11.95 8 14.05'/>") },
+        { "controllers", "Game Controllers",
+            icon("<path d='M4.5 5.4h7a3.5 3.5 0 0 1 3.45 4.4l-.42 1.9'
+                     "a1.75 1.75 0 0 1-3.1.55L10.2 10.4H5.8l-1.23 1.85'
+                     "a1.75 1.75 0 0 1-3.1-.55l-.42-1.9A3.5 3.5 0 0 1 4.5 5.4z'/>"
+                 "<path d='M4.7 7.9v1.8M3.8 8.8h1.8'/>"
+                 "<circle cx='10.9' cy='8.4' r='.75'/><circle cx='12.5' cy='10' r='.75'/>") },
+        { "reading", "Reading List",
+            icon("<path d='M2.4 3.1h3.7a2.05 2.05 0 0 1 1.9 1.35 2.05 2.05 0 0 1 1.9-1.35'
+                     "h3.7v9.7h-3.7a1.65 1.65 0 0 0-1.9 1.25 1.65 1.65 0 0 0-1.9-1.25H2.4z'/>"
+                 "<path d='M8 4.45v9.6'/>") },
+        { "downloads", "Downloads",
+            icon("<path d='M8 2.1v7.7M5.05 6.95 8 9.9l2.95-2.95'/>"
+                 "<path d='M2.4 11.35v1.55a1.1 1.1 0 0 0 1.1 1.1h9a1.1 1.1 0 0 0 1.1-1.1v-1.55'/>") },
     };
 
     std::string sidebarHtml;
-    sidebarHtml.reserve(2048);
+    sidebarHtml.reserve(4096);
     for (const auto& c : sidebar) {
         const bool sel = (c.id == viewUtf8);
         sidebarHtml += "<a class=\"cat" + std::string(sel ? " on" : "") + "\" href=\"" + setView(c.id) + "\" data-name=\"";
         sidebarHtml += c.label;
-        sidebarHtml += "\"><span class=\"ic\" style=\"background:" + std::string(c.color) + "\">";
+        sidebarHtml += "\">";
         sidebarHtml += c.icon;
-        sidebarHtml += "</span><span class=\"lbl\">";
+        sidebarHtml += "<span class=\"lbl\">";
         sidebarHtml += c.label;
         sidebarHtml += "</span></a>";
     }
@@ -447,71 +490,78 @@ inline std::string settingsPageHtml(bool dark)
     html += "\">\n<head>\n<meta charset=\"utf-8\">\n";
     html += "<title>Settings</title>\n<style>\n";
 
+    // Liquid Glass (macOS Tahoe 26 / Safari 26): sidebars and content float
+    // as separate translucent, generously rounded panels inset from the window
+    // edge, rather than sitting flush against it. Controls are capsules with
+    // a soft border. -webkit-backdrop-filter is prefixed because this is the
+    // WinCairo WebKit build.
     html +=
         "html,body{margin:0;height:100%}\n"
-        "html.light{--bg:#f5f5f7;--side:#ebebed;--card:#fff;--text:#1d1d1f;--sub:#6e6e73;"
-        "--border:#d6d6dc;--accent:#007aff;--accentText:#fff;--hover:rgba(0,0,0,.05);"
-        "--field:#fff;--shadow:0 1px 0 rgba(0,0,0,.05);color-scheme:light}\n"
-        "html.dark{--bg:#1c1c1e;--side:#232325;--card:#2c2c2e;--text:#f5f5f7;--sub:#98989d;"
-        "--border:#3a3a3c;--accent:#0a84ff;--accentText:#fff;--hover:rgba(255,255,255,.07);"
-        "--field:#1c1c1e;--shadow:0 1px 0 rgba(0,0,0,.4);color-scheme:dark}\n"
+        "html.light{--bg:#e9eaee;--side:rgba(250,250,252,.72);--card:rgba(255,255,255,.78);"
+        "--text:#1d1d1f;--sub:#6e6e73;--border:rgba(0,0,0,.10);--hair:rgba(0,0,0,.07);"
+        "--accent:#007aff;--accentText:#fff;--hover:rgba(0,0,0,.055);--field:rgba(255,255,255,.9);"
+        "--shadow:0 10px 34px rgba(0,0,0,.13);color-scheme:light}\n"
+        "html.dark{--bg:#101012;--side:rgba(42,42,47,.72);--card:rgba(38,38,43,.78);"
+        "--text:#f5f5f7;--sub:#98989d;--border:rgba(255,255,255,.13);--hair:rgba(255,255,255,.08);"
+        "--accent:#0a84ff;--accentText:#fff;--hover:rgba(255,255,255,.08);--field:rgba(30,30,34,.85);"
+        "--shadow:0 10px 34px rgba(0,0,0,.5);color-scheme:dark}\n"
         "*{box-sizing:border-box}\n"
-        "body{font:13px/1.4 'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;"
-        "color:var(--text);background:var(--bg);display:flex;overflow:hidden}\n"
-        "#side{width:240px;flex:0 0 240px;background:var(--side);border-right:1px solid var(--border);"
-        "display:flex;flex-direction:column;overflow:hidden}\n"
-        "#filter{padding:10px 10px 6px}\n"
-        "#filter input{width:100%;border:1px solid var(--border);border-radius:7px;"
-        "background:var(--field);color:var(--text);padding:5px 9px;font:inherit;outline:none}\n"
+        "body{font:13px/1.45 'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;"
+        "color:var(--text);background:var(--bg);display:flex;overflow:hidden;"
+        "padding:10px;gap:10px}\n"
+        "#side,#main{background:var(--side);border:1px solid var(--border);border-radius:18px;"
+        "box-shadow:var(--shadow);-webkit-backdrop-filter:blur(26px) saturate(180%);"
+        "backdrop-filter:blur(26px) saturate(180%)}\n"
+        "#side{width:246px;flex:0 0 246px;display:flex;flex-direction:column;overflow:hidden}\n"
+        "#filter{padding:12px 12px 8px}\n"
+        "#filter input{width:100%;border:1px solid var(--border);border-radius:9px;"
+        "background:var(--field);color:var(--text);padding:5px 10px;font:inherit;outline:none}\n"
         "#filter input:focus{border-color:var(--accent)}\n"
-        "#list{flex:1 1 auto;overflow:auto;padding:4px 8px 14px}\n"
-        ".cat{display:flex;align-items:center;gap:10px;padding:5px 8px;border-radius:6px;"
+        "#list{flex:1 1 auto;overflow:auto;padding:2px 8px 14px}\n"
+        ".cat{display:flex;align-items:center;gap:11px;padding:6px 9px;border-radius:9px;"
         "text-decoration:none;color:var(--text);font-size:13px;margin:0 0 1px;"
         "-webkit-user-drag:none}\n"
         ".cat:hover{background:var(--hover)}\n"
         ".cat.on{background:var(--accent);color:var(--accentText)}\n"
-        ".cat .ic{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;"
-        "justify-content:center;font-size:13px;flex:0 0 22px;color:#fff;line-height:1;"
-        "text-align:center}\n"
-        ".cat.on .ic{background:rgba(255,255,255,.25)!important}\n"
+        ".cat .ic{width:17px;height:17px;flex:0 0 17px;display:block}\n"
         ".cat .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
-        "#main{flex:1 1 auto;overflow:auto}\n"
-        "#main .inner{max-width:620px;margin:0 auto;padding:28px 30px 60px}\n"
-        ".heading{margin:0 0 20px;font-size:22px;font-weight:700;letter-spacing:-.01em}\n"
-        ".panel{background:var(--card);border:1px solid var(--border);border-radius:13px;"
-        "padding:2px 16px 4px;margin-bottom:18px}\n"
+        "#main{flex:1 1 auto;overflow:auto;background:var(--card)}\n"
+        "#main .inner{max-width:640px;margin:0 auto;padding:30px 32px 64px}\n"
+        ".heading{margin:0 0 22px;font-size:21px;font-weight:700;letter-spacing:-.01em}\n"
+        ".panel{background:var(--field);border:1px solid var(--border);border-radius:14px;"
+        "overflow:hidden;margin-bottom:20px}\n"
         ".grp{font-size:11px;font-weight:700;color:var(--sub);text-transform:uppercase;"
-        "letter-spacing:.06em;padding:14px 0 6px}\n"
+        "letter-spacing:.06em;padding:0 2px 7px}\n"
         ".row{display:flex;align-items:center;justify-content:space-between;gap:18px;"
-        "padding:11px 0;border-top:1px solid var(--border)}\n"
+        "padding:10px 14px;border-top:1px solid var(--hair)}\n"
         ".panel .row:first-of-type{border-top:none}\n"
         ".lbl{flex:1 1 auto;min-width:0}\n"
         ".lbl .nm{font-weight:500}\n"
         ".lbl .ds{display:block;color:var(--sub);font-size:12px;margin-top:2px;line-height:1.35}\n"
         ".ctrl{flex:0 0 auto;display:flex;align-items:center;justify-content:flex-end}\n"
-        ".chk{width:15px;height:15px;border-radius:4px;display:inline-block;position:relative;"
-        "flex:0 0 15px;text-decoration:none;border:1px solid var(--border);background:var(--field);"
+        ".chk{width:16px;height:16px;border-radius:5px;display:inline-block;position:relative;"
+        "flex:0 0 16px;text-decoration:none;border:1px solid var(--border);background:var(--field);"
         "transition:background-color .12s ease,border-color .12s ease}\n"
         ".chk:hover{border-color:var(--accent)}\n"
         ".chk.on{background:var(--accent);border-color:var(--accent)}\n"
         ".chk.on::after{content:\"\";position:absolute;left:4px;top:1px;width:5px;height:9px;"
         "border:solid #fff;border-width:0 2px 2px 0;transform:rotate(43deg)}\n"
         ".sel select{font:inherit;color:var(--text);background:var(--field);border:1px solid var(--border);"
-        "border-radius:7px;padding:5px 26px 5px 11px;min-width:170px;outline:none;"
+        "border-radius:9px;padding:5px 28px 5px 12px;min-width:180px;outline:none;"
         "appearance:none;-webkit-appearance:none;"
         "background-image:url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' "
-        "viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' fill='none' stroke='%236e6e73' "
-        "stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>\");"
-        "background-repeat:no-repeat;background-position:right 9px center;background-size:11px}\n"
+        "viewBox='0 0 12 12'><path d='M2 4.4l4 3.8 4-3.8' fill='none' stroke='%238e8e93' "
+        "stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/></svg>\");"
+        "background-repeat:no-repeat;background-position:right 10px center;background-size:11px}\n"
         ".sel select:focus{border-color:var(--accent)}\n"
         ".txt input{font:inherit;color:var(--text);background:var(--field);border:1px solid var(--border);"
-        "border-radius:7px;padding:5px 10px;width:240px;outline:none}\n"
+        "border-radius:9px;padding:5px 11px;width:240px;outline:none}\n"
         ".txt input:focus{border-color:var(--accent)}\n"
         ".btn{display:inline-block;font:inherit;color:var(--text);background:var(--field);"
-        "border:1px solid var(--border);border-radius:7px;padding:5px 12px;text-decoration:none;"
+        "border:1px solid var(--border);border-radius:9px;padding:5px 14px;text-decoration:none;"
         "white-space:nowrap}\n"
         ".btn:hover{border-color:var(--accent);color:var(--accent)}\n"
-        ".empty{padding:20px 4px 18px}\n"
+        ".empty{padding:18px 16px 16px}\n"
         ".empty .big{font-weight:600;margin-bottom:3px}\n"
         ".empty .ds{color:var(--sub);font-size:12px;line-height:1.45}\n"
         ".static{color:var(--sub);font-size:12px}\n"

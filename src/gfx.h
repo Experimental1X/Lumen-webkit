@@ -413,7 +413,7 @@ inline void drawStartPageIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF c
 // Settings affordance: an outlined cog with notches around the rim and a
 // hole in the middle, drawn in the same visual idiom as the other chrome
 // icons.
-inline void drawGearIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, float k)
+inline void drawGearIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, COLORREF holeColor, float k)
 {
     const float cx = (rect.left + rect.right) / 2.0f;
     const float cy = (rect.top + rect.bottom) / 2.0f;
@@ -446,7 +446,7 @@ inline void drawGearIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color,
     ringPath.AddEllipse(cx - inner, cy - inner, inner * 2.0f, inner * 2.0f);
     g.DrawPath(&pen, &ringPath);
 
-    Gdiplus::SolidBrush holeBrush(toGdiColor(0x2b2c32));
+    Gdiplus::SolidBrush holeBrush(toGdiColor(holeColor));
     g.FillEllipse(&holeBrush, cx - hole, cy - hole, hole * 2.0f, hole * 2.0f);
 }
 

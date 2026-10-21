@@ -387,7 +387,7 @@ void Browser::resize()
         if (!viewWindow)
             continue;
 
-        const int viewLeft = m_sidebarVisible ? std::min(px(kSidebarWidth), static_cast<int>(client.right)) : 0;
+        const int viewLeft = sidebarVisibleNow() ? std::min(px(kSidebarWidth), static_cast<int>(client.right)) : 0;
         MoveWindow(
             viewWindow,
             viewLeft,
@@ -1001,7 +1001,7 @@ void Browser::onMouseMove(POINT point)
     const POINT local { point.x, point.y - top };
     if (m_overview)
         overviewMove(local, client.right);
-    else if (m_sidebarVisible)
+    else if (sidebarVisibleNow())
         sidebarMove(local, std::max(0, static_cast<int>(client.bottom) - top));
 }
 
@@ -1053,7 +1053,7 @@ bool Browser::onLeftButtonDown(POINT point)
 
         if (m_overview)
             return overviewClick(local, client.right, height);
-        if (m_sidebarVisible)
+        if (sidebarVisibleNow())
             return sidebarClick(local, height);
         return false;
     }
@@ -1235,7 +1235,7 @@ bool Browser::onMouseWheel(WPARAM wParam, LPARAM lParam)
             InvalidateRect(m_window, nullptr, FALSE);
             return true;
         }
-        if (m_sidebarVisible && point.x < px(kSidebarWidth)) {
+        if (sidebarVisibleNow() && point.x < px(kSidebarWidth)) {
             m_sidebarScroll = std::clamp(m_sidebarScroll - step, 0, sidebarMaxScroll(height));
             InvalidateRect(m_window, nullptr, FALSE);
             return true;
@@ -1289,7 +1289,7 @@ void Browser::onPaint(HDC target)
         // Page area behind the web views.
         fillSolid(target, content, m_theme.page);
 
-        if (m_sidebarVisible) {
+        if (sidebarVisibleNow()) {
             const RECT panel { 0, l.totalHeight, std::min(px(kSidebarWidth), width), l.totalHeight + contentHeight };
             paintBuffered(target, panel, [&](HDC dc) { paintSidebar(dc, panel.right - panel.left, contentHeight); });
         }
@@ -1931,14 +1931,14 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
     s.list = { 0, listTop, s.width, std::max(listTop, height - footer) };
     s.clearButton = { margin, height - px(42), s.width - margin, height - px(12) };
 
-    // Gear is a 32-px circle in the bottom-right corner. It sits just below
-    // the segmented control header and above the list bottom, so it never
-    // collides with row clicks.
-    const int gearSize = px(32);
+    // Gear is a 36-px accent-filled circle in the bottom-left corner, aligned
+    // with the segmented control's left margin so it reads as the bottom of
+    // the sidebar column rather than a floating afterthought.
+    const int gearSize = px(36);
     s.gearButton = {
-        s.width - margin - gearSize,
+        margin,
         std::max(listTop + margin, height - margin - gearSize),
-        s.width - margin,
+        margin + gearSize,
         height - margin
     };
     return s;
@@ -1963,6 +1963,15 @@ int Browser::sidebarMaxScroll(int height) const
     const SidebarLayout s = sidebarLayout(height);
     const int total = static_cast<int>(sidebarEntries().size()) * s.rowHeight;
     return std::max(0, total - static_cast<int>(s.list.bottom - s.list.top));
+}
+
+bool Browser::sidebarVisibleNow() const
+{
+    if (!m_sidebarVisible)
+        return false;
+    // The built-in pages are meant to read as full browser surfaces rather
+    // than as web content sitting next to a sidebar.
+    return m_active != m_settingsPageTab && m_active != m_downloadsPageTab;
 }
 
 void Browser::toggleSidebar()
@@ -2002,7 +2011,7 @@ bool Browser::sidebarClick(POINT local, int height)
         return true;
     }
 
-    // Settings (gear) is bottom-right and floats over the list; check it
+    // Settings (gear) is bottom-left and floats over the list; check it
     // before iterating list rows so a click on the gear always wins.
     if (PtInRect(&s.gearButton, local)) {
         openSettings();
@@ -2149,14 +2158,14 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
-    // Settings gear in the bottom-right corner, always visible.
+    // Settings gear in the bottom-left corner, always visible. Filled with the
+    // accent colour so it is the one unmistakable control in the sidebar.
     {
         RECT gearInset = s.gearButton;
         InflateRect(&gearInset, -px(2), -px(2));
         const int gearRadius = (gearInset.bottom - gearInset.top) / 2;
-        fillRoundedRect(g, gearInset, std::max(2, gearRadius), m_theme.pill);
-        strokeRoundedRect(g, gearInset, std::max(2, gearRadius), m_theme.glassBorder, std::max(1.0f, k));
-        drawGearIcon(g, gearInset, m_theme.textSecondary, k * 0.6f);
+        fillRoundedRect(g, gearInset, std::max(2, gearRadius), m_theme.accent);
+        drawGearIcon(g, gearInset, RGB(255, 255, 255), m_theme.accent, k * 0.78f);
     }
 
     fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);

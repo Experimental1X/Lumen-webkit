@@ -262,7 +262,7 @@ private:
         RECT segments[3] { };
         RECT list { };
         RECT clearButton { };
-        // Always-visible gear button in the bottom-right corner that opens
+        // Always-visible gear button in the bottom-left corner that opens
         // the Settings tab. Computed in sidebarLayout; clicked in sidebarClick;
         // drawn in paintSidebar.
         RECT gearButton { };
@@ -272,6 +272,10 @@ private:
     RECT sidebarRow(const SidebarLayout& layout, size_t index) const;
     RECT sidebarRowClose(const RECT& row) const;
     int sidebarMaxScroll(int height) const;
+    // False when the active tab is one of the built-in pages (Settings,
+    // Downloads). Those own the whole content area, so the sidebar steps
+    // aside for them even when it is switched on.
+    bool sidebarVisibleNow() const;
     void toggleSidebar();
     bool sidebarClick(POINT local, int height);
     void sidebarMove(POINT local, int height);
