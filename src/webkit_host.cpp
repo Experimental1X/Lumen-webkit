@@ -6,6 +6,7 @@
 
 #include "dialogs.h"
 #include "downloads.h"
+#include "download_transfer.h"
 
 #include <WebKit/WKArray.h>
 #include <WebKit/WKDownloadRef.h>
@@ -511,14 +512,33 @@ void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WK
     // missed them and the bytes got rendered into the tab as mojibake
     // beginning "MZ" or "PK".
     //
-    // This is now the only place a download is recognised, so say so in the
-    // log. If a download does not appear, "Download attached" is missing from
-    // the log while these lines are not, which says the URL never reached this
-    // function at all; the opposite says the rule fired and the failure is
-    // somewhere inside WebKit's own download machinery.
+    // The download URL rule is the only place a navigation turns into a
+    // transfer. Two paths now: an isDownloadUrl match goes through the
+    // WinHTTP worker in download_transfer.cpp (logs "Download rule matched
+    // on URL" here and "Download created (WinHTTP)" from the worker);
+// a navigation that WebKit itself flags (the <a download> attribute)
+    // becomes a real WKDownload (logs "Download rule matched on the
+    // navigation action" here and "Download attached" once WebKit hands us
+    // the WKDownloadRef). If a download never appears in the panel, the
+    // matching "rule matched" line being absent means the URL never reached
+    // decideNavigationAction; the line being present plus the
+    // "created"/"attached" line being absent means the failure is inside
+    // whichever engine path the rule picked.
     if (!wurl.empty() && isDownloadUrl(wurl)) {
+        // Historically this called WKFramePolicyListenerDownload(listener),
+        // letting WebKit spin up a WKDownload. On the WinCairo port that
+        // object is created and decideDestination runs, but the bytes
+        // never reach the file: didWriteData fires every ~65 ms with
+        // totalBytesWritten == 0 indefinitely, with the destination file
+        // staying at 0 bytes (build 15's lumen.log captured 3,599 such
+        // callbacks in 4 minutes for one transfer). The WinHTTP path in
+        // download_transfer.cpp does not share that engine code path, so
+        // steal the URL out of the WebKit request, route it through us,
+        // and ignore the navigation so the page does not also try to load
+        // the file. The downloads panel and page read items() unchanged.
         log(L"Download rule matched on URL: " + wurl);
-        WKFramePolicyListenerDownload(listener);
+        Downloads::instance().startTransfer(wurl);
+        WKFramePolicyListenerIgnore(listener);
         return;
     }
 

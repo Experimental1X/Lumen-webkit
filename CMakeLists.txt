@@ -33,6 +33,7 @@ add_executable(Lumen WIN32
     src/browser.cpp
     src/dialogs.cpp
     src/downloads.cpp
+    src/download_transfer.cpp
     src/library.cpp
     src/settings.cpp
     src/util.cpp
@@ -59,6 +60,7 @@ target_link_libraries(Lumen PRIVATE
     advapi32
     comdlg32
     shell32
+    winhttp
 )
 
 if (MSVC)

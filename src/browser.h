@@ -386,6 +386,12 @@ private:
     // view whenever Downloads::onChanged fires, so the page itself does not
     // have to self-reload.
     size_t m_downloadsPageTab { static_cast<size_t>(-1) };
+    // When that snapshot was last pushed. Progress is measured off the disk
+    // every 400 ms, and a full WKPageLoadHTML every one of those lands a WebKit
+    // navigation twice a second on the thread that also has to answer clicks,
+    // so the push is rate limited and the page's own reload picks up whatever
+    // fell in between.
+    ULONGLONG m_downloadsPagePushedAt { 0 };
 
     // Same idea for the Settings tab. The Settings HTML uses form submits
     // and toggles; the browser refreshes the page after every
@@ -402,8 +408,10 @@ private:
         ULONGLONG closedAt { 0 };
     };
     static constexpr UINT_PTR kReapTimer = 1;
-    // Polls the destination files of in-flight downloads. WebKit's progress
-    // callback has never fired on this build, so byte counts come from disk.
+    // Polls the destination files of in-flight downloads. didWriteData does
+    // fire on this build; see downloads.h for the data path that's still
+    // stuck on it. Polling covers every active transfer regardless of which
+    // path wrote the file.
     static constexpr UINT_PTR kProgressTimer = 2;
     // Drives the chrome animations at roughly 60 Hz, and is only running while
     // a spring is actually in flight.

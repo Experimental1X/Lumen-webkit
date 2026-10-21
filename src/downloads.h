@@ -49,6 +49,27 @@ public:
     // response or a context menu) and installs the callbacks for it.
     void attach(WKDownloadRef download);
 
+    // Routes a URL through the WinHTTP path. Inside the lock we build a
+    // DownloadItem with the chosen filename and a destination file, then
+    // hand the URL + id to download_transfer.cpp. The caller (the
+    // navigation policy handler in webkit_host.cpp) cancels the WebKit
+    // navigation first so the URL only flows once.
+    void startTransfer(std::wstring url);
+
+    // Updates an item from a worker thread. Progress is rate-limited: only
+    // writes and notifies if the byte count moved or the total changed.
+    void reportProgress(unsigned id, long long received, long long total);
+    // Both mark the item Finished (or Failed) and notify. reportFail takes
+    // ownership of running on the worker's thread.
+    void reportFinish(unsigned id, long long finalTotal);
+    void reportFail(unsigned id, std::wstring reason);
+    // Returns the destination path for an item the worker is transferring,
+    // or empty if the item disappeared (cancelled and removed).
+    std::wstring destinationFor(unsigned id) const;
+    // Used by the WinHTTP worker between chunks to detect a cancel or
+    // removal. Cheap; takes the m_lock briefly.
+    bool stillActive(unsigned id) const;
+
     // Window the browser pumps Download notifications through. Set once at
     // startup; nullptr falls back to a direct call (used by the
     // Downloads singleton itself in tests).
@@ -67,13 +88,16 @@ public:
     void remove(unsigned id);
     void clearFinished();
 
-    // Reads the true byte count off disk for every active download.
-    // WebKit's didWriteData is the preferred signal, but on this WinCairo
-    // build it has never actually arrived: downloads reported a correct total
-    // from decideDestination and then sat at 0 bytes indefinitely, which is
-    // indistinguishable from a stalled transfer. The file WebKit is writing
-    // is the ground truth, so measure it rather than take the engine's word
-    // for it. Cheap enough to run from the browser's idle timer.
+    // Reads the true byte count off disk for every active download that is
+    // still going through WKDownload. didWriteData does fire on this build
+    // (lumen.log from build 15 logged it 3,599 times during one stalled
+    // transfer), but always with totalBytesWritten == 0, which means the
+    // network process is not actually streaming. The file on disk is the
+    // truth: polling it gives the panel a real number and lets us mark the
+    // download Finished the instant the bytes match the response size.
+    // Transfers that bypass WKDownload (the WinHTTP path in
+    // download_transfer.cpp) update item.received directly, so this polling
+    // becomes a safety net for them as well.
     void refreshFromDisk();
 
     // Called on the UI thread when anything changes. `started` is true when a
@@ -103,11 +127,11 @@ private:
 
     // WKDownloadSetClient stores a raw pointer to the callback table and
     // dereferences it for every callback that follows, so the table has to
-    // outlive attach(). Handing it a stack local meant WebKit was reading
-    // reclaimed stack frames by the time the transfer actually started:
-    // decideDestination survived because it fires early, didWriteData never
-    // did, so downloads sat at 0 bytes forever. One table per live download,
-    // released when the download reaches a terminal state.
+    // outlive attach(). One table per live download, released when the
+    // download reaches a terminal state. The callbacks only run for items
+    // that go through WebKit's own download machinery; the WinHTTP path in
+    // download_transfer.cpp updates item.received directly and bypasses all
+    // of this for the URL-shape rules in webkit_host.cpp.
     std::map<WKDownloadRef, std::unique_ptr<WKDownloadClientV0>> m_clients;
 };
 

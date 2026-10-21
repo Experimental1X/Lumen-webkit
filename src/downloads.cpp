@@ -1,5 +1,6 @@
 #include "downloads.h"
 
+#include "download_transfer.h"
 #include "util.h"
 #include "webkit_util.h"
 
@@ -117,6 +118,40 @@ bool readsLikeWords(const std::wstring& name)
     return letter;
 }
 
+// A long run of hex digits with nothing a person would type in it. readsLikeWords
+// accepts these happily - they are letters and numbers - but they are a content
+// hash, not a filename, and using one gives you a Downloads folder full of
+// "f9a9a647fda40a82.zip". FileCR hands out exactly that shape, so the check is
+// worth having.
+bool looksLikeHash(const std::wstring& name)
+{
+    // Long enough that no real product name of this shape exists, short enough
+    // to catch the usual MD5/SHA prefixes.
+    if (name.size() < 12)
+        return false;
+
+    // Ignore the extension before judging the stem.
+    std::wstring stem = name;
+    const size_t dot = stem.find_last_of(L'.');
+    if (dot != std::wstring::npos)
+        stem.erase(dot);
+
+    if (stem.size() < 12)
+        return false;
+
+    bool hasHexDigit = false;
+    for (wchar_t ch : stem) {
+        const bool hex = (ch >= L'0' && ch <= L'9')
+            || (ch >= L'a' && ch <= L'f')
+            || (ch >= L'A' && ch <= L'F');
+        if (!hex)
+            return false;
+        if (ch >= L'0' && ch <= L'9')
+            hasHexDigit = true;
+    }
+    return hasHexDigit;
+}
+
 // Ends in something short enough after the last dot to be an extension.
 bool hasShortExtension(const std::wstring& name)
 {
@@ -140,7 +175,7 @@ bool hasShortExtension(const std::wstring& name)
 // A name worth keeping as it stands: readable, and it says what it is.
 bool isReadableName(const std::wstring& name)
 {
-    return readsLikeWords(name) && hasShortExtension(name);
+    return readsLikeWords(name) && !looksLikeHash(name) && hasShortExtension(name);
 }
 
 // The name WebKit suggests comes from Content-Disposition, and when a server
@@ -169,7 +204,7 @@ std::wstring nameFromDownloadUrl(WKDownloadRef download, const std::wstring& fal
         const size_t slash = url.find(L'/', start);
         const std::wstring segment = percentDecode(
             slash == std::wstring::npos ? url.substr(start) : url.substr(start, slash - start));
-        if (readsLikeWords(segment))
+        if (readsLikeWords(segment) && !looksLikeHash(segment))
             best = segment;
 
         if (slash == std::wstring::npos)
@@ -178,12 +213,74 @@ std::wstring nameFromDownloadUrl(WKDownloadRef download, const std::wstring& fal
     }
 
     // The salvaged segment describes the file rather than naming it, and these
-    // hosts only ever serve archives - so ".zip" is the guess worth making.
+    // hosts only ever serve archives - so ".zip" is the guess worth making,
+    // unless the segment already carries an extension of its own.
     // Finding nothing at all means the URL said nothing useful either.
     if (!best.empty())
-        return sanitizeFilename(best) + L".zip";
+        return hasShortExtension(best) ? sanitizeFilename(best)
+                                       : sanitizeFilename(best) + L".zip";
 
     return sanitizeFilename(fallback);
+}
+
+// Same derivation as nameFromDownloadUrl, but takes a plain URL string
+// instead of a WKDownloadRef. The WinHTTP path in download_transfer.cpp
+// needs this because it never goes through decideDestination.
+std::wstring nameFromUrlString(const std::wstring& url)
+{
+    std::wstring trimmed = url;
+    const size_t cut = trimmed.find_first_of(L"?#");
+    if (cut != std::wstring::npos)
+        trimmed.resize(cut);
+
+    std::wstring best;
+    size_t start = 0;
+    while (start < trimmed.size()) {
+        const size_t slash = trimmed.find(L'/', start);
+        const std::wstring segment = percentDecode(
+            slash == std::wstring::npos ? trimmed.substr(start)
+                                        : trimmed.substr(start, slash - start));
+        if (readsLikeWords(segment) && !looksLikeHash(segment))
+            best = segment;
+
+        if (slash == std::wstring::npos)
+            break;
+        start = slash + 1;
+    }
+
+    if (best.empty())
+        return { };
+    return hasShortExtension(best) ? sanitizeFilename(best)
+                                   : sanitizeFilename(best) + L".zip";
+}
+
+// Last-resort filename for a URL that had no human-readable segment. The
+// WKDownload path's decideDestination uses Content-Disposition's suggested
+// name as the fallback; this is the equivalent for the WinHTTP path that
+// runs before any headers arrive, so the panel sees a name on row 1
+// instead of "download".
+std::wstring fallbackFilenameForUrl(const std::wstring& url)
+{
+    std::wstring trimmed = url;
+    const size_t cut = trimmed.find_first_of(L"?#");
+    if (cut != std::wstring::npos)
+        trimmed.resize(cut);
+
+    const size_t slash = trimmed.find_last_of(L'/');
+    std::wstring segment = slash != std::wstring::npos
+        ? percentDecode(trimmed.substr(slash + 1))
+        : percentDecode(trimmed);
+
+    if (segment.empty())
+        return { };
+
+    // Mirrors like s1-filecr.xyz/<hash> produce a hex-only segment. We let
+    // it through instead of substituting "download" so a hash-only URL
+    // still names itself accurately; sanitize it so trailing dots, reserved
+    // device names, etc. never reach the file system.
+    if (hasShortExtension(segment))
+        return sanitizeFilename(segment);
+    return sanitizeFilename(segment) + L".zip";
 }
 
 std::wstring hostFromUrl(std::wstring url)
@@ -292,9 +389,10 @@ void Downloads::notify(bool started)
     if (m_ownerWindow) {
         // Pump the notification through the message loop onto the UI thread.
         // The download callbacks can fire on the IPC threads WebKit uses for
-        // network progress; calling Browser code (which touches GDI, the panel
-        // window, etc.) from there would be undefined behaviour, and WebKit's
-        // didWriteData was being silently dropped in tests.
+        // network progress; calling Browser code (which touches GDI, the
+        // panel window, etc.) from there would be undefined behaviour.
+        // WinHTTP workers on std::thread also talk to the UI through here,
+        // for the same reason.
         PostMessageW(m_ownerWindow, WM_LUMEN_DOWNLOAD_CHANGED, started ? 1 : 0, 0);
     } else if (onChanged) {
         onChanged(started);
@@ -328,19 +426,44 @@ double Downloads::progress() const
 void Downloads::refreshFromDisk()
 {
     bool changed = false;
+    // One line per download, on the first poll that could measure it. This is
+    // the whole reason a stalled download is diagnosable at all: "never
+    // reached here" means the poll timer is not running, while "reached here
+    // and the file is still 0 bytes" means WebKit is not writing to the
+    // destination it gave us. Without the distinction both look identical from
+    // the outside - a row that says 0 bytes for the entire download.
+    bool loggedFirst = false;
 
     {
         Lock lock(m_lock);
         for (auto& item : m_items) {
-            if (item.state != DownloadItem::State::Active || item.path.empty())
+            if (item.state != DownloadItem::State::Active)
                 continue;
 
-            WIN32_FILE_ATTRIBUTE_DATA data { };
-            if (!GetFileAttributesExW(item.path.c_str(), GetFileExInfoStandard, &data))
+            if (item.path.empty()) {
+                if (!loggedFirst) {
+                    loggedFirst = true;
+                    log(L"Download poll: no destination yet - decideDestination has not run.");
+                }
                 continue;
+            }
+
+            WIN32_FILE_ATTRIBUTE_DATA data { };
+            if (!GetFileAttributesExW(item.path.c_str(), GetFileExInfoStandard, &data)) {
+                if (!loggedFirst) {
+                    loggedFirst = true;
+                    log(L"Download poll: cannot stat " + item.path);
+                }
+                continue;
+            }
 
             const long long size = (static_cast<long long>(data.nFileSizeHigh) << 32)
                 | static_cast<long long>(data.nFileSizeLow);
+
+            if (size == 0 && !loggedFirst) {
+                loggedFirst = true;
+                log(L"Download poll: " + item.path + L" exists and is still 0 bytes.");
+            }
 
             if (size > item.received) {
                 item.received = size;
@@ -419,6 +542,126 @@ void Downloads::attach(WKDownloadRef download)
     }
 
     notify(true);
+}
+
+void Downloads::startTransfer(std::wstring url)
+{
+    if (url.empty())
+        return;
+
+    // Derive a name from the URL path before opening the destination so the
+    // panel sees the right row from frame one. decideDestination's
+    // Content-Disposition suggestion is unavailable to us here, so the
+    // chain is: human-readable path segment if there is one, else the URL's
+    // final path segment (which may itself be a hash), else "download".
+    std::wstring name = nameFromUrlString(url);
+    if (name.empty())
+        name = fallbackFilenameForUrl(url);
+    if (name.empty())
+        name = L"download";
+    const std::wstring path = uniquePath(downloadsFolder(), name);
+    const std::wstring filename = fileNameOf(path);
+    const std::wstring host = hostFromUrl(url);
+
+    unsigned id = 0;
+    {
+        Lock lock(m_lock);
+        DownloadItem item;
+        item.id = m_nextId++;
+        item.ref = nullptr;
+        item.filename = filename;
+        item.path = path;
+        item.source = host;
+        item.received = 0;
+        item.total = 0;
+        item.state = DownloadItem::State::Active;
+        id = item.id;
+        m_items.insert(m_items.begin(), std::move(item));
+    }
+
+    log(L"Download created (WinHTTP): id=" + std::to_wstring(id)
+        + L" from " + (host.empty() ? L"(unknown host)" : host)
+        + L" -> " + path);
+    notify(true);
+
+    // Spawn the worker outside the lock; it will pull item.path through
+    // destinationFor() and the byte counts through reportProgress().
+    startWinhttpTransfer(id, std::move(url));
+}
+
+std::wstring Downloads::destinationFor(unsigned id) const
+{
+    Lock lock(m_lock);
+    if (DownloadItem* item = findIdLocked(id))
+        return item->path;
+    return { };
+}
+
+bool Downloads::stillActive(unsigned id) const
+{
+    Lock lock(m_lock);
+    if (DownloadItem* item = findIdLocked(id))
+        return item->state == DownloadItem::State::Active;
+    return false;
+}
+
+void Downloads::reportProgress(unsigned id, long long received, long long total)
+{
+    bool changed = false;
+    {
+        Lock lock(m_lock);
+        if (DownloadItem* item = findIdLocked(id)) {
+            if (received > item->received) {
+                item->received = received;
+                changed = true;
+            }
+            if (total > 0 && total != item->total) {
+                item->total = total;
+                changed = true;
+            }
+        }
+    }
+    if (changed)
+        notify(false);
+}
+
+void Downloads::reportFinish(unsigned id, long long finalTotal)
+{
+    bool changed = false;
+    std::wstring path;
+    {
+        Lock lock(m_lock);
+        if (DownloadItem* item = findIdLocked(id)) {
+            path = item->path;
+            if (finalTotal > 0)
+                item->total = finalTotal;
+            item->state = DownloadItem::State::Finished;
+            item->ref = nullptr;
+            changed = true;
+        }
+    }
+    if (changed) {
+        log(L"Download finished (WinHTTP): " + path);
+        notify(false);
+    }
+}
+
+void Downloads::reportFail(unsigned id, std::wstring reason)
+{
+    bool changed = false;
+    {
+        Lock lock(m_lock);
+        if (DownloadItem* item = findIdLocked(id)) {
+            item->state = DownloadItem::State::Failed;
+            item->ref = nullptr;
+            changed = true;
+        }
+    }
+    if (changed) {
+        log(L"Download failed (WinHTTP): id=" + std::to_wstring(id)
+            + L" " + reason);
+        notify(false);
+    }
 }
 
 WKStringRef Downloads::decideDestination(WKDownloadRef download, WKURLResponseRef response, WKStringRef suggestedFilename, const void*)
@@ -515,17 +758,31 @@ void Downloads::didFail(WKDownloadRef download, WKErrorRef, WKDataRef, const voi
 void Downloads::cancel(unsigned id)
 {
     WKDownloadRef target = nullptr;
+    bool wasWinHttpTransfer = false;
     {
         Lock lock(m_lock);
         DownloadItem* item = findIdLocked(id);
-        if (!item || item->state != DownloadItem::State::Active || !item->ref)
+        if (!item || item->state != DownloadItem::State::Active)
             return;
 
+        // Two paths: WebKit-managed (item.ref is set) and our own WinHTTP
+        // path (item.ref is null because the worker reads item.state under
+        // stillActive()). For WebKit we need WKDownloadCancel; for WinHTTP
+        // we just flag Cancelled and the worker aborts on its next chunk.
+        if (item->ref)
+            target = item->ref;
+        else
+            wasWinHttpTransfer = true;
+
         item->state = DownloadItem::State::Cancelled;
-        target = item->ref;
     }
 
-    WKDownloadCancel(target, nullptr, &cancelFinished);
+    if (target)
+        WKDownloadCancel(target, nullptr, &cancelFinished);
+    else if (wasWinHttpTransfer)
+        log(L"Download cancel marked (WinHTTP worker will stop at the next chunk): id="
+            + std::to_wstring(id));
+
     notify(false);
 }
 

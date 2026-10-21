@@ -2019,15 +2019,29 @@ void Browser::showOverview()
 
     endAddressEdit();
 
-    if (auto* view = active())
-        captureThumbnail(*view);
+    // Every tab needs a picture, not just whichever one happens to be active.
+    // captureThumbnail reads the screen, so it refuses a view that is not
+    // visible - and inactive tabs have theirs hidden - which used to leave
+    // every card but the active one with no thumbnail at all. A card with no
+    // thumbnail is painted in m_theme.page, which in the dark theme sits a
+    // couple of shades off the overlay background, so those cards vanished:
+    // the grid read as empty space with one lone picture floating in it.
+    //
+    // Showing a view again puts its last composited content straight back on
+    // screen from DWM's redirection surface, so it can be grabbed immediately.
+    // The whole loop runs inside this one command handler, before any paint,
+    // so none of the intermediate shows are ever seen.
+    for (auto& tab : m_tabs) {
+        tab->setVisible(true);
+        captureThumbnail(*tab);
+    }
 
     m_overview = true;
     m_overviewScroll = 0;
     m_overviewHoverCard = -1;
     m_overviewHoverClose = false;
 
-    for (const auto& tab : m_tabs)
+    for (auto& tab : m_tabs)
         tab->setVisible(false);
 
     syncAnimations();
@@ -2159,12 +2173,31 @@ void Browser::releaseOverviewSurface()
 
 void Browser::paintOverview(HDC dc, int width, int height)
 {
+    if (width <= 0 || height <= 0)
+        return;
+
+    // The overlay's background goes down first, before the early-out below and
+    // before anything is composited onto it. Every tab view is hidden the
+    // instant the overview opens, so the buffer's previous contents are all
+    // that is left behind the overlay - and the buffer is never cleared, so
+    // that is usually the window's untouched black. Filling first means the
+    // half-second fade runs against the overlay's own colour instead of
+    // opening a black hole and then filling it in.
+    //
+    // It also clears the previous animation frame, which matters because the
+    // composite below is translucent until the last moment: without this, each
+    // tick blended onto the tick before it and the grid ended up as a stack of
+    // half-transparent copies a pixel or two apart - a doubled card border and
+    // the tab title printed twice.
+    fillSolid(dc, RECT { 0, 0, width, height },
+        m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
+
     // The overview eases in and out, so it is drawn offscreen and composited
     // with an alpha rather than being painted straight onto the chrome. Two
     // things happen at once: the whole grid fades, and the cards grow from
     // 94% to full size about the centre of the content area.
     const double t = std::clamp(m_overviewAnim.value, 0.0, 1.0);
-    if (t <= 0.002 || width <= 0 || height <= 0)
+    if (t <= 0.002)
         return;
 
     // Compositing needs a scratch surface the size of the content area, and a
@@ -3028,10 +3061,16 @@ void Browser::onDownloadsChanged(bool started)
 
     // Refresh the full downloads page if it is open, so a download that
     // starts, finishes or is removed updates without the page having to
-    // self-reload.
+    // self-reload. Rate limited: this handler also runs on every progress
+    // tick, and reloading the page twice a second is a WebKit navigation
+    // storm on the UI thread. The page reloads itself between pushes anyway.
     if (m_downloadsPageTab != static_cast<size_t>(-1) && m_downloadsPageTab < m_tabs.size()) {
-        if (auto* view = m_tabs[m_downloadsPageTab].get())
-            view->loadHtml(downloadsPageHtml(m_theme.dark));
+        const ULONGLONG now = GetTickCount64();
+        if (m_downloadsPagePushedAt == 0 || now - m_downloadsPagePushedAt >= 1000) {
+            m_downloadsPagePushedAt = now;
+            if (auto* view = m_tabs[m_downloadsPageTab].get())
+                view->loadHtml(downloadsPageHtml(m_theme.dark));
+        }
     }
 
     // Poll the files on disk while anything is in flight, and stop as soon as
