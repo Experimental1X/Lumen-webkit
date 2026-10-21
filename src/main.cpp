@@ -178,6 +178,12 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             return 0;
         break;
 
+    case WM_LBUTTONUP:
+        // Releases the pressed state so the button springs back out.
+        if (browser)
+            browser->onLeftButtonUp();
+        break;
+
     case WM_MOUSEMOVE:
         if (browser) {
             if (!browser->trackingMouse()) {

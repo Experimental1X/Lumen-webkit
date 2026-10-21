@@ -132,6 +132,7 @@ public:
     void onMouseLeave();
     void onNcMouseMove();
     bool onLeftButtonDown(POINT point);
+    void onLeftButtonUp();
     LRESULT onNcHitTest(LRESULT defaultHit, POINT screenPoint);
     void onDpiChanged();
     void onSettingChange(LPARAM lParam);
@@ -159,6 +160,57 @@ public:
     void setTrackingMouse(bool value) { m_trackingMouse = value; }
 
 private:
+    // --- motion ---
+    // Every transition in the chrome is a damped spring integrated against the
+    // clock, not a fixed-duration tween. Apple animates layout with
+    // spring(response:dampingFraction:) and its defaults are 0.55 / 0.825 for
+    // layout changes and 0.15 / 0.86 for control feedback, so those are the
+    // numbers used here: a layout spring that settles in about half a second
+    // with a barely perceptible overshoot, and a much snappier one for a
+    // button that has been pressed.
+    struct Spring {
+        double value { 0.0 };
+        double target { 0.0 };
+        double velocity { 0.0 };
+
+        void snap(double to)
+        {
+            value = to;
+            target = to;
+            velocity = 0.0;
+        }
+
+        void animateTo(double to) { target = to; }
+
+        bool settled() const { return value == target && velocity == 0.0; }
+
+        bool step(double dt, double response, double damping);
+    };
+
+    static constexpr double kLayoutResponse = 0.55;
+    static constexpr double kLayoutDamping = 0.825;
+    static constexpr double kControlResponse = 0.15;
+    static constexpr double kControlDamping = 0.86;
+
+    // Advances every spring and repaints if any of them moved. Returns true
+    // while at least one is still travelling.
+    bool stepAnimations();
+    void syncAnimations();
+    void ensureAnimTimer();
+    // Current width of the sidebar, in pixels, mid-transition included.
+    int sidebarWidthNow() const;
+
+    Spring m_sidebarAnim;
+    Spring m_panelAnim;
+    Spring m_overviewAnim;
+    Spring m_findAnim;
+    Spring m_addressAnim;
+    ULONGLONG m_lastAnimTick { 0 };
+    // Index of the toolbar button currently held down, and how far into the
+    // press it is. -1 when nothing is pressed.
+    int m_pressTarget { -1 };
+    Spring m_pressAnim;
+
     // --- metrics ---
     UINT dpi() const;
     int px(int logical) const;
@@ -252,6 +304,9 @@ private:
     bool overviewClick(POINT local, int width, int height);
     void overviewMove(POINT local, int width);
     void paintOverview(HDC dc, int width, int height);
+    // The tab grid itself. paintOverview renders this into an offscreen buffer
+    // first so the whole grid can fade and scale as one piece.
+    void paintOverviewContent(HDC dc, int width, int height);
 
     // --- sidebar (Bookmarks, Reading List, History) ---
     struct SidebarLayout {
@@ -327,6 +382,12 @@ private:
         ULONGLONG closedAt { 0 };
     };
     static constexpr UINT_PTR kReapTimer = 1;
+    // Polls the destination files of in-flight downloads. WebKit's progress
+    // callback has never fired on this build, so byte counts come from disk.
+    static constexpr UINT_PTR kProgressTimer = 2;
+    // Drives the chrome animations at roughly 60 Hz, and is only running while
+    // a spring is actually in flight.
+    static constexpr UINT_PTR kAnimTimer = 3;
     std::vector<ClosedTab> m_closedTabs;
     void reapTabs();
     size_t m_active { 0 };

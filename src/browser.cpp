@@ -12,6 +12,7 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cwchar>
 
@@ -125,6 +126,15 @@ bool Browser::create(HWND window, std::wstring& error)
     createAddressControl();
     createFindControl();
     createDownloadsPanel();
+
+    // Nothing is mid-transition at startup: every spring starts parked at the
+    // value its target already has, so the first paint is not a fade-in.
+    m_sidebarAnim.snap(0.0);
+    m_panelAnim.snap(0.0);
+    m_overviewAnim.snap(0.0);
+    m_findAnim.snap(0.0);
+    m_addressAnim.snap(0.0);
+    m_pressAnim.snap(0.0);
     Downloads::instance().setOwnerWindow(m_window);
     // Settings persist across launches (settings.tsv under %APPDATA%\Lumen).
     Settings::instance().load();
@@ -155,6 +165,121 @@ void Browser::onTimer(UINT_PTR id)
 {
     if (id == kReapTimer)
         reapTabs();
+    else if (id == kProgressTimer)
+        Downloads::instance().refreshFromDisk();
+    else if (id == kAnimTimer)
+        stepAnimations();
+}
+
+// ---------------------------------------------------------------------------
+// Motion
+// ---------------------------------------------------------------------------
+
+bool Browser::Spring::step(double dt, double response, double damping)
+{
+    if (settled())
+        return false;
+
+    // A long stall - dragging the window, a modal dialog, a debugger break -
+    // would otherwise hand the integrator an enormous dt and fling the spring
+    // off screen. Treating it as one frame costs a few milliseconds of motion
+    // and keeps the simulation stable.
+    dt = std::clamp(dt, 0.0, 1.0 / 30.0);
+    if (dt <= 0.0)
+        return true;
+
+    // Damped harmonic oscillator: a = -w^2(x - target) - 2*zeta*w*v
+    const double omega = 2.0 * 3.14159265358979323846 / response;
+    const double accel = -omega * omega * (value - target) - 2.0 * damping * omega * velocity;
+    velocity += accel * dt;
+    value += velocity * dt;
+
+    // Snap the asymptote so the timer can actually stop. Sub-pixel, so nothing
+    // visibly jumps when it lands.
+    if (std::abs(value - target) < 0.05 && std::abs(velocity) < 0.5) {
+        value = target;
+        velocity = 0.0;
+        return false;
+    }
+    return true;
+}
+
+void Browser::syncAnimations()
+{
+    m_sidebarAnim.target = sidebarVisibleNow() ? static_cast<double>(px(kSidebarWidth)) : 0.0;
+    m_panelAnim.target = m_downloadsVisible ? 1.0 : 0.0;
+    m_overviewAnim.target = m_overview ? 1.0 : 0.0;
+    m_findAnim.target = m_findVisible ? 1.0 : 0.0;
+    m_addressAnim.target = m_editing ? 1.0 : 0.0;
+    m_pressAnim.target = m_pressTarget >= 0 ? 1.0 : 0.0;
+    ensureAnimTimer();
+}
+
+void Browser::ensureAnimTimer()
+{
+    if (!m_window)
+        return;
+
+    const bool busy = !m_sidebarAnim.settled() || !m_panelAnim.settled()
+        || !m_overviewAnim.settled() || !m_findAnim.settled()
+        || !m_addressAnim.settled() || !m_pressAnim.settled();
+
+    if (busy)
+        SetTimer(m_window, kAnimTimer, 16, nullptr);
+    else {
+        KillTimer(m_window, kAnimTimer);
+        m_lastAnimTick = 0;
+    }
+}
+
+bool Browser::stepAnimations()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (m_lastAnimTick == 0)
+        m_lastAnimTick = now;
+
+    const double dt = static_cast<double>(now - m_lastAnimTick) / 1000.0;
+    m_lastAnimTick = now;
+
+    bool moving = false;
+    moving |= m_sidebarAnim.step(dt, kLayoutResponse, kLayoutDamping);
+    moving |= m_panelAnim.step(dt, kLayoutResponse, kLayoutDamping);
+    moving |= m_overviewAnim.step(dt, kLayoutResponse, kLayoutDamping);
+    moving |= m_findAnim.step(dt, kLayoutResponse, kLayoutDamping);
+    moving |= m_addressAnim.step(dt, kControlResponse, kControlDamping);
+    moving |= m_pressAnim.step(dt, kControlResponse, kControlDamping);
+
+    // The downloads panel is a separate top-level window, so it cannot simply
+    // fade out - it has to shrink to nothing and then be hidden for real.
+    const bool panelLanded = m_panelAnim.settled() && m_panelAnim.value <= 0.0;
+    if (panelLanded && m_downloadsPanel && !m_downloadsVisible)
+        ShowWindow(m_downloadsPanel, SW_HIDE);
+
+    // Same story for the find bar's edit control.
+    if (m_findAnim.settled() && m_findAnim.value <= 0.0 && !m_findVisible && m_find)
+        ShowWindow(m_find, SW_HIDE);
+
+    // The tab overview hides every tab view while it is up, so the page only
+    // comes back once the overlay has finished easing away.
+    if (!m_overview && m_overviewAnim.settled() && m_overviewAnim.value <= 0.0 && m_active < m_tabs.size())
+        m_tabs[m_active]->setVisible(true);
+
+    if (moving) {
+        resize();
+        if (m_downloadsPanel && (m_downloadsVisible || m_panelAnim.value > 0.0))
+            layoutDownloadsPanel();
+        invalidateChrome();
+    } else
+        ensureAnimTimer();
+
+    return moving;
+}
+
+int Browser::sidebarWidthNow() const
+{
+    if (!m_sidebarAnim.settled())
+        return std::clamp(static_cast<int>(std::lround(m_sidebarAnim.value)), 0, px(kSidebarWidth));
+    return m_sidebarAnim.target > 0.0 ? px(kSidebarWidth) : 0;
 }
 
 void Browser::reapTabs()
@@ -196,7 +321,11 @@ float Browser::scaleFactor() const
 
 int Browser::chromeHeight() const
 {
-    return px(kToolbarHeight) + (m_tabs.size() > 1 ? px(kTabBarHeight) : 0) + (m_findVisible ? px(kFindBarHeight) : 0);
+    // The find bar is the one piece of chrome that changes the page's top edge,
+    // so it has to travel: a bar that appears at full height instantly reads as
+    // a layout jump rather than a transition.
+    const int findHeight = static_cast<int>(std::lround(m_findAnim.value * px(kFindBarHeight)));
+    return px(kToolbarHeight) + (m_tabs.size() > 1 ? px(kTabBarHeight) : 0) + findHeight;
 }
 
 void Browser::invalidateChrome() const
@@ -387,7 +516,7 @@ void Browser::resize()
         if (!viewWindow)
             continue;
 
-        const int viewLeft = sidebarVisibleNow() ? std::min(px(kSidebarWidth), static_cast<int>(client.right)) : 0;
+        const int viewLeft = sidebarWidthNow();
         MoveWindow(
             viewWindow,
             viewLeft,
@@ -401,7 +530,7 @@ void Browser::resize()
     // window and must follow every size change.
     InvalidateRect(m_window, nullptr, FALSE);
 
-    if (m_downloadsVisible)
+    if (m_downloadsVisible || m_panelAnim.value > 0.0)
         layoutDownloadsPanel();
 }
 
@@ -615,6 +744,7 @@ void Browser::beginAddressEdit()
 
         placeAddressBar(layout());
         ShowWindow(m_address, SW_SHOW);
+        syncAnimations();
     }
 
     SetFocus(m_address);
@@ -628,6 +758,7 @@ void Browser::endAddressEdit()
 
     m_editing = false;
     ShowWindow(m_address, SW_HIDE);
+    syncAnimations();
     invalidateChrome();
 }
 
@@ -1060,6 +1191,11 @@ bool Browser::onLeftButtonDown(POINT point)
 
     const HitResult hit = hitTest(point, l);
 
+    // Remember which control is being held, so the paint code can press it in
+    // and the release can spring it back out.
+    m_pressTarget = static_cast<int>(hit.target);
+    syncAnimations();
+
     if (m_downloadsVisible && hit.target != Target::Downloads)
         hideDownloadsPanel(false);
 
@@ -1128,6 +1264,15 @@ bool Browser::onLeftButtonDown(POINT point)
     }
 
     return false;
+}
+
+void Browser::onLeftButtonUp()
+{
+    if (m_pressTarget < 0)
+        return;
+
+    m_pressTarget = -1;
+    syncAnimations();
 }
 
 LRESULT Browser::onNcHitTest(LRESULT defaultHit, POINT screenPoint)
@@ -1283,15 +1428,16 @@ void Browser::onPaint(HDC target)
     const int contentHeight = std::max(0, static_cast<int>(client.bottom - l.totalHeight));
     const RECT content { 0, l.totalHeight, width, l.totalHeight + contentHeight };
 
-    if (m_overview) {
+    if (m_overview || m_overviewAnim.value > 0.0) {
         paintBuffered(target, content, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
     } else {
         // Page area behind the web views.
         fillSolid(target, content, m_theme.page);
 
-        if (sidebarVisibleNow()) {
-            const RECT panel { 0, l.totalHeight, std::min(px(kSidebarWidth), width), l.totalHeight + contentHeight };
-            paintBuffered(target, panel, [&](HDC dc) { paintSidebar(dc, panel.right - panel.left, contentHeight); });
+        const int sidebarWidth = sidebarWidthNow();
+        if (sidebarWidth > 0) {
+            const RECT panel { 0, l.totalHeight, sidebarWidth, l.totalHeight + contentHeight };
+            paintBuffered(target, panel, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
         }
     }
 
@@ -1406,9 +1552,34 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         fillRoundedRect(g, inset, (inset.bottom - inset.top) / 2, m_theme.glassHover);
     };
 
+    // Linear colour blend, used to fade the pressed state in.
+    auto mix = [](COLORREF from, COLORREF to, double t) {
+        const auto channel = [t](int a, int b) {
+            return static_cast<BYTE>(std::lround(a + (b - a) * t));
+        };
+        return RGB(channel(GetRValue(from), GetRValue(to)),
+            channel(GetGValue(from), GetGValue(to)),
+            channel(GetBValue(from), GetBValue(to)));
+    };
+
+    // A control that is being held darkens a step further than a plain hover,
+    // and springs back out when the button is released. This is the short,
+    // snappy spring (0.15 / 0.86) rather than the layout one.
+    auto drawPress = [&](Target which, const RECT& rect) {
+        if (m_pressTarget != static_cast<int>(which))
+            return;
+
+        RECT inset = rect;
+        InflateRect(&inset, -px(2), -px(2));
+        const double t = std::clamp(m_pressAnim.value, 0.0, 1.0);
+        const COLORREF deep = m_theme.dark ? RGB(88, 88, 94) : RGB(212, 212, 218);
+        fillRoundedRect(g, inset, (inset.bottom - inset.top) / 2, mix(m_theme.glassHover, deep, t));
+    };
+
     drawGlass(l.sidebar);
     if (m_hover.target == Target::Sidebar)
         drawHot(l.sidebar);
+    drawPress(Target::Sidebar, l.sidebar);
     drawSidebarIcon(g, l.sidebar, m_theme.text, k);
 
     drawGlass(l.navGroup);
@@ -1416,6 +1587,8 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         drawHot(l.back);
     if (m_hover.target == Target::Forward && canGoForward)
         drawHot(l.forward);
+    drawPress(Target::Back, l.back);
+    drawPress(Target::Forward, l.forward);
     drawChevronIcon(g, l.back, false, canGoBack ? m_theme.text : m_theme.textDisabled, k);
     drawChevronIcon(g, l.forward, true, canGoForward ? m_theme.text : m_theme.textDisabled, k);
 
@@ -1423,6 +1596,7 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     if (l.hasDownloads) {
         if (m_hover.target == Target::Downloads)
             drawHot(l.downloadsButton);
+        drawPress(Target::Downloads, l.downloadsButton);
         const Downloads& downloads = Downloads::instance();
         drawDownloadsIcon(g, l.downloadsButton, m_theme.text, m_theme.accent, downloads.hasActive(), downloads.progress(), k);
     }
@@ -1432,6 +1606,9 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         drawHot(l.newTabButton);
     if (m_hover.target == Target::TabOverview)
         drawHot(l.overviewButton);
+    drawPress(Target::Share, l.shareButton);
+    drawPress(Target::NewTab, l.newTabButton);
+    drawPress(Target::TabOverview, l.overviewButton);
     drawShareIcon(g, l.shareButton, m_theme.text, k);
     drawPlusIcon(g, l.newTabButton, m_theme.text, k);
     drawTabOverviewIcon(g, l.overviewButton, m_theme.text, k);
@@ -1465,7 +1642,11 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
     }
 
     if (m_editing) {
-        strokeRoundedRect(g, l.pill, pillRadius, m_theme.accent, 2.0f * k, 210);
+        // The focus ring fades up rather than appearing at full strength the
+        // instant the field takes focus.
+        const double t = std::clamp(m_addressAnim.value, 0.0, 1.0);
+        strokeRoundedRect(g, l.pill, pillRadius, m_theme.accent, 2.0f * k,
+            static_cast<int>(210.0 * t + 0.5));
     } else {
         drawPageMenuIcon(g, l.pageMenu, m_theme.textSecondary, k);
         if (loading)
@@ -1704,6 +1885,7 @@ void Browser::showOverview()
     for (const auto& tab : m_tabs)
         tab->setVisible(false);
 
+    syncAnimations();
     SetFocus(m_window);
     InvalidateRect(m_window, nullptr, FALSE);
 }
@@ -1717,9 +1899,10 @@ void Browser::hideOverview()
     m_overviewHoverCard = -1;
     m_overviewHoverClose = false;
 
-    for (size_t i = 0; i < m_tabs.size(); ++i)
-        m_tabs[i]->setVisible(i == m_active);
-
+    // The tab views stay hidden until the overlay has finished easing out, so
+    // the page is revealed by the fade instead of snapping in behind it.
+    // stepAnimations() is what brings them back.
+    syncAnimations();
     resize();
     if (auto* view = active())
         view->focus();
@@ -1824,6 +2007,46 @@ void Browser::overviewMove(POINT local, int width)
 }
 
 void Browser::paintOverview(HDC dc, int width, int height)
+{
+    // The overview eases in and out, so it is drawn offscreen and composited
+    // with an alpha rather than being painted straight onto the chrome. Two
+    // things happen at once: the whole grid fades, and the cards grow from
+    // 94% to full size about the centre of the content area.
+    const double t = std::clamp(m_overviewAnim.value, 0.0, 1.0);
+    if (t <= 0.002 || width <= 0 || height <= 0)
+        return;
+
+    Gdiplus::Bitmap buffer(width, height, PixelFormat32bppPARGB);
+    {
+        Gdiplus::Graphics scratch(&buffer);
+        scratch.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+        HDC bufferDc = scratch.GetHDC();
+        paintOverviewContent(bufferDc, width, height);
+        scratch.ReleaseHDC(bufferDc);
+    }
+
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+
+    Gdiplus::ImageAttributes attributes;
+    attributes.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+    Gdiplus::ColorMatrix matrix;
+    matrix.SetAlpha(static_cast<float>(t));
+    attributes.SetColorMatrix(&matrix);
+
+    const float scale = 0.94f + 0.06f * static_cast<float>(t);
+    g.TranslateTransform(static_cast<Gdiplus::REAL>(width * (1.0 - scale) * 0.5),
+        static_cast<Gdiplus::REAL>(height * (1.0 - scale) * 0.5));
+    g.ScaleTransform(scale, scale);
+
+    g.DrawImage(&buffer,
+        0, 0, static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
+        0, 0, static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
+        Gdiplus::UnitPixel, &attributes);
+}
+
+void Browser::paintOverviewContent(HDC dc, int width, int height)
 {
     const RECT whole { 0, 0, width, height };
     fillSolid(dc, whole, m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
@@ -1984,6 +2207,9 @@ void Browser::toggleSidebar()
     if (m_overview)
         hideOverview();
 
+    // Let the width spring to its new value rather than jumping the page
+    // sideways; resize() reads the interpolated width every frame.
+    syncAnimations();
     resize();
     InvalidateRect(m_window, nullptr, FALSE);
 }
@@ -2296,8 +2522,9 @@ void Browser::showFind()
 
     if (!m_findVisible) {
         m_findVisible = true;
-        resize();
         ShowWindow(m_find, SW_SHOW);
+        syncAnimations();
+        resize();
     }
 
     SetFocus(m_find);
@@ -2315,7 +2542,9 @@ void Browser::hideFind()
     for (const auto& tab : m_tabs)
         tab->hideFind();
 
-    ShowWindow(m_find, SW_HIDE);
+    // The edit control stays on screen until the slide-out lands; see
+    // stepAnimations(), which hides it once the spring reaches zero.
+    syncAnimations();
     resize();
 
     if (auto* view = active())
@@ -2495,7 +2724,10 @@ void Browser::layoutDownloadsPanel()
     GetClientRect(m_window, &client);
 
     const int width = px(kDownloadsWidth);
-    const int height = downloadsPanelHeight();
+    // The panel grows out of the toolbar rather than popping into existence.
+    // Height is the animated one; the content below it is clipped by the
+    // window region, so a partially open panel shows the rows from the top.
+    const int height = std::max(1, static_cast<int>(std::lround(downloadsPanelHeight() * m_panelAnim.value)));
     const int anchorRight = l.hasDownloads ? static_cast<int>(l.downloadsButton.right) : static_cast<int>(client.right) - px(20);
     const int x = std::clamp(anchorRight - width, px(8), std::max(px(8), static_cast<int>(client.right) - width - px(8)));
     const int y = l.toolbarHeight - px(4);
@@ -2516,6 +2748,7 @@ void Browser::showDownloadsPanel(bool takeFocus)
         return;
 
     m_downloadsVisible = true;
+    syncAnimations();
     layoutDownloadsPanel();
     InvalidateRect(m_downloadsPanel, nullptr, FALSE);
 
@@ -2537,8 +2770,9 @@ void Browser::hideDownloadsPanel(bool refocusPage)
     m_downloadsHoverClear = false;
     m_downloadsHoverShowAll = false;
 
-    if (m_downloadsPanel)
-        ShowWindow(m_downloadsPanel, SW_HIDE);
+    // The panel collapses back into the toolbar; stepAnimations() is what
+    // actually hides the window once the spring reaches zero.
+    syncAnimations();
 
     if (refocusPage && !m_editing && !m_overview) {
         if (auto* view = active())
@@ -2585,6 +2819,14 @@ void Browser::onDownloadsChanged(bool started)
         if (auto* view = m_tabs[m_downloadsPageTab].get())
             view->loadHtml(downloadsPageHtml(m_theme.dark));
     }
+
+    // Poll the files on disk while anything is in flight, and stop as soon as
+    // nothing is. WebKit's own progress callback has never actually arrived on
+    // this port, so the byte count has to come from somewhere real.
+    if (Downloads::instance().hasActive())
+        SetTimer(m_window, kProgressTimer, 400, nullptr);
+    else
+        KillTimer(m_window, kProgressTimer);
 
     invalidateChrome();
 }

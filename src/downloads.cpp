@@ -113,6 +113,17 @@ void cancelFinished(WKDataRef, const void*)
 {
 }
 
+// Scoped lock for m_lock. Every access to the download list and the client
+// tables goes through one of these.
+class Lock {
+public:
+    explicit Lock(CRITICAL_SECTION& section) { EnterCriticalSection(&section); }
+    ~Lock() { LeaveCriticalSection(&section); }
+
+    Lock(const Lock&) = delete;
+    Lock& operator=(const Lock&) = delete;
+};
+
 } // namespace
 
 std::wstring formatBytes(long long bytes)
@@ -136,13 +147,23 @@ std::wstring formatBytes(long long bytes)
     return text;
 }
 
+Downloads::Downloads()
+{
+    InitializeCriticalSection(&m_lock);
+}
+
+Downloads::~Downloads()
+{
+    DeleteCriticalSection(&m_lock);
+}
+
 Downloads& Downloads::instance()
 {
     static Downloads downloads;
     return downloads;
 }
 
-DownloadItem* Downloads::find(WKDownloadRef download)
+DownloadItem* Downloads::findLocked(WKDownloadRef download)
 {
     for (auto& item : m_items) {
         if (item.ref == download)
@@ -151,13 +172,19 @@ DownloadItem* Downloads::find(WKDownloadRef download)
     return nullptr;
 }
 
-DownloadItem* Downloads::findId(unsigned id)
+DownloadItem* Downloads::findIdLocked(unsigned id)
 {
     for (auto& item : m_items) {
         if (item.id == id)
             return &item;
     }
     return nullptr;
+}
+
+std::vector<DownloadItem> Downloads::items() const
+{
+    Lock lock(m_lock);
+    return m_items;
 }
 
 void Downloads::notify(bool started)
@@ -176,6 +203,7 @@ void Downloads::notify(bool started)
 
 bool Downloads::hasActive() const
 {
+    Lock lock(m_lock);
     for (const auto& item : m_items) {
         if (item.state == DownloadItem::State::Active)
             return true;
@@ -185,6 +213,7 @@ bool Downloads::hasActive() const
 
 double Downloads::progress() const
 {
+    Lock lock(m_lock);
     long long received = 0;
     long long total = 0;
     for (const auto& item : m_items) {
@@ -196,39 +225,85 @@ double Downloads::progress() const
     return total > 0 ? std::clamp(static_cast<double>(received) / static_cast<double>(total), 0.0, 1.0) : 0.0;
 }
 
+void Downloads::refreshFromDisk()
+{
+    bool changed = false;
+
+    {
+        Lock lock(m_lock);
+        for (auto& item : m_items) {
+            if (item.state != DownloadItem::State::Active || item.path.empty())
+                continue;
+
+            WIN32_FILE_ATTRIBUTE_DATA data { };
+            if (!GetFileAttributesExW(item.path.c_str(), GetFileExInfoStandard, &data))
+                continue;
+
+            const long long size = (static_cast<long long>(data.nFileSizeHigh) << 32)
+                | static_cast<long long>(data.nFileSizeLow);
+
+            if (size > item.received) {
+                item.received = size;
+                changed = true;
+            }
+
+            // A file that has reached its advertised size is done, whether or
+            // not didFinish ever arrives. Leaving it Active is what made the
+            // bar sit at a full width while the row still read "0 bytes".
+            if (item.total > 0 && size >= item.total) {
+                item.state = DownloadItem::State::Finished;
+                item.ref = nullptr;
+                changed = true;
+                log(L"Download complete (measured on disk): " + item.path);
+            }
+        }
+    }
+
+    if (changed)
+        notify(false);
+}
+
 void Downloads::attach(WKDownloadRef download)
 {
-    if (!download || find(download))
+    if (!download)
         return;
 
     WKRetain(download);
 
-    DownloadItem item;
-    item.id = m_nextId++;
-    item.ref = download;
-    item.filename = L"Download";
+    {
+        Lock lock(m_lock);
+        if (findLocked(download)) {
+            WKRelease(download);
+            return;
+        }
 
-    auto request = adopt(WKDownloadCopyRequest(download));
-    if (request) {
-        auto url = adopt(WKURLRequestCopyURL(request.get()));
-        item.source = hostFromUrl(toWide(url.get()));
+        DownloadItem item;
+        item.id = m_nextId++;
+        item.ref = download;
+        item.filename = L"Download";
+
+        auto request = adopt(WKDownloadCopyRequest(download));
+        if (request) {
+            auto url = adopt(WKURLRequestCopyURL(request.get()));
+            item.source = hostFromUrl(toWide(url.get()));
+        }
+
+        m_items.insert(m_items.begin(), std::move(item));
+
+        // The callback table has to outlive this function: WKDownloadSetClient
+        // keeps the pointer and reads it again on every later callback. See the
+        // m_clients comment in downloads.h for what happens if it does not.
+        auto client = std::make_unique<WKDownloadClientV0>();
+        client->base.version = 0;
+        client->base.clientInfo = this;
+        client->decideDestinationWithResponse = &Downloads::decideDestination;
+        client->didWriteData = &Downloads::didWriteData;
+        client->didFinish = &Downloads::didFinish;
+        client->didFailWithError = &Downloads::didFail;
+
+        m_clients[download] = std::move(client);
+        WKDownloadSetClient(download, &m_clients[download]->base);
     }
-
-    m_items.insert(m_items.begin(), std::move(item));
-
-    // The callback table has to outlive this function: WKDownloadSetClient
-    // keeps the pointer and reads it again on every later callback. See the
-    // m_clients comment in downloads.h for what happens if it does not.
-    auto client = std::make_unique<WKDownloadClientV0>();
-    client->base.version = 0;
-    client->base.clientInfo = this;
-    client->decideDestinationWithResponse = &Downloads::decideDestination;
-    client->didWriteData = &Downloads::didWriteData;
-    client->didFinish = &Downloads::didFinish;
-    client->didFailWithError = &Downloads::didFail;
-
-    m_clients[download] = std::move(client);
-    WKDownloadSetClient(download, &m_clients[download]->base);
 
     log(L"Download started.");
     notify(true);
@@ -244,18 +319,21 @@ WKStringRef Downloads::decideDestination(WKDownloadRef download, WKURLResponseRe
 
     const std::wstring path = uniquePath(downloadsFolder(), name);
 
-    if (DownloadItem* item = self.find(download)) {
-        item->path = path;
-        item->filename = fileNameOf(path);
-        if (response) {
-            const uint32_t expected = WKURLResponseGetExpectedContentLength(response);
-            if (expected > 0)
-                item->total = expected;
+    {
+        Lock lock(self.m_lock);
+        if (DownloadItem* item = self.findLocked(download)) {
+            item->path = path;
+            item->filename = fileNameOf(path);
+            if (response) {
+                const uint32_t expected = WKURLResponseGetExpectedContentLength(response);
+                if (expected > 0)
+                    item->total = expected;
+            }
         }
-        self.notify(false);
     }
 
     log(L"Download destination: " + path);
+    self.notify(false);
 
     // The string is returned with one reference that WebKit takes over. If it
     // only borrows it, the cost is a few bytes; releasing it here instead
@@ -266,87 +344,111 @@ WKStringRef Downloads::decideDestination(WKDownloadRef download, WKURLResponseRe
 void Downloads::didWriteData(WKDownloadRef download, long long, long long totalBytesWritten, long long totalBytesExpectedToWrite, const void*)
 {
     Downloads& self = instance();
-    if (DownloadItem* item = self.find(download)) {
-        // Log the first chunk only, so lumen.log stays readable on a large
-        // file but still proves the callback table was still alive.
-        if (item->received == 0)
-            log(L"Download first bytes received: " + item->filename);
-        item->received = totalBytesWritten;
-        if (totalBytesExpectedToWrite > 0)
-            item->total = totalBytesExpectedToWrite;
-        self.notify(false);
+    {
+        Lock lock(self.m_lock);
+        if (DownloadItem* item = self.findLocked(download)) {
+            // Log the first chunk only, so lumen.log stays readable on a large
+            // file but still proves the callback table was still alive.
+            if (item->received == 0)
+                log(L"Download first bytes received: " + item->filename);
+            item->received = totalBytesWritten;
+            if (totalBytesExpectedToWrite > 0)
+                item->total = totalBytesExpectedToWrite;
+        }
     }
+    self.notify(false);
 }
 
 void Downloads::didFinish(WKDownloadRef download, const void*)
 {
     Downloads& self = instance();
-    if (DownloadItem* item = self.find(download)) {
-        item->state = DownloadItem::State::Finished;
-        item->ref = nullptr;
-        if (item->total <= 0)
-            item->total = item->received;
-        log(L"Download finished: " + item->path);
-        self.notify(false);
+    {
+        Lock lock(self.m_lock);
+        if (DownloadItem* item = self.findLocked(download)) {
+            item->state = DownloadItem::State::Finished;
+            item->ref = nullptr;
+            if (item->total <= 0)
+                item->total = item->received;
+            log(L"Download finished: " + item->path);
+        }
+        // didFinish is the last callback WebKit makes, so the table is free now.
+        self.m_clients.erase(download);
     }
-    // didFinish is the last callback WebKit makes, so the table is free now.
-    self.m_clients.erase(download);
+    self.notify(false);
     WKRelease(download);
 }
 
 void Downloads::didFail(WKDownloadRef download, WKErrorRef, WKDataRef, const void*)
 {
     Downloads& self = instance();
-    if (DownloadItem* item = self.find(download)) {
-        if (item->state != DownloadItem::State::Cancelled)
-            item->state = DownloadItem::State::Failed;
-        item->ref = nullptr;
-        log(L"Download did not complete: " + item->filename);
-        self.notify(false);
+    {
+        Lock lock(self.m_lock);
+        if (DownloadItem* item = self.findLocked(download)) {
+            // Only report a failure for something still in flight. refreshFromDisk
+            // marks a transfer complete the moment the file reaches its
+            // advertised size, and a late didFail must not undo that.
+            if (item->state == DownloadItem::State::Active)
+                item->state = DownloadItem::State::Failed;
+            item->ref = nullptr;
+            log(L"Download did not complete: " + item->filename);
+        }
+        self.m_clients.erase(download);
     }
-    self.m_clients.erase(download);
+    self.notify(false);
     WKRelease(download);
 }
 
 void Downloads::cancel(unsigned id)
 {
-    DownloadItem* item = findId(id);
-    if (!item || item->state != DownloadItem::State::Active || !item->ref)
-        return;
+    WKDownloadRef target = nullptr;
+    {
+        Lock lock(m_lock);
+        DownloadItem* item = findIdLocked(id);
+        if (!item || item->state != DownloadItem::State::Active || !item->ref)
+            return;
 
-    item->state = DownloadItem::State::Cancelled;
-    WKDownloadCancel(item->ref, nullptr, &cancelFinished);
+        item->state = DownloadItem::State::Cancelled;
+        target = item->ref;
+    }
+
+    WKDownloadCancel(target, nullptr, &cancelFinished);
     notify(false);
 }
 
 void Downloads::remove(unsigned id)
 {
-    for (auto it = m_items.begin(); it != m_items.end(); ++it) {
-        if (it->id != id)
-            continue;
+    {
+        Lock lock(m_lock);
+        for (auto it = m_items.begin(); it != m_items.end(); ++it) {
+            if (it->id != id)
+                continue;
 
-        // An active download is cancelled first; it is removed from the list
-        // once WebKit has reported that it ended.
-        if (it->state == DownloadItem::State::Active) {
-            cancel(id);
+            // An active download is cancelled first; it is removed from the
+            // list once WebKit has reported that it ended.
+            if (it->state == DownloadItem::State::Active) {
+                cancel(id);
+                return;
+            }
+
+            m_items.erase(it);
+            notify(false);
             return;
         }
-
-        m_items.erase(it);
-        notify(false);
-        return;
     }
 }
 
 void Downloads::clearFinished()
 {
     bool changed = false;
-    for (auto it = m_items.begin(); it != m_items.end();) {
-        if (it->state != DownloadItem::State::Active) {
-            it = m_items.erase(it);
-            changed = true;
-        } else
-            ++it;
+    {
+        Lock lock(m_lock);
+        for (auto it = m_items.begin(); it != m_items.end();) {
+            if (it->state != DownloadItem::State::Active) {
+                it = m_items.erase(it);
+                changed = true;
+            } else
+                ++it;
+        }
     }
 
     if (changed)

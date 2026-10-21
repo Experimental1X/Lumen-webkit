@@ -23,10 +23,78 @@
 #include <WebKit/WKURLResponse.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <shellapi.h>
 
 namespace lumen {
+
+namespace {
+
+// MIME types that should be saved rather than rendered.
+//
+// The WinCairo port has no plug-in for archives or executables, so when a
+// navigation to one is allowed through, WebKit falls back to showing the bytes
+// as text: opening a .zip navigates the tab to a page of mojibake beginning
+// "MZ" or "PK". Most direct-download links never send
+// Content-Disposition: attachment, so keying off that header alone is what let
+// those navigations through.
+//
+// Deliberately excludes the types a browser genuinely handles inline - text/*,
+// images, audio, video and application/pdf.
+bool isDownloadMimeType(const char* mime)
+{
+    if (!mime || !*mime)
+        return false;
+
+    // "text/plain; charset=utf-8" -> "text/plain", folded to lower case.
+    char normalized[128] { };
+    size_t length = 0;
+    for (const char* p = mime; *p && *p != ';' && length + 1 < std::size(normalized); ++p) {
+        if (*p == ' ')
+            continue;
+        normalized[length++] = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
+    }
+
+    static const char* const blocked[] = {
+        "application/zip",
+        "application/x-zip",
+        "application/x-zip-compressed",
+        "application/octet-stream",
+        "application/gzip",
+        "application/x-gzip",
+        "application/x-tar",
+        "application/x-bzip2",
+        "application/x-7z-compressed",
+        "application/x-rar-compressed",
+        "application/vnd.rar",
+        "application/x-msdownload",
+        "application/x-msdos-program",
+        "application/x-msi",
+        "application/vnd.microsoft.portable-executable",
+        "application/x-executable",
+        "application/x-elf",
+        "application/x-iso9660-image",
+        "application/x-cd-image",
+        "application/x-apple-diskimage",
+        "application/vnd.android.package-archive",
+        "application/x-debian-package",
+        "application/java-archive",
+        "application/x-sqlite3",
+        "application/vnd.ms-cab-compressed",
+        "application/x-font-ttf",
+        "application/vnd.ms-fontobject",
+    };
+
+    for (const char* candidate : blocked) {
+        if (std::strcmp(normalized, candidate) == 0)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
 
 namespace {
 
@@ -367,16 +435,25 @@ void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WK
 
 void WebView::decideNavigationResponse(WKPageRef, WKNavigationResponseRef response, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
 {
-    // Only an explicit Content-Disposition: attachment becomes a download.
-    // Subresources (the bulk of what a page loads) usually have MIME types
-    // the embedder cannot render inline, but they are not downloads - the
-    // page itself handles them. Treating every unknown-MIME subresource as
-    // a download made a YouTube homepage visit spawn two phantom entries:
-    // one for the page itself, one for a cross-origin fetch.
+    // A subframe is part of the page. An ad frame or an embedded viewer
+    // fetching its own payload must never spawn a download, which is what
+    // happened before this check existed - one YouTube page load produced two
+    // phantom entries.
+    if (!WKNavigationResponseIsForMainFrame(response)) {
+        WKFramePolicyListenerUse(listener);
+        return;
+    }
+
     bool download = false;
     auto urlResponse = adopt(WKNavigationResponseCopyResponse(response));
-    if (urlResponse)
-        download = WKURLResponseIsAttachment(urlResponse.get());
+    if (urlResponse) {
+        // Content-Disposition: attachment is the unambiguous case, but most
+        // direct-download links never send it - they just serve the bytes.
+        // Those navigations used to be allowed through, which rendered the file
+        // into the tab as a page of mojibake instead of saving it.
+        download = WKURLResponseIsAttachment(urlResponse.get())
+            || isDownloadMimeType(WKURLResponseGetMIMEType(urlResponse.get()));
+    }
 
     if (download)
         WKFramePolicyListenerDownload(listener);
