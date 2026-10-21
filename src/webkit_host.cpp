@@ -32,6 +32,49 @@ namespace lumen {
 
 namespace {
 
+// URL-by-extension companion for download sniffing in decideNavigationAction.
+// Most direct-download links (GitHub Releases, SourceForge mirrors, FileCR,
+// macOS / Linux ISOs, browser installers) never send Content-Disposition:
+// attachment, so keying off that header alone misses them. The URL is
+// reachable from the action callback, so we check it there.
+//
+// Deliberately narrow: media files (.mp3, .mp4, etc.) are excluded so a
+// link on a music page does not turn into a download.
+bool isDownloadUrl(const std::wstring& url)
+{
+    // Query string and fragment are not part of the file name.
+    std::wstring path = url;
+    const size_t fragment = path.find(L'#');
+    if (fragment != std::wstring::npos)
+        path.resize(fragment);
+    const size_t query = path.find(L'?');
+    if (query != std::wstring::npos)
+        path.resize(query);
+
+    const size_t slash = path.find_last_of(L'/');
+    const size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash))
+        return false;
+
+    std::wstring ext = path.substr(dot);
+    for (wchar_t& c : ext)
+        c = static_cast<wchar_t>(towlower(static_cast<unsigned wchar_t>(c)));
+
+    static const wchar_t* const binary[] = {
+        L".zip", L".7z", L".rar", L".tar", L".gz", L".tgz", L".bz2",
+        L".xz", L".lz", L".lzma", L".zst",
+        L".iso", L".img", L".dmg", L".bin", L".cue",
+        L".exe", L".msi", L".msp", L".dll", L".cab", L".scr",
+        L".deb", L".rpm", L".pkg", L".apk", L".ipa",
+        L".jar", L".war",
+        L".pdf",
+    };
+    for (const wchar_t* candidate : binary)
+        if (ext == candidate)
+            return true;
+    return false;
+}
+
 Ref<WKURLRef> makeUrl(const std::wstring& value)
 {
     const std::string utf8 = toUtf8(value);
