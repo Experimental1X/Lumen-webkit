@@ -1646,7 +1646,7 @@ void Browser::paintChrome(HDC dc, const ChromeLayout& l)
         // instant the field takes focus.
         const double t = std::clamp(m_addressAnim.value, 0.0, 1.0);
         strokeRoundedRect(g, l.pill, pillRadius, m_theme.accent, 2.0f * k,
-            static_cast<int>(210.0 * t + 0.5));
+            static_cast<BYTE>(210.0 * t + 0.5));
     } else {
         drawPageMenuIcon(g, l.pageMenu, m_theme.textSecondary, k);
         if (loading)
@@ -2031,18 +2031,26 @@ void Browser::paintOverview(HDC dc, int width, int height)
 
     Gdiplus::ImageAttributes attributes;
     attributes.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
-    Gdiplus::ColorMatrix matrix;
-    matrix.SetAlpha(static_cast<float>(t));
+    // Gdiplus::ColorMatrix is a plain REAL[5][5]; fill it by hand rather than
+    // calling a method that does not exist in this SDK.
+    Gdiplus::ColorMatrix matrix { };
+    matrix.m[0][0] = 1.0f;
+    matrix.m[1][1] = 1.0f;
+    matrix.m[2][2] = 1.0f;
+    matrix.m[3][3] = static_cast<Gdiplus::REAL>(t);
+    matrix.m[4][4] = 1.0f;
     attributes.SetColorMatrix(&matrix);
 
     const float scale = 0.94f + 0.06f * static_cast<float>(t);
-    g.TranslateTransform(static_cast<Gdiplus::REAL>(width * (1.0 - scale) * 0.5),
-        static_cast<Gdiplus::REAL>(height * (1.0 - scale) * 0.5));
-    g.ScaleTransform(scale, scale);
 
-    g.DrawImage(&buffer,
-        0, 0, static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
-        0, 0, static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
+    Gdiplus::RectF destRect(
+        static_cast<Gdiplus::REAL>(width * (1.0 - scale) * 0.5),
+        static_cast<Gdiplus::REAL>(height * (1.0 - scale) * 0.5),
+        static_cast<Gdiplus::REAL>(width * scale),
+        static_cast<Gdiplus::REAL>(height * scale));
+    g.DrawImage(&buffer, destRect,
+        0.0f, 0.0f,
+        static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
         Gdiplus::UnitPixel, &attributes);
 }
 

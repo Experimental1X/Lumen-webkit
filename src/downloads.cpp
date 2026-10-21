@@ -117,11 +117,21 @@ void cancelFinished(WKDataRef, const void*)
 // tables goes through one of these.
 class Lock {
 public:
-    explicit Lock(CRITICAL_SECTION& section) { EnterCriticalSection(&section); }
-    ~Lock() { LeaveCriticalSection(&section); }
+    explicit Lock(CRITICAL_SECTION& section)
+        : m_section(section)
+    {
+        EnterCriticalSection(&m_section);
+    }
+    ~Lock()
+    {
+        LeaveCriticalSection(&m_section);
+    }
 
     Lock(const Lock&) = delete;
     Lock& operator=(const Lock&) = delete;
+
+private:
+    CRITICAL_SECTION& m_section;
 };
 
 } // namespace

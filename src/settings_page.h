@@ -77,7 +77,6 @@ inline std::string settingsPageHtml(bool dark)
 
     const bool searchHl           = store.getBool(settingKey::kSearchHighlights,    true);
     const bool searchSugg         = store.getBool(settingKey::kSearchSuggestions,   true);
-    const bool sidebarOnStart     = store.getBool(settingKey::kShowSidebarOnStartup,false);
     const bool homepageInTab      = store.getBool(settingKey::kHomepageInNewTab,    true);
     const bool javascript         = store.getBool(settingKey::kJavaScript,          true);
     const bool webgl              = store.getBool(settingKey::kWebGL,               true);
@@ -171,7 +170,7 @@ inline std::string settingsPageHtml(bool dark)
     // The glyph itself is still inline SVG: emoji cannot be recoloured to sit
     // on a coloured tile, so the shapes are drawn on a 16x16 grid at one stroke
     // weight with round caps.
-    auto icon = [](const char* colour, const char* body) {
+    auto tile = [](const char* colour, const char* body) {
         return std::string("<span class='tile' style='background:") + colour + "'>"
                "<svg class='ic' viewBox='0 0 16 16' fill='none' stroke='#fff'"
                " stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'>"
@@ -179,67 +178,67 @@ inline std::string settingsPageHtml(bool dark)
     };
 
     // (id, label, coloured tile + white glyph)
-    struct Cat { const char* id; const char* label; std::string icon; };
-    const Cat sidebar[] = {
+    struct Cat { const char* id; const char* label; std::string tile; };
+    const Cat categories[] = {
         { "general", "General",
-            icon("#8E8E93", "<circle cx='8' cy='8' r='4.85'/><circle cx='8' cy='8' r='2.15'/>"
+            tile("#8E8E93", "<circle cx='8' cy='8' r='4.85'/><circle cx='8' cy='8' r='2.15'/>"
                  "<path d='M8 1.15v1.9M8 12.95v1.9M1.15 8h1.9M12.95 8h1.9'/>"
                  "<path d='M3.24 3.24l1.35 1.35M11.41 11.41l1.35 1.35"
                  "M12.76 3.24l-1.35 1.35M4.59 11.41l-1.35 1.35'/>") },
         { "tabs", "Tabs",
-            icon("#0A84FF", "<rect x='1.9' y='2.9' width='12.2' height='10.2' rx='1.9'/>"
+            tile("#0A84FF", "<rect x='1.9' y='2.9' width='12.2' height='10.2' rx='1.9'/>"
                  "<path d='M1.9 6.3h12.2'/>") },
         { "privacy", "Privacy & Security",
-            icon("#5E5CE6", "<path d='M8 1.5 13.1 3.4v4.3c0 3.3-2.15 5.9-5.1 6.9'"
+            tile("#5E5CE6", "<path d='M8 1.5 13.1 3.4v4.3c0 3.3-2.15 5.9-5.1 6.9'"
                      " -2.95-1-5.1-3.6-5.1-6.9V3.4z'/>") },
         { "search", "Search",
-            icon("#30B0C7", "<circle cx='6.9' cy='6.9' r='4.45'/><path d='M10.2 10.2 14 14'/>") },
+            tile("#30B0C7", "<circle cx='6.9' cy='6.9' r='4.45'/><path d='M10.2 10.2 14 14'/>") },
         { "passwords", "Passwords",
-            icon("#FF9F0A", "<circle cx='5.6' cy='5.6' r='2.9'/><path d='M7.75 7.75 13.4 13.4'/>"
+            tile("#FF9F0A", "<circle cx='5.6' cy='5.6' r='2.9'/><path d='M7.75 7.75 13.4 13.4'/>"
                  "<path d='M10.4 10.4l1.5-1.5M12.1 12.1l1.4-1.4'/>") },
         { "autofill", "AutoFill",
-            icon("#30D158", "<rect x='1.7' y='3.7' width='12.6' height='8.6' rx='1.9'/>"
+            tile("#30D158", "<rect x='1.7' y='3.7' width='12.6' height='8.6' rx='1.9'/>"
                  "<path d='M1.7 6.7h12.6'/><path d='M4.2 9.6h3.2'/>") },
         { "extensions", "Extensions",
-            icon("#BF5AF2", "<path d='M6.6 2.2h2.8v1.9h2.2a1 1 0 0 1 1 1v2.2h1.9v2.8h-1.9v2.2'"
+            tile("#BF5AF2", "<path d='M6.6 2.2h2.8v1.9h2.2a1 1 0 0 1 1 1v2.2h1.9v2.8h-1.9v2.2'"
                      "a1 1 0 0 1-1 1H9.4v1.9H6.6v-1.9H4.4a1 1 0 0 1-1-1V10.1H1.5'"
                      "V7.3h1.9V5.1a1 1 0 0 1 1-1h2.2z'/>") },
         { "engines", "Search Engines",
-            icon("#64D2FF", "<circle cx='11.3' cy='11.3' r='2.7'/><path d='M13.4 13.4 15 15'/>"
+            tile("#64D2FF", "<circle cx='11.3' cy='11.3' r='2.7'/><path d='M13.4 13.4 15 15'/>"
                  "<path d='M2.2 3.4h8M2.2 6.8h5.5M2.2 10.2h3.4'/>") },
         { "advanced", "Advanced",
-            icon("#AC8E68", "<path d='M1.8 4.9h12.4M1.8 11.1h12.4'/>"
+            tile("#AC8E68", "<path d='M1.8 4.9h12.4M1.8 11.1h12.4'/>"
                  "<circle cx='5.7' cy='4.9' r='2'/><circle cx='10.4' cy='11.1' r='2'/>") },
         { "websites", "Websites",
-            icon("#007AFF", "<circle cx='8' cy='8' r='6.05'/><path d='M1.95 8h12.1'/>"
+            tile("#007AFF", "<circle cx='8' cy='8' r='6.05'/><path d='M1.95 8h12.1'/>"
                  "<path d='M8 1.95c1.75 2.05 2.7 4 2.7 6.05S9.75 11.95 8 14.05'/>"
                  "<path d='M8 1.95C6.25 4 5.3 5.95 5.3 8S6.25 11.95 8 14.05'/>") },
         { "controllers", "Game Controllers",
-            icon("#FF375F", "<path d='M4.5 5.4h7a3.5 3.5 0 0 1 3.45 4.4l-.42 1.9'"
+            tile("#FF375F", "<path d='M4.5 5.4h7a3.5 3.5 0 0 1 3.45 4.4l-.42 1.9'"
                      "a1.75 1.75 0 0 1-3.1.55L10.2 10.4H5.8l-1.23 1.85'"
                      "a1.75 1.75 0 0 1-3.1-.55l-.42-1.9A3.5 3.5 0 0 1 4.5 5.4z'/>"
                  "<path d='M4.7 7.9v1.8M3.8 8.8h1.8'/>"
                  "<circle cx='10.9' cy='8.4' r='.75'/><circle cx='12.5' cy='10' r='.75'/>") },
         { "reading", "Reading List",
-            icon("#66D4CF", "<path d='M2.4 3.1h3.7a2.05 2.05 0 0 1 1.9 1.35 2.05 2.05 0 0 1 1.9-1.35'"
+            tile("#66D4CF", "<path d='M2.4 3.1h3.7a2.05 2.05 0 0 1 1.9 1.35 2.05 2.05 0 0 1 1.9-1.35'"
                      "h3.7v9.7h-3.7a1.65 1.65 0 0 0-1.9 1.25 1.65 1.65 0 0 0-1.9-1.25H2.4z'/>"
                  "<path d='M8 4.45v9.6'/>") },
         { "downloads", "Downloads",
-            icon("#0A84FF", "<path d='M8 2.1v7.7M5.05 6.95 8 9.9l2.95-2.95'/>"
+            tile("#0A84FF", "<path d='M8 2.1v7.7M5.05 6.95 8 9.9l2.95-2.95'/>"
                  "<path d='M2.4 11.35v1.55a1.1 1.1 0 0 0 1.1 1.1h9a1.1 1.1 0 0 0 1.1-1.1v-1.55'/>") },
     };
 
-    std::string sidebarHtml;
-    sidebarHtml.reserve(4096);
-    for (const auto& c : sidebar) {
+    std::string catsHtml;
+    catsHtml.reserve(4096);
+    for (const auto& c : categories) {
         const bool sel = (c.id == viewUtf8);
-        sidebarHtml += "<a class=\"cat" + std::string(sel ? " on" : "") + "\" href=\"" + setView(c.id) + "\" data-name=\"";
-        sidebarHtml += c.label;
-        sidebarHtml += "\">";
-        sidebarHtml += c.icon;
-        sidebarHtml += "<span class=\"lbl\">";
-        sidebarHtml += c.label;
-        sidebarHtml += "</span></a>";
+        catsHtml += "<a class=\"cat" + std::string(sel ? " on" : "") + "\" href=\"" + setView(c.id) + "\" data-name=\"";
+        catsHtml += c.label;
+        catsHtml += "\">";
+        catsHtml += c.tile;
+        catsHtml += "<span class=\"lbl\">";
+        catsHtml += c.label;
+        catsHtml += "</span></a>";
     }
 
     // ----- pane bodies -----
@@ -495,11 +494,12 @@ inline std::string settingsPageHtml(bool dark)
     html += "\">\n<head>\n<meta charset=\"utf-8\">\n";
     html += "<title>Settings</title>\n<style>\n";
 
-    // Liquid Glass (macOS Tahoe 26 / Safari 26): sidebars and content float
-    // as separate translucent, generously rounded panels inset from the window
-    // edge, rather than sitting flush against it. Controls are capsules with
-    // a soft border. -webkit-backdrop-filter is prefixed because this is the
-    // WinCairo WebKit build.
+    // macOS Settings (Safari 26/27): a single page with a horizontal strip of
+    // categories at the very top and the detail panel below. Categories render
+    // as icon-above-label tiles in their system colour; the selected one
+    // wears an accent ring. Everything is a separate translucent panel inset
+    // from the window edge (Liquid Glass). -webkit-backdrop-filter is needed
+    // because this is the WinCairo WebKit build.
     html +=
         "html,body{margin:0;height:100%}\n"
         "html.light{--bg:#e9eaee;--side:rgba(250,250,252,.72);--card:rgba(255,255,255,.78);"
@@ -512,30 +512,33 @@ inline std::string settingsPageHtml(bool dark)
         "--shadow:0 10px 34px rgba(0,0,0,.5);color-scheme:dark}\n"
         "*{box-sizing:border-box}\n"
         "body{font:13px/1.45 'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;"
-        "color:var(--text);background:var(--bg);display:flex;overflow:hidden;"
-        "padding:10px;gap:10px}\n"
-        "#side,#main{background:var(--side);border:1px solid var(--border);border-radius:18px;"
+        "color:var(--text);background:var(--bg);display:flex;flex-direction:column;"
+        "overflow:hidden;padding:10px;gap:10px}\n"
+        "#bar,#main{background:var(--side);border:1px solid var(--border);border-radius:18px;"
         "box-shadow:var(--shadow);-webkit-backdrop-filter:blur(26px) saturate(180%);"
         "backdrop-filter:blur(26px) saturate(180%)}\n"
-        "#side{width:246px;flex:0 0 246px;display:flex;flex-direction:column;overflow:hidden}\n"
-        "#filter{padding:12px 12px 8px}\n"
-        "#filter input{width:100%;border:1px solid var(--border);border-radius:9px;"
-        "background:var(--field);color:var(--text);padding:5px 10px;font:inherit;outline:none}\n"
-        "#filter input:focus{border-color:var(--accent)}\n"
-        "#list{flex:1 1 auto;overflow:auto;padding:2px 8px 14px}\n"
-        ".cat{display:flex;align-items:center;gap:11px;padding:6px 9px;border-radius:9px;"
-        "text-decoration:none;color:var(--text);font-size:13px;margin:0 0 1px;"
-        "-webkit-user-drag:none}\n"
+        "#bar{flex:0 0 auto;padding:12px 14px 8px;overflow:hidden}\n"
+        "#search{padding:0 2px 10px}\n"
+        "#search input{width:240px;border:1px solid var(--border);border-radius:9px;"
+        "background:var(--field);color:var(--text);padding:5px 11px;font:inherit;outline:none}\n"
+        "#search input:focus{border-color:var(--accent)}\n"
+        "#cats{display:flex;align-items:flex-start;overflow-x:auto;overflow-y:hidden;"
+        "padding:2px 0 4px;gap:2px;scrollbar-width:thin}\n"
+        ".cat{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;"
+        "padding:7px 11px 6px;border-radius:11px;text-decoration:none;color:var(--text);"
+        "font-size:11px;line-height:1.15;flex:0 0 auto;min-width:60px;max-width:96px;"
+        "text-align:center;gap:5px;-webkit-user-drag:none}\n"
         ".cat:hover{background:var(--hover)}\n"
-        ".cat.on{background:var(--accent);color:var(--accentText)}\n"
-        ".cat .ic{width:17px;height:17px;flex:0 0 17px;display:block}\n"
+        ".cat.on{background:transparent}\n"
         ".tile{display:inline-flex;align-items:center;justify-content:center;"
-        "width:24px;height:24px;border-radius:6px;margin-right:0;flex:none;vertical-align:middle}\n"
-        ".cat .tile{width:24px;height:24px;margin-right:0;flex:none}\n"
-        ".cat .tile .ic{width:15px;height:15px;flex:0 0 15px}\n"
-        "svg.ic path,svg.ic circle,svg.ic rect{fill:none;stroke:#fff;stroke-width:1.5;"
+        "width:34px;height:34px;border-radius:8px;flex:0 0 auto;"
+        "box-shadow:0 0 0 1.5px transparent inset;transition:box-shadow .12s ease}\n"
+        ".tile svg.ic{width:18px;height:18px;display:block}\n"
+        ".cat.on .tile{box-shadow:0 0 0 1.75px var(--accent) inset}\n"
+        "svg.ic path,svg.ic circle,svg.ic rect{fill:none;stroke:#fff;stroke-width:1.6;"
         "stroke-linecap:round;stroke-linejoin:round}\n"
-        ".cat .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
+        ".cat .lbl{white-space:nowrap;max-width:84px;overflow:hidden;text-overflow:ellipsis}\n"
+        ".cat.on .lbl{color:var(--accent);font-weight:600}\n"
         "#main{flex:1 1 auto;overflow:auto;background:var(--card)}\n"
         "#main .inner{max-width:640px;margin:0 auto;padding:30px 32px 64px}\n"
         ".heading{margin:0 0 22px;font-size:21px;font-weight:700;letter-spacing:-.01em}\n"
@@ -581,13 +584,15 @@ inline std::string settingsPageHtml(bool dark)
 
     html += "</style>\n</head>\n<body>\n";
 
-    // Sidebar
-    html += "<div id=\"side\"><div id=\"filter\"><input id=\"q\" placeholder=\"Search settings\" "
-            "oninput=\"filterCats()\"></div><div id=\"list\">";
-    html += sidebarHtml;
+    // Top bar: a search field above a horizontal strip of category tiles.
+    html += "<div id=\"bar\">";
+    html += "<div id=\"search\"><input id=\"q\" placeholder=\"Search settings\" "
+            "oninput=\"filterCats()\"></div>";
+    html += "<div id=\"cats\">";
+    html += catsHtml;
     html += "</div></div>";
 
-    // Main pane (the selected detail panel is rendered into here)
+    // Detail panel: the selected category renders here.
     html += "<div id=\"main\"><div class=\"inner\">";
     html += "<h1 class=\"heading\">";
 
@@ -610,9 +615,9 @@ inline std::string settingsPageHtml(bool dark)
     html += body;
     html += "</div></div>\n";
 
-    // Tiny inline JS: filter the sidebar as the user types in the search box.
+    // Tiny inline JS: filter the category strip as the user types.
     html += "<script>\nfunction filterCats(){var q=document.getElementById('q').value.toLowerCase();"
-            "var rows=document.querySelectorAll('#list .cat');"
+            "var rows=document.querySelectorAll('#cats .cat');"
             "for(var i=0;i<rows.length;i++){var n=rows[i].getAttribute('data-name').toLowerCase();"
             "rows[i].style.display=(!q||n.indexOf(q)>=0)?'flex':'none';}}\n</script>\n";
 
