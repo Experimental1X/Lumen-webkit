@@ -148,6 +148,7 @@ public:
     // threads, so the resulting UI work has to land on this thread.
     void onDownloadsChanged(bool started);
     void onSettingsChanged();
+    void onClearHistory();
 
     // Opens the Settings page in a new tab. Brings an existing Settings
     // tab forward instead of duplicating it.

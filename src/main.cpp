@@ -123,24 +123,31 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         return 0;
     }
 
-    case WM_NCCALCSIZE:
-        if (wParam) {
-            // Remove the native title bar but keep the thin resize borders,
-            // shadow and snapping: let the default procedure compute the
-            // client rectangle, then give the caption height back to us.
-            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
-            const LONG originalTop = params->rgrc[0].top;
-            const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
-            if (IsZoomed(window)) {
-                const UINT dpi = GetDpiForWindow(window);
-                const int frame = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)
-                    + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-                params->rgrc[0].top = originalTop + frame;
-            } else
-                params->rgrc[0].top = originalTop;
-            return result;
-        }
-        break;
+    case WM_NCCALCSIZE: {
+        if (!wParam)
+            break;
+
+        // Frameless. The window keeps WS_CAPTION | WS_THICKCAPTION in its style
+        // on purpose: removing them would cost us Aero Snap, the Win11 snap
+        // layout flyout and the maximise/restore animation. Instead we claim
+        // the entire window rect as client area, so the system frame is never
+        // painted and Browser::onPaint covers it edge to edge.
+        auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+        const RECT original = params->rgrc[0];
+        const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
+
+        if (IsZoomed(window)) {
+            // A maximised frame sits just off-screen so its resize border is
+            // invisible. Only the caption still needs to be handed back.
+            const UINT dpi = GetDpiForWindow(window);
+            const int frame = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)
+                + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            params->rgrc[0].top = original.top + frame;
+        } else
+            params->rgrc[0] = original;
+
+        return result;
+    }
 
     case WM_NCHITTEST: {
         const LRESULT hit = DefWindowProcW(window, message, wParam, lParam);
@@ -253,6 +260,11 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     case WM_LUMEN_SETTINGS_CHANGED:
         if (browser)
             browser->onSettingsChanged();
+        return 0;
+
+    case WM_LUMEN_SETTINGS_CLEAR_HISTORY:
+        if (browser)
+            browser->onClearHistory();
         return 0;
 
     case WM_DPICHANGED: {

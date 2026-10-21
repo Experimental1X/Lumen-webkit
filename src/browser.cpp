@@ -1132,27 +1132,45 @@ bool Browser::onLeftButtonDown(POINT point)
 
 LRESULT Browser::onNcHitTest(LRESULT defaultHit, POINT screenPoint)
 {
-    // Borders handled by the default procedure (left, right, bottom, corners).
-    if (defaultHit != HTCLIENT)
-        return defaultHit;
-
     POINT point = screenPoint;
     ScreenToClient(m_window, &point);
 
     RECT client { };
     GetClientRect(m_window, &client);
 
-    // The top edge is inside our client area, so provide its resize border.
-    if (!IsZoomed(m_window)) {
-        const int border = px(6);
-        if (point.y >= 0 && point.y < border) {
-            if (point.x < border * 2)
-                return HTTOPLEFT;
-            if (point.x >= client.right - border * 2)
-                return HTTOPRIGHT;
-            return HTTOP;
-        }
+    // Maximized: the system frame is still the real one, so let its answer
+    // through. That keeps drag-to-restore and the snap layout flyout working.
+    if (IsZoomed(m_window) && defaultHit != HTCLIENT)
+        return defaultHit;
+
+    // Restored: the window is frameless, so the resize border that used to
+    // live in the non-client area is now inside our client rect and Windows
+    // reports HTCLIENT for all of it. Recreate the border by hand, otherwise
+    // the window could only ever be resized from the top edge.
+    const int border = px(6);
+    const bool onLeft = point.x < border;
+    const bool onRight = point.x >= client.right - border;
+    const bool onTop = point.y < border;
+    const bool onBottom = point.y >= client.bottom - border;
+
+    if (onTop) {
+        if (onLeft)
+            return HTTOPLEFT;
+        if (onRight)
+            return HTTOPRIGHT;
+        return HTTOP;
     }
+    if (onBottom) {
+        if (onLeft)
+            return HTBOTTOMLEFT;
+        if (onRight)
+            return HTBOTTOMRIGHT;
+        return HTBOTTOM;
+    }
+    if (onLeft)
+        return HTLEFT;
+    if (onRight)
+        return HTRIGHT;
 
     // Unused toolbar and tab bar space drags the window.
     if (point.y >= 0 && point.y < chromeHeight())
@@ -2858,6 +2876,9 @@ void Browser::openSettings()
     m_tabs.push_back(std::move(view));
     m_settingsPageTab = m_tabs.size() - 1;
 
+    // Always open on the first pane, the way Safari does.
+    Settings::instance().setView(L"general");
+
     activateTab(m_settingsPageTab);
     raw->loadHtml(settingsPageHtml(m_theme.dark));
     invalidateChrome();
@@ -2865,13 +2886,24 @@ void Browser::openSettings()
 
 void Browser::onSettingsChanged()
 {
-    // The Settings UI fires lumen:settings?key=X&value=Y for every change;
-    // the URL handler in webkit_host.cpp calls Settings::set() and posts this
-    // message. Re-render the open Settings tab so the new value shows up.
+    // The Settings UI fires lumen:settings?key=X&value=Y (or ?view=x, or an
+    // __action__ one-shot) for every change; the URL handler in
+    // webkit_host.cpp applies it and posts this message. Re-render the open
+    // Settings tab so the new value shows up.
     if (m_settingsPageTab == static_cast<size_t>(-1) || m_settingsPageTab >= m_tabs.size())
         return;
     if (auto* view = m_tabs[m_settingsPageTab].get())
         view->loadHtml(settingsPageHtml(m_theme.dark));
+}
+
+void Browser::onClearHistory()
+{
+    // "Clear History and Website Data" in Privacy & Security. The Library is
+    // ours, so wipe it here and let the sidebar repaint with the new list.
+    m_library.clearHistory();
+    m_sidebarScroll = 0;
+    m_sidebarHoverRow = -1;
+    invalidateChrome();
 }
 
 

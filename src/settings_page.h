@@ -30,262 +30,532 @@ inline std::string escapeSettingHtml(const std::string& s)
 
 } // namespace
 
-// Self-contained Settings page in the same visual language as the start
-// page and the downloads page. Each interactive control links to a
-// `lumen:settings?key=X&value=Y` URL; `WebView::decideNavigationAction`
-// catches those, calls `Settings::set`, and the browser re-renders the
-// page. Mirrors Safari's settings layout, minus the Apple-service entries
-// (iCloud, Apple Pay, Apple ID, Screen Time, etc.) that don't apply.
+// Safari Settings window reimplemented as a single HTML page (left category
+// sidebar + right detail pane). Each category links to a
+// `lumen:settings?view=<id>` URL so a click triggers a re-render with the
+// other pane shown. Within a pane, every interactive control links to
+// `lumen:settings?key=<key>&value=<value>` (or `?key=__action__&value=...`
+// for one-shot buttons); `WebView::decideNavigationAction` catches those and
+// routes them through the Settings store, with a custom message marshalling
+// the re-render back onto the UI thread.
+//
+// Apple-only rows (iCloud, Apple Pay, Apple ID, Screen Time, "Show in Dock",
+// macOS-specific startup controls) are intentionally absent because their
+// behaviour relies on macOS services. Windows has no equivalent integration
+// at the taskbar/shell level, per the user's standing rule.
 inline std::string settingsPageHtml(bool dark)
 {
-    const Settings& s = Settings::instance();
+    Settings& store = Settings::instance();
 
-    // Pull values once, formatted for the page.
-    const std::wstring homepage        = s.get(settingKey::kHomepage, L"lumen:start");
-    const std::wstring downloadsFolder = s.get(settingKey::kDownloadsFolder, L"");
-    const int          pageZoom        = s.getInt(settingKey::kPageZoom, 100);
-    const bool         blockTrackers   = s.getBool(settingKey::kBlockTrackers, true);
-    const bool         block3pCookies  = s.getBool(settingKey::kBlockThirdPartyCookies, false);
-    const bool         javascript      = s.getBool(settingKey::kJavaScript, true);
-    const bool         webgl           = s.getBool(settingKey::kWebGL, true);
-    const bool         hardwareAccel   = s.getBool(settingKey::kHardwareAccel, false);
-    const bool         showFullUrl     = s.getBool(settingKey::kShowFullUrl, true);
-    const bool         searchHl        = s.getBool(settingKey::kSearchHighlights, true);
-    const bool         sidebarOnStart  = s.getBool(settingKey::kShowSidebarOnStartup, false);
-    const bool         homepageInTab   = s.getBool(settingKey::kHomepageInNewTab, true);
+    // Which pane to render on the right. Defaults to General the way Safari
+    // opens its settings window.
+    std::wstring view = store.view();
+    if (view.empty())
+        view = L"general";
 
-    const std::string engine    = toUtf8(s.get(settingKey::kSearchEngine,    L"google"));
-    const std::string theme     = toUtf8(s.get(settingKey::kTheme,           L"system"));
-    const std::string encoding  = toUtf8(s.get(settingKey::kDefaultEncoding, L"utf-8"));
+    // ----- read all values up front, formatted for the page -----
+    const std::wstring homepage        = store.get(settingKey::kHomepage,            L"lumen:start");
+    const std::wstring downloadsFolder = store.get(settingKey::kDownloadsFolder,     L"");
+    const int          pageZoom        = store.getInt(settingKey::kPageZoom,         100);
+    const std::string  engine          = toUtf8(store.get(settingKey::kSearchEngine, L"google"));
+    const std::string  encoding        = toUtf8(store.get(settingKey::kDefaultEncoding, L"utf-8"));
+    const std::string  newTabsOpenWith = toUtf8(store.get(settingKey::kNewTabsOpenWith, L"homepage"));
 
-    auto pillToggle = [&](const wchar_t* key, bool on) {
-        return std::string("<a class=\"toggle ") + (on ? "on" : "off") +
-               "\" href=\"lumen:settings?key=" + toUtf8(key) + "&value=" + (on ? "0" : "1") + "\">" +
-               (on ? "On" : "Off") + "</a>";
+    const bool restoreTabs        = store.getBool(settingKey::kRestoreTabs,            true);
+    const bool openLinksInTabs    = store.getBool(settingKey::kOpenLinksInTabs,        true);
+    const bool askWhereToSave     = store.getBool(settingKey::kAskWhereToSave,         false);
+    const bool openSafeFiles      = store.getBool(settingKey::kOpenSafeFiles,          false);
+    const bool separateTabWindows = store.getBool(settingKey::kSeparateTabWindows,     false);
+    const bool confirmClosingTabs = store.getBool(settingKey::kConfirmClosingTabs,     true);
+    const bool warnMultipleTabs   = store.getBool(settingKey::kWarnMultipleTabs,       false);
+
+    const bool blockTrackers      = store.getBool(settingKey::kBlockTrackers,          true);
+    const bool block3pCookies     = store.getBool(settingKey::kBlockThirdPartyCookies, false);
+    const bool hideIp             = store.getBool(settingKey::kHideIpFromTrackers,     false);
+    const bool warnFraud          = store.getBool(settingKey::kFraudulentWarning,      true);
+    const bool clearOnExit        = store.getBool(settingKey::kClearOnExit,            false);
+
+    const bool searchHl           = store.getBool(settingKey::kSearchHighlights,    true);
+    const bool searchSugg         = store.getBool(settingKey::kSearchSuggestions,   true);
+    const bool sidebarOnStart     = store.getBool(settingKey::kShowSidebarOnStartup,false);
+    const bool homepageInTab      = store.getBool(settingKey::kHomepageInNewTab,    true);
+    const bool javascript         = store.getBool(settingKey::kJavaScript,          true);
+    const bool webgl              = store.getBool(settingKey::kWebGL,               true);
+    const bool hardwareAccel      = store.getBool(settingKey::kHardwareAccel,       false);
+    const bool showFullUrl        = store.getBool(settingKey::kShowFullUrl,         true);
+    const bool devMenu            = store.getBool(settingKey::kShowDevelopMenu,     false);
+    const bool devFeatures        = store.getBool(settingKey::kWebDeveloperFeatures,false);
+    const bool checkSpelling      = store.getBool(settingKey::kCheckSpelling,        false);
+
+    // Map any non-ASCII text up here so the lambdas can take std::string.
+    const std::string viewUtf8          = toUtf8(view);
+    const std::string homepageUtf8      = toUtf8(homepage);
+    const std::string downloadsFolderUtf = toUtf8(downloadsFolder);
+    const std::string pageZoomStr       = std::to_string(pageZoom);
+
+    auto setValue = [](const wchar_t* key, const std::string& raw) -> std::string {
+        return std::string("lumen:settings?key=") + toUtf8(key) + "&value=" + escapeSettingHtml(raw);
+    };
+    auto setView = [](const char* id) -> std::string {
+        return std::string("lumen:settings?view=") + id;
     };
 
-    auto selectRow = [&](const wchar_t* key, const std::string& current, const std::vector<std::pair<std::string, std::string>>& options) {
-        std::string out = "<div class=\"select\"><form action=\"lumen:settings\" method=\"get\">";
-        out += "<input type=\"hidden\" name=\"key\" value=\"" + toUtf8(key) + "\">";
-        out += "<select name=\"value\" onchange=\"this.form.submit()\">";
-        for (const auto& [value, label] : options) {
-            out += "<option value=\"" + value + "\"";
-            if (value == current) out += " selected";
-            out += ">" + label + "</option>";
+    // Every control navigates with location.href rather than submitting a form.
+    // Form submission to a custom scheme is not guaranteed to reach the
+    // navigation delegate on this WebKit build, but an href navigation always
+    // does, so that is the path the lumen: handler is wired to.
+    auto navScript = [](const wchar_t* key) {
+        return "location.href='lumen:settings?key=" + toUtf8(key) + "&value='+encodeURIComponent(this.value)";
+    };
+
+    // ----- row/group/popup/checkbox helpers -----
+    auto checkbox = [&](const wchar_t* key, bool on) -> std::string {
+        const std::string url = setValue(key, on ? "0" : "1");
+        return "<a class=\"chk " + std::string(on ? "on" : "off") + "\" href=\"" + url + "\"></a>";
+    };
+
+    auto popup = [&](const wchar_t* key, const std::string& current,
+                     const std::vector<std::pair<std::string, std::string>>& opts) -> std::string {
+        std::string out = "<div class=\"sel\"><select onchange=\"" + navScript(key) + "\">";
+        for (const auto& [value, label] : opts) {
+            out += "<option value=\"" + escapeSettingHtml(value) + "\"";
+            if (value == current)
+                out += " selected";
+            out += ">" + escapeSettingHtml(label) + "</option>";
         }
-        out += "</select></form></div>";
+        out += "</select></div>";
         return out;
     };
 
-    auto textRow = [&](const wchar_t* key, const std::wstring& value, const char* placeholder) {
-        std::string out = "<div class=\"text\"><form action=\"lumen:settings\" method=\"get\">";
-        out += "<input type=\"hidden\" name=\"key\" value=\"" + toUtf8(key) + "\">";
-        out += "<input type=\"text\" name=\"value\" value=\"" + escapeSettingHtml(toUtf8(value)) +
-               "\" placeholder=\"" + placeholder + "\" onchange=\"this.form.submit()\">";
-        out += "</form></div>";
+    auto textInput = [&](const wchar_t* key, const std::string& value, const char* placeholder) -> std::string {
+        return "<div class=\"txt\"><input type=\"text\" value=\"" + escapeSettingHtml(value)
+             + "\" placeholder=\"" + placeholder + "\" onchange=\"" + navScript(key)
+             + "\" onkeydown=\"if(event.keyCode===13)this.blur()\"></div>";
+    };
+
+    auto button = [&](const std::string& label, const char* actionValue) -> std::string {
+        const std::string url = std::string("lumen:settings?key=__action__&value=") + actionValue;
+        return "<a class=\"btn\" href=\"" + url + "\">" + escapeSettingHtml(label) + "</a>";
+    };
+
+    auto groupTitle = [](const std::string& t) -> std::string {
+        return "<div class=\"grp\">" + escapeSettingHtml(t) + "</div>";
+    };
+
+    // Build one row: <label> ... </label> ... <control ...>
+    auto row = [&](const std::string& name, const std::string& desc, const std::string& control) -> std::string {
+        std::string out = "<div class=\"row\">";
+        out += "<div class=\"lbl\"><div class=\"nm\">" + escapeSettingHtml(name) + "</div>";
+        if (!desc.empty())
+            out += "<div class=\"ds\">" + escapeSettingHtml(desc) + "</div>";
+        out += "</div>";
+        out += "<div class=\"ctrl\">" + control + "</div>";
+        out += "</div>";
         return out;
     };
 
-    auto folderRow = [&](const wchar_t* key, const std::wstring& value) {
-        std::string out = "<div class=\"text\"><form action=\"lumen:settings\" method=\"get\">";
-        out += "<input type=\"hidden\" name=\"key\" value=\"" + toUtf8(key) + "\">";
-        out += "<input type=\"text\" name=\"value\" value=\"" + escapeSettingHtml(toUtf8(value)) +
-               "\" placeholder=\"Default (Windows Downloads folder)\" onchange=\"this.form.submit()\">";
-        out += "</form></div>";
+    auto group = [&](const std::string& title, const std::string& body) -> std::string {
+        std::string out = "<section class=\"panel\">";
+        out += groupTitle(title);
+        out += body;
+        out += "</section>";
         return out;
     };
 
+    // ----- sidebar (categories) -----
+    // (id, icon-emoji bytes, tile background color, label)
+    struct Cat { const char* id; const char* icon; const char* color; const char* label; };
+    const Cat sidebar[] = {
+        { "general",        "\xF0\x9F\x9B\xA0", "#0a84ff", "General"        },
+        { "tabs",           "\xF0\x9F\x97\x82", "#5e5ce6", "Tabs"           },
+        { "privacy",        "\xF0\x9F\x9B\xA1", "#30d158", "Privacy & Security" },
+        { "search",         "\xF0\x9F\x94\x8D", "#ff9f0a", "Search"         },
+        { "passwords",      "\xF0\x9F\x94\x91", "#bf5af2", "Passwords"      },
+        { "autofill",       "\xF0\x9F\x93\x8D", "#64d2ff", "AutoFill"       },
+        { "extensions",     "\xF0\x9F\xA7\xA9", "#ff375f", "Extensions"     },
+        { "engines",        "\xF0\x9F\x94\x8E", "#ff9f0a", "Search Engines" },
+        { "advanced",       "\xE2\x9A\x99\xEF\xB8\x8F", "#8e8e93", "Advanced" },
+        { "websites",       "\xF0\x9F\x8C\x90", "#5ac8fa", "Websites"       },
+        { "controllers",    "\xF0\x9F\x8E\xAE", "#30d158", "Game Controllers" },
+        { "reading",        "\xF0\x9F\x93\x96", "#ff9f0a", "Reading List"   },
+        { "downloads",      "\xE2\xAC\x87",      "#0a84ff", "Downloads"      },
+    };
+
+    std::string sidebarHtml;
+    sidebarHtml.reserve(2048);
+    for (const auto& c : sidebar) {
+        const bool sel = (c.id == viewUtf8);
+        sidebarHtml += "<a class=\"cat" + std::string(sel ? " on" : "") + "\" href=\"" + setView(c.id) + "\" data-name=\"";
+        sidebarHtml += c.label;
+        sidebarHtml += "\"><span class=\"ic\" style=\"background:" + std::string(c.color) + "\">";
+        sidebarHtml += c.icon;
+        sidebarHtml += "</span><span class=\"lbl\">";
+        sidebarHtml += c.label;
+        sidebarHtml += "</span></a>";
+    }
+
+    // ----- pane bodies -----
+    std::string body;
+    body.reserve(8192);
+
+    if (viewUtf8 == "general") {
+        body += group("Settings",
+            row("Homepage",
+                "Opens when you launch the browser or click the home button.",
+                textInput(settingKey::kHomepage, homepageUtf8, "lumen:start"))
+            + row("Open homepage in new tabs",
+                "New-tab windows open to your homepage instead of a blank page.",
+                checkbox(settingKey::kHomepageInNewTab, homepageInTab))
+            + row("New tabs open with",
+                "Choose what loads every time you open a new tab.",
+                popup(settingKey::kNewTabsOpenWith, newTabsOpenWith, {
+                    { "homepage", "Homepage" },
+                    { "blank",    "Blank page" },
+                    { "last",     "Same as last tab" },
+                }))
+        );
+        body += group("Downloads",
+            row("Save files to",
+                "Default download location. Leave empty to use your system Downloads folder.",
+                textInput(settingKey::kDownloadsFolder, downloadsFolderUtf, "Default"))
+            + row("Ask where to save each file",
+                "Show a file picker before every download.",
+                checkbox(settingKey::kAskWhereToSave, askWhereToSave))
+            + row("Open safe files after downloading",
+                "PDFs, images and other safe types open automatically when the download finishes.",
+                checkbox(settingKey::kOpenSafeFiles, openSafeFiles))
+        );
+        body += group("Search with Lumen",
+            row("Show Highlights",
+                "Featured results and shortcuts at the top of the start page.",
+                checkbox(settingKey::kSearchHighlights, searchHl))
+            + row("Show Suggestions",
+                "Suggest search queries and bookmarks as you type in the address bar.",
+                checkbox(settingKey::kSearchSuggestions, searchSugg))
+        );
+    }
+
+    else if (viewUtf8 == "tabs") {
+        body += group("Tabs",
+            row("Open tabs in a separate window",
+                "New tabs take their own window instead of joining the active one.",
+                checkbox(settingKey::kSeparateTabWindows, separateTabWindows))
+            + row("Open links in tabs instead of windows",
+                "Middle-click / Ctrl-click on a link opens a new tab.",
+                checkbox(settingKey::kOpenLinksInTabs, openLinksInTabs))
+            + row("Confirm before closing multiple tabs",
+                "Asks you to confirm when more than one tab would close at once.",
+                checkbox(settingKey::kConfirmClosingTabs, confirmClosingTabs))
+            + row("Warn when opening multiple tabs at once",
+                "Prompt when a page tries to open many tabs in rapid succession.",
+                checkbox(settingKey::kWarnMultipleTabs, warnMultipleTabs))
+        );
+        body += group("Startup",
+            row("Restore tabs when reopening the browser",
+                "Reopen the tabs that were open the last time you closed the browser.",
+                checkbox(settingKey::kRestoreTabs, restoreTabs))
+        );
+    }
+
+    else if (viewUtf8 == "privacy") {
+        body += group("Cross-Site Tracking",
+            row("Prevent cross-site tracking",
+                "Limits how third-party sites can follow you across the web.",
+                checkbox(settingKey::kBlockTrackers, blockTrackers))
+            + row("Hide IP address from known trackers",
+                "Routes requests through a relay so trackers can't see your IP.",
+                checkbox(settingKey::kHideIpFromTrackers, hideIp))
+        );
+        body += group("Cookies",
+            row("Block all third-party cookies",
+                "Cookies set by sites other than the one you're on.",
+                checkbox(settingKey::kBlockThirdPartyCookies, block3pCookies))
+            + row("Clear history and website data when Lumen closes",
+                "Clears history, cookies and cached data automatically on exit.",
+                checkbox(settingKey::kClearOnExit, clearOnExit))
+        );
+        body += group("Warnings",
+            row("Warn about fraudulent websites",
+                "Show a warning before loading a page suspected of phishing or malware.",
+                checkbox(settingKey::kFraudulentWarning, warnFraud))
+        );
+        body += group("Browsing Data",
+            row("Clear browsing history…",
+                "Wipe the local history stored on this computer.",
+                button("Clear History", "clear_history"))
+        );
+    }
+
+    else if (viewUtf8 == "search") {
+        body += group("Default Search Engine",
+            row("Search engine",
+                "Used by the address bar and the start page when you type plain words.",
+                popup(settingKey::kSearchEngine, engine, {
+                    { "google",     "Google" },
+                    { "bing",       "Bing" },
+                    { "duckduckgo", "DuckDuckGo" },
+                    { "yahoo",      "Yahoo" },
+                    { "ecosia",     "Ecosia" },
+                    { "startpage",  "Startpage" },
+                }))
+        );
+        body += group("Search Experience",
+            row("Show Highlights",
+                "Featured results and shortcuts at the top of the start page.",
+                checkbox(settingKey::kSearchHighlights, searchHl))
+            + row("Show Suggestions",
+                "Suggest search queries and bookmarks as you type in the address bar.",
+                checkbox(settingKey::kSearchSuggestions, searchSugg))
+        );
+    }
+
+    else if (viewUtf8 == "passwords") {
+        body += "<section class=\"panel\"><div class=\"grp\">Passwords</div>"
+                "<div class=\"empty\"><div class=\"big\">Passwords are not stored in Lumen.</div>"
+                "<div class=\"ds\">This build does not include a credential store or keychain. "
+                "You will be asked to type credentials on every visit.</div></div></section>";
+    }
+
+    else if (viewUtf8 == "autofill") {
+        body += "<section class=\"panel\"><div class=\"grp\">AutoFill</div>"
+                "<div class=\"empty\"><div class=\"big\">AutoFill is not supported in Lumen.</div>"
+                "<div class=\"ds\">Saved passwords, cards and addresses are not stored in this build.</div></div></section>";
+    }
+
+    else if (viewUtf8 == "extensions") {
+        body += "<section class=\"panel\"><div class=\"grp\">Extensions</div>"
+                "<div class=\"empty\"><div class=\"big\">No extensions installed</div>"
+                "<div class=\"ds\">Lumen does not support extensions in this build. "
+                "When support is added, installed extensions will appear here and you can grant "
+                "them access per-site.</div></div></section>";
+    }
+
+    else if (viewUtf8 == "engines") {
+        body += group("Website Search",
+            row("Use website search shortcut suggestions",
+                "Show a list of website-specific searches when the address bar matches.",
+                checkbox(settingKey::kSearchSuggestions, searchSugg))
+        );
+        body += "<section class=\"panel\"><div class=\"grp\">Manage Search Engines</div>"
+                "<div class=\"empty\"><div class=\"big\">Manage search engines…</div>"
+                "<div class=\"ds\">The engine list is fixed to the six providers in Search this "
+                "release. Custom engines will appear here in a future update.</div></div></section>";
+    }
+
+    else if (viewUtf8 == "advanced") {
+        body += group("Accessibility",
+            row("Check spelling while typing",
+                "Underline misspelled words in the address bar and input fields.",
+                checkbox(settingKey::kCheckSpelling, checkSpelling))
+        );
+        body += group("Smart Search Field",
+            row("Show full website address",
+                "Always show https:// and www. in the address bar.",
+                checkbox(settingKey::kShowFullUrl, showFullUrl))
+        );
+        body += group("Web Content",
+            row("Default page zoom",
+                "Zoom level used by pages that don't ask for one.",
+                popup(settingKey::kPageZoom, pageZoomStr, {
+                    { "50",  "50%"  }, { "67",  "67%"  }, { "75", "75%" }, { "90", "90%" },
+                    { "100", "100%" }, { "110", "110%" }, { "125", "125%" }, { "150", "150%" },
+                    { "200", "200%" },
+                }))
+            + row("Default text encoding",
+                "Used for pages that don't declare one.",
+                popup(settingKey::kDefaultEncoding, encoding, {
+                    { "utf-8",        "UTF-8" },
+                    { "iso-8859-1",   "ISO 8859-1 (Latin 1)" },
+                    { "windows-1252", "Windows-1252" },
+                    { "shift_jis",    "Shift-JIS" },
+                }))
+            + row("JavaScript",
+                "Required for almost every modern site.",
+                checkbox(settingKey::kJavaScript, javascript))
+            + row("WebGL",
+                "Hardware-accelerated 3D rendering inside pages.",
+                checkbox(settingKey::kWebGL, webgl))
+            + row("Hardware acceleration",
+                "Off uses CPU rendering. Slower, but avoids some GPU glitches.",
+                checkbox(settingKey::kHardwareAccel, hardwareAccel))
+        );
+        body += group("Develop",
+            row("Show Develop menu and toolbar",
+                "Adds a Develop menu with web-developer tools (Inspect, etc.).",
+                checkbox(settingKey::kShowDevelopMenu, devMenu))
+            + row("Enable web-developer features",
+                "Turns on DOM Inspector and other developer surfaces.",
+                checkbox(settingKey::kWebDeveloperFeatures, devFeatures))
+        );
+    }
+
+    else if (viewUtf8 == "websites") {
+        body += group("Per-Site Permissions",
+            row("Camera, microphone, location",
+                "Default prompt used when a site asks for access.",
+                "<span class=\"static\">Ask per site</span>")
+            + row("Pop-ups",
+                "Default behaviour when a page tries to open a new window.",
+                "<span class=\"static\">Block pop-ups</span>")
+            + row("Downloads",
+                "Whether a site can trigger a download without confirmation.",
+                "<span class=\"static\">Ask per site</span>")
+            + row("Notifications",
+                "Whether a site can show desktop notifications.",
+                "<span class=\"static\">Ask per site</span>")
+        );
+    }
+
+    else if (viewUtf8 == "controllers") {
+        body += "<section class=\"panel\"><div class=\"grp\">Game Controllers</div>"
+                "<div class=\"empty\"><div class=\"big\">Game controllers are not configured.</div>"
+                "<div class=\"ds\">Lumen does not currently map gamepad buttons to page actions. "
+                "Connect a controller and games will detect it via the standard WebHID API.</div></div></section>";
+    }
+
+    else if (viewUtf8 == "reading") {
+        body += group("Reading List",
+            row("Show Reading List in the sidebar",
+                "The Reading List pane is reached from the sidebar (Ctrl+Shift+D).",
+                "<span class=\"static\">Always available</span>")
+        );
+        body += "<section class=\"panel\"><div class=\"empty\">"
+                "<div class=\"ds\">Reading list entries are stored locally in "
+                "<code>%APPDATA%\\Lumen\\reading.tsv</code>.</div></div></section>";
+    }
+
+    else if (viewUtf8 == "downloads") {
+        body += group("Downloads",
+            row("Save files to",
+                "Where downloads land by default.",
+                textInput(settingKey::kDownloadsFolder, downloadsFolderUtf, "Default"))
+            + row("Ask where to save each file",
+                "Show a file picker before every download.",
+                checkbox(settingKey::kAskWhereToSave, askWhereToSave))
+            + row("Open safe files after downloading",
+                "PDFs, images and other safe types open automatically when the download finishes.",
+                checkbox(settingKey::kOpenSafeFiles, openSafeFiles))
+        );
+    }
+
+    // ----- assemble the page -----
     std::string html;
-    html.reserve(8192);
+    html.reserve(16384);
+
     html += "<!doctype html>\n<html class=\"";
     html += dark ? "dark" : "light";
     html += "\">\n<head>\n<meta charset=\"utf-8\">\n";
     html += "<title>Settings</title>\n<style>\n";
 
     html +=
-        "html.light{--bg1:#f4f5f8;--bg2:#e4e7ee;--card:#fff;--text:#1d1d1f;"
-        "--sub:#6e6e73;--border:#d6d6dc;--accent:#007aff;--danger:#ff3b30;"
-        "--track:#e9e9ee;color-scheme:light}\n"
-        "html.dark{--bg1:#2b2c32;--bg2:#16171b;--card:#3a3a3f;--text:#f5f5f7;"
-        "--sub:#9a9aa1;--border:#54545a;--accent:#0a84ff;--danger:#ff453a;"
-        "--track:#404045;color-scheme:dark}\n"
+        "html,body{margin:0;height:100%}\n"
+        "html.light{--bg:#f5f5f7;--side:#ebebed;--card:#fff;--text:#1d1d1f;--sub:#6e6e73;"
+        "--border:#d6d6dc;--accent:#007aff;--accentText:#fff;--hover:rgba(0,0,0,.05);"
+        "--field:#fff;--shadow:0 1px 0 rgba(0,0,0,.05);color-scheme:light}\n"
+        "html.dark{--bg:#1c1c1e;--side:#232325;--card:#2c2c2e;--text:#f5f5f7;--sub:#98989d;"
+        "--border:#3a3a3c;--accent:#0a84ff;--accentText:#fff;--hover:rgba(255,255,255,.07);"
+        "--field:#1c1c1e;--shadow:0 1px 0 rgba(0,0,0,.4);color-scheme:dark}\n"
         "*{box-sizing:border-box}\n"
-        "html,body{margin:0;min-height:100%}\n"
         "body{font:13px/1.4 'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;"
-        "color:var(--text);background:linear-gradient(180deg,var(--bg1),var(--bg2));"
-        "background-attachment:fixed}\n"
-        ".page{max-width:780px;margin:0 auto;padding:32px 24px 80px}\n"
-        "h1{margin:0 0 6px;font-size:24px;font-weight:700;letter-spacing:-.01em}\n"
-        ".lede{margin:0 0 24px;color:var(--sub);font-size:13px}\n"
-        ".section{background:var(--card);border:1px solid var(--border);border-radius:12px;"
-        "padding:6px 18px;margin-bottom:18px}\n"
-        ".section h2{margin:14px 0 4px;font-size:13px;font-weight:600;color:var(--sub);"
-        "text-transform:uppercase;letter-spacing:.04em}\n"
-        ".row{display:flex;align-items:center;justify-content:space-between;padding:11px 0;"
-        "border-top:1px solid var(--border);gap:14px}\n"
-        ".row:first-of-type{border-top:none}\n"
-        ".label{flex:1 1 auto;min-width:0}\n"
-        ".label .name{font-weight:500}\n"
-        ".label .desc{display:block;color:var(--sub);font-size:12px;margin-top:2px}\n"
-        ".toggle{display:inline-flex;align-items:center;justify-content:center;"
-        "min-width:54px;height:26px;border-radius:999px;text-decoration:none;font-weight:600;"
-        "font-size:12px;padding:0 14px;cursor:pointer;border:1px solid transparent}\n"
-        ".toggle.on{background:var(--accent);color:#fff}\n"
-        ".toggle.off{background:var(--track);color:var(--text)}\n"
-        ".select select,.text input{font:inherit;color:var(--text);background:var(--bg1);"
-        "border:1px solid var(--border);border-radius:8px;padding:6px 10px;min-width:200px}\n"
-        ".text input{width:260px}\n"
-        ".danger{background:transparent;color:var(--danger);border-color:var(--danger)}\n"
-        ".danger:hover{background:var(--danger);color:#fff}\n"
-        ".action{background:var(--bg1);color:var(--text);border-color:var(--border)}\n"
-        ".grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 14px}\n"
-        ".grid a{display:flex;align-items:center;gap:8px;height:30px;padding:0 12px;"
-        "border-radius:6px;text-decoration:none;color:var(--text);background:var(--track);"
-        "border:1px solid var(--border);font-size:12px}\n"
-        ".grid a.sel{background:var(--accent);color:#fff;border-color:var(--accent)}\n"
-        ".grid a .dot{width:8px;height:8px;border-radius:50%;background:var(--card);"
-        "border:1px solid var(--border)}\n"
-        ".grid a.sel .dot{background:#fff;border-color:#fff}\n";
+        "color:var(--text);background:var(--bg);display:flex;overflow:hidden}\n"
+        "#side{width:240px;flex:0 0 240px;background:var(--side);border-right:1px solid var(--border);"
+        "display:flex;flex-direction:column;overflow:hidden}\n"
+        "#filter{padding:10px 10px 6px}\n"
+        "#filter input{width:100%;border:1px solid var(--border);border-radius:7px;"
+        "background:var(--field);color:var(--text);padding:5px 9px;font:inherit;outline:none}\n"
+        "#filter input:focus{border-color:var(--accent)}\n"
+        "#list{flex:1 1 auto;overflow:auto;padding:4px 8px 14px}\n"
+        ".cat{display:flex;align-items:center;gap:10px;padding:5px 8px;border-radius:6px;"
+        "text-decoration:none;color:var(--text);font-size:13px;margin:0 0 1px;"
+        "-webkit-user-drag:none}\n"
+        ".cat:hover{background:var(--hover)}\n"
+        ".cat.on{background:var(--accent);color:var(--accentText)}\n"
+        ".cat .ic{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;"
+        "justify-content:center;font-size:13px;flex:0 0 22px;color:#fff;line-height:1;"
+        "text-align:center}\n"
+        ".cat.on .ic{background:rgba(255,255,255,.25)!important}\n"
+        ".cat .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
+        "#main{flex:1 1 auto;overflow:auto}\n"
+        "#main .inner{max-width:620px;margin:0 auto;padding:28px 30px 60px}\n"
+        ".heading{margin:0 0 20px;font-size:22px;font-weight:700;letter-spacing:-.01em}\n"
+        ".panel{background:var(--card);border:1px solid var(--border);border-radius:13px;"
+        "padding:2px 16px 4px;margin-bottom:18px}\n"
+        ".grp{font-size:11px;font-weight:700;color:var(--sub);text-transform:uppercase;"
+        "letter-spacing:.06em;padding:14px 0 6px}\n"
+        ".row{display:flex;align-items:center;justify-content:space-between;gap:18px;"
+        "padding:11px 0;border-top:1px solid var(--border)}\n"
+        ".panel .row:first-of-type{border-top:none}\n"
+        ".lbl{flex:1 1 auto;min-width:0}\n"
+        ".lbl .nm{font-weight:500}\n"
+        ".lbl .ds{display:block;color:var(--sub);font-size:12px;margin-top:2px;line-height:1.35}\n"
+        ".ctrl{flex:0 0 auto;display:flex;align-items:center;justify-content:flex-end}\n"
+        ".chk{width:15px;height:15px;border-radius:4px;display:inline-block;position:relative;"
+        "flex:0 0 15px;text-decoration:none;border:1px solid var(--border);background:var(--field);"
+        "transition:background-color .12s ease,border-color .12s ease}\n"
+        ".chk:hover{border-color:var(--accent)}\n"
+        ".chk.on{background:var(--accent);border-color:var(--accent)}\n"
+        ".chk.on::after{content:\"\";position:absolute;left:4px;top:1px;width:5px;height:9px;"
+        "border:solid #fff;border-width:0 2px 2px 0;transform:rotate(43deg)}\n"
+        ".sel select{font:inherit;color:var(--text);background:var(--field);border:1px solid var(--border);"
+        "border-radius:7px;padding:5px 26px 5px 11px;min-width:170px;outline:none;"
+        "appearance:none;-webkit-appearance:none;"
+        "background-image:url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' "
+        "viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' fill='none' stroke='%236e6e73' "
+        "stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>\");"
+        "background-repeat:no-repeat;background-position:right 9px center;background-size:11px}\n"
+        ".sel select:focus{border-color:var(--accent)}\n"
+        ".txt input{font:inherit;color:var(--text);background:var(--field);border:1px solid var(--border);"
+        "border-radius:7px;padding:5px 10px;width:240px;outline:none}\n"
+        ".txt input:focus{border-color:var(--accent)}\n"
+        ".btn{display:inline-block;font:inherit;color:var(--text);background:var(--field);"
+        "border:1px solid var(--border);border-radius:7px;padding:5px 12px;text-decoration:none;"
+        "white-space:nowrap}\n"
+        ".btn:hover{border-color:var(--accent);color:var(--accent)}\n"
+        ".empty{padding:20px 4px 18px}\n"
+        ".empty .big{font-weight:600;margin-bottom:3px}\n"
+        ".empty .ds{color:var(--sub);font-size:12px;line-height:1.45}\n"
+        ".static{color:var(--sub);font-size:12px}\n"
+        "code{font-family:'Cascadia Code',Consolas,monospace;font-size:12px;"
+        "background:var(--field);padding:1px 5px;border-radius:4px;border:1px solid var(--border)}\n";
 
-    html += "</style>\n</head>\n<body>\n<div class=\"page\">\n";
-    html += "<h1>Settings</h1>\n";
-    html += "<p class=\"lede\">Configure Lumen. Changes save immediately and apply to new tabs.</p>\n";
+    html += "</style>\n</head>\n<body>\n";
 
-    // General
-    html += "<div class=\"section\"><h2>General</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Homepage</div>"
-            "<span class=\"desc\">Opens when you launch the browser or click Home.</span></div>";
-    html += textRow(settingKey::kHomepage, homepage, "lumen:start");
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Open homepage in new tabs</div>"
-            "<span class=\"desc\">When you open a new tab.</span></div>";
-    html += pillToggle(settingKey::kHomepageInNewTab, homepageInTab);
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Downloads folder</div>"
-            "<span class=\"desc\">Where saved files go by default.</span></div>";
-    html += folderRow(settingKey::kDownloadsFolder, downloadsFolder);
+    // Sidebar
+    html += "<div id=\"side\"><div id=\"filter\"><input id=\"q\" placeholder=\"Search settings\" "
+            "oninput=\"filterCats()\"></div><div id=\"list\">";
+    html += sidebarHtml;
     html += "</div></div>";
 
-    // Appearance
-    html += "<div class=\"section\"><h2>Appearance</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Theme</div>"
-            "<span class=\"desc\">Follow the system, or pin to light or dark.</span></div>";
-    {
-        std::string urlSystem = std::string("lumen:settings?key=theme&value=system");
-        std::string urlLight  = std::string("lumen:settings?key=theme&value=light");
-        std::string urlDark   = std::string("lumen:settings?key=theme&value=dark");
-        html += "<div class=\"grid\">";
-        html += "<a class=\""; if (theme == "system") html += "sel"; html += "\" href=\"" + urlSystem + "\"><span class=\"dot\"></span><span>System</span></a>";
-        html += "<a class=\""; if (theme == "light")  html += "sel"; html += "\" href=\"" + urlLight  + "\"><span class=\"dot\"></span><span>Light</span></a>";
-        html += "<a class=\""; if (theme == "dark")   html += "sel"; html += "\" href=\"" + urlDark   + "\"><span class=\"dot\"></span><span>Dark</span></a>";
-        html += "</div>";
-    }
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Default page zoom</div>"
-            "<span class=\"desc\">%</span></div>";
-    {
-        std::vector<std::pair<std::string, std::string>> opts {
-            {"50", "50%"}, {"67", "67%"}, {"75", "75%"}, {"90", "90%"},
-            {"100", "100%"}, {"110", "110%"}, {"125", "125%"}, {"150", "150%"}, {"200", "200%"}
-        };
-        const std::string zoomStr = std::to_string(pageZoom);
-        for (auto& o : opts) {
-            if (o.first == zoomStr) o.second = o.first + "%  (current)";
-        }
-        html += selectRow(settingKey::kPageZoom, zoomStr, opts);
-    }
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Default text encoding</div>"
-            "<span class=\"desc\">For pages that don't declare one.</span></div>";
-    {
-        std::vector<std::pair<std::string, std::string>> opts {
-            {"utf-8", "UTF-8"}, {"iso-8859-1", "ISO 8859-1 (Latin 1)"},
-            {"windows-1252", "Windows-1252"}, {"shift_jis", "Shift-JIS"}
-        };
-        html += selectRow(settingKey::kDefaultEncoding, encoding, opts);
-    }
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Show sidebar on startup</div>"
-            "<span class=\"desc\">Open the bookmarks/history panel when the browser launches.</span></div>";
-    html += pillToggle(settingKey::kShowSidebarOnStartup, sidebarOnStart);
-    html += "</div></div>";
+    // Main pane (the selected detail panel is rendered into here)
+    html += "<div id=\"main\"><div class=\"inner\">";
+    html += "<h1 class=\"heading\">";
 
-    // Privacy & Security
-    html += "<div class=\"section\"><h2>Privacy &amp; Security</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Prevent cross-site tracking</div>"
-            "<span class=\"desc\">Limits how third-party sites can follow you across the web.</span></div>";
-    html += pillToggle(settingKey::kBlockTrackers, blockTrackers);
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Block third-party cookies</div>"
-            "<span class=\"desc\">Cookies set by sites other than the one you're on.</span></div>";
-    html += pillToggle(settingKey::kBlockThirdPartyCookies, block3pCookies);
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Clear browsing history</div>"
-            "<span class=\"desc\">Wipe the local history sidebar.</span></div>";
-    html += "<a class=\"action danger\" href=\"lumen:settings?key=__action__&value=clear_history\">Clear</a>";
-    html += "</div></div>";
+    if      (viewUtf8 == "general")     html += "General";
+    else if (viewUtf8 == "tabs")        html += "Tabs";
+    else if (viewUtf8 == "privacy")     html += "Privacy &amp; Security";
+    else if (viewUtf8 == "search")      html += "Search";
+    else if (viewUtf8 == "passwords")   html += "Passwords";
+    else if (viewUtf8 == "autofill")    html += "AutoFill";
+    else if (viewUtf8 == "extensions")  html += "Extensions";
+    else if (viewUtf8 == "engines")     html += "Search Engines";
+    else if (viewUtf8 == "advanced")    html += "Advanced";
+    else if (viewUtf8 == "websites")    html += "Websites";
+    else if (viewUtf8 == "controllers") html += "Game Controllers";
+    else if (viewUtf8 == "reading")     html += "Reading List";
+    else if (viewUtf8 == "downloads")   html += "Downloads";
+    else                                html += "Settings";
 
-    // Websites (placeholder rows; per-site settings not yet wired)
-    html += "<div class=\"section\"><h2>Websites</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Camera, microphone, location</div>"
-            "<span class=\"desc\">Use the prompt defaults set here for every site that asks.</span></div>";
-    html += "<span class=\"desc\" style=\"color:var(--sub)\">Ask per site</span></div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Pop-ups</div>"
-            "<span class=\"desc\">Default behaviour when a page opens a new window.</span></div>";
-    html += "<span class=\"desc\" style=\"color:var(--sub)\">Block pop-ups</span></div></div>";
+    html += "</h1>";
+    html += body;
+    html += "</div></div>\n";
 
-    // Extensions (placeholder)
-    html += "<div class=\"section\"><h2>Extensions</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">No extensions installed</div>"
-            "<span class=\"desc\">Lumen does not support extensions in this build.</span></div></div></div>";
+    // Tiny inline JS: filter the sidebar as the user types in the search box.
+    html += "<script>\nfunction filterCats(){var q=document.getElementById('q').value.toLowerCase();"
+            "var rows=document.querySelectorAll('#list .cat');"
+            "for(var i=0;i<rows.length;i++){var n=rows[i].getAttribute('data-name').toLowerCase();"
+            "rows[i].style.display=(!q||n.indexOf(q)>=0)?'flex':'none';}}\n</script>\n";
 
-    // Search
-    html += "<div class=\"section\"><h2>Search</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Default search engine</div>"
-            "<span class=\"desc\">Used by the address bar when you type plain words.</span></div>";
-    {
-        std::vector<std::pair<std::string, std::string>> opts {
-            {"google", "Google"}, {"bing", "Bing"}, {"duckduckgo", "DuckDuckGo"},
-            {"yahoo", "Yahoo"}, {"ecosia", "Ecosia"}, {"startpage", "Startpage"}
-        };
-        html += selectRow(settingKey::kSearchEngine, engine, opts);
-    }
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Search highlights</div>"
-            "<span class=\"desc\">Show suggestions and shortcuts on the start page.</span></div>";
-    html += pillToggle(settingKey::kSearchHighlights, searchHl);
-    html += "</div></div>";
-
-    // AutoFill (placeholder)
-    html += "<div class=\"section\"><h2>AutoFill</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">AutoFill is not supported in Lumen</div>"
-            "<span class=\"desc\">Saved passwords, cards and addresses are not stored in this build.</span></div></div></div>";
-
-    // Profiles (placeholder)
-    html += "<div class=\"section\"><h2>Profiles</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">No profiles</div>"
-            "<span class=\"desc\">Lumen uses a single set of settings for now.</span></div></div></div>";
-
-    // Advanced
-    html += "<div class=\"section\"><h2>Advanced</h2>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Show full website address</div>"
-            "<span class=\"desc\">Always show https://www in the address bar.</span></div>";
-    html += pillToggle(settingKey::kShowFullUrl, showFullUrl);
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">JavaScript</div>"
-            "<span class=\"desc\">Required for almost every modern site.</span></div>";
-    html += pillToggle(settingKey::kJavaScript, javascript);
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">WebGL</div>"
-            "<span class=\"desc\">Hardware-accelerated 3D rendering inside pages.</span></div>";
-    html += pillToggle(settingKey::kWebGL, webgl);
-    html += "</div>";
-    html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Hardware acceleration</div>"
-            "<span class=\"desc\">Off (CPU rendering) avoids some GPU glitches but is slower.</span></div>";
-    html += pillToggle(settingKey::kHardwareAccel, hardwareAccel);
-    html += "</div></div>";
-
-    html += "</div>\n</body>\n</html>\n";
+    html += "</body>\n</html>\n";
     return html;
 }
 
