@@ -130,9 +130,9 @@ bool hasFileSignature(const std::wstring& url)
     return looksLikeFileSignature(percentDecodeBytes(path.substr(slash + 1)));
 }
 
-// Strong signals only: the URL says this is a file. Kept separate from the
-// path-marker guessing below so the response stage - where a false positive
-// cannot be walked back - can use these without that risk.
+// Strong signals only: the URL positively says this is a file, with no
+// guessing. isDownloadUrl layers looser path markers on top; keeping the two
+// apart makes it obvious which rule actually caught any given download.
 bool isFileUrl(const std::wstring& url)
 {
     if (hasBinaryExtension(url))
@@ -522,32 +522,26 @@ void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WK
         WKFramePolicyListenerUse(listener);
 }
 
-void WebView::decideNavigationResponse(WKPageRef page, WKNavigationResponseRef, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
+void WebView::decideNavigationResponse(WKPageRef, WKNavigationResponseRef, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
 {
-    // The URL is checked again here rather than only at the action stage: a
-    // redirect target never comes back through decideNavigationAction, and
-    // most "Direct Download" buttons bounce through one. Without this second
-    // look the archive that arrives after the redirect lands in the tab and
-    // renders as text starting "PK". Only the strong half of isFileUrl runs
-    // here, because a false positive at this point cannot be walked back.
+    // This used to re-check the URL as a second line of defence, on the theory
+    // that a redirect into a file never comes back through
+    // decideNavigationAction. It is gone, and the reason is worth recording so
+    // nobody spends another build cycle rediscovering it: this SDK offers no way
+    // to read the URL off a WKNavigationResponseRef. WKNavigationResponseGetURL
+    // is not declared, and neither is WKPageGetProvisionalURL - the page
+    // accessors that survive in this port are WKPageGetPageZoomFactor and
+    // WKPageGetEstimatedProgress and little else. The correct signal, reading
+    // Content-Type or Content-Disposition, is out of reach for the same reason:
+    // no WKURLResponseGetMIMEType, no WKNavigationResponseIsForMainFrame, and
+    // no way to get a WKURLResponseRef out of a WKNavigationResponseRef at all.
     //
-    // The URL comes off the page rather than off the response. This SDK has no
-    // WKNavigationResponseGetURL, and the proper signal - reading Content-Type
-    // and Content-Disposition - is out of reach too, because
-    // WKURLResponseGetMIMEType and WKNavigationResponseIsForMainFrame are both
-    // missing and the C API will not hand over a WKURLResponseRef.
-    //
-    // The provisional URL is what WebKit is loading *right now*, so through a
-    // redirect chain it is the far end of the chain, not the page the user
-    // started from. That is the whole point of this second look.
-    if (page) {
-        const std::wstring current = toWide(WKPageGetProvisionalURL(page));
-        if (!current.empty() && isFileUrl(current)) {
-            WKFramePolicyListenerDownload(listener);
-            return;
-        }
-    }
-
+    // So the action stage carries downloads on its own. That is not much of a
+    // loss, because the links that matter are clicked at their final URL: the
+    // FileCR "Click to Download" button navigates straight to
+    // s1-filecr.xyz/.../PK%E2%80%9A..., so decideNavigationAction already sees
+    // the file and isFileUrl already matches it on the mirror host and on the
+    // percent-decoded PK signature.
     WKFramePolicyListenerUse(listener);
 }
 
