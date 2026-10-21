@@ -2160,6 +2160,7 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
     // The footer holds the always-visible gear (right at the bottom) and, in
     // History mode, the "Clear History" button stacked above it. Each gets its
     // own band so neither one bleeds onto the row list nor onto each other.
+    const int listTop = s.segmented.bottom + margin;
     const int gearSize = px(32);
     const int gearBand = margin + gearSize;        // bottom band
     const int clearHeight = px(28);
