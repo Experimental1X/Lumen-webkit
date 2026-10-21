@@ -248,8 +248,8 @@ private:
     HDC m_backDC { nullptr };
     HBITMAP m_backBitmap { nullptr };
     HGDIOBJ m_backPrevious { nullptr };
-    int m_backWidth { 0 };
-    int m_backHeight { 0 };
+    LONG m_backWidth { 0 };
+    LONG m_backHeight { 0 };
     void releaseBackBuffer();
     void drawLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text, RECT rect, COLORREF color, UINT flags) const;
     int measureLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text) const;

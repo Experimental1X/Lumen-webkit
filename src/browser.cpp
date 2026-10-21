@@ -1554,8 +1554,10 @@ void Browser::paintBuffered(HDC target, const RECT& area, const std::function<vo
 
     // The buffer shares the client's origin, so it has to reach to the far
     // edge of the area even when only a corner of it is being painted.
-    const int neededWidth = std::max(area.right, 0);
-    const int neededHeight = std::max(area.bottom, 0);
+    // area.right and area.bottom are LONG, so the zero has to be LONG as well -
+    // std::max cannot deduce a single type across the two.
+    const LONG neededWidth = std::max<LONG>(area.right, 0);
+    const LONG neededHeight = std::max<LONG>(area.bottom, 0);
 
     // Drawing the chrome into a throwaway bitmap and blitting the result was
     // costing more than the chrome itself: a window-sized bitmap is around
@@ -1564,7 +1566,8 @@ void Browser::paintBuffered(HDC target, const RECT& area, const std::function<vo
     if (!m_backDC || neededWidth > m_backWidth || neededHeight > m_backHeight) {
         releaseBackBuffer();
         m_backDC = CreateCompatibleDC(target);
-        m_backBitmap = CreateCompatibleBitmap(target, neededWidth, neededHeight);
+        m_backBitmap = CreateCompatibleBitmap(target,
+            static_cast<int>(neededWidth), static_cast<int>(neededHeight));
         if (!m_backDC || !m_backBitmap) {
             releaseBackBuffer();
             return;

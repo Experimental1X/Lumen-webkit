@@ -522,23 +522,30 @@ void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WK
         WKFramePolicyListenerUse(listener);
 }
 
-void WebView::decideNavigationResponse(WKPageRef, WKNavigationResponseRef navigationResponse, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
+void WebView::decideNavigationResponse(WKPageRef page, WKNavigationResponseRef, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
 {
     // The URL is checked again here rather than only at the action stage: a
     // redirect target never comes back through decideNavigationAction, and
     // most "Direct Download" buttons bounce through one. Without this second
     // look the archive that arrives after the redirect lands in the tab and
-    // renders as text starting "PK". Only the strong half of isDownloadUrl
-    // runs here, because a false positive at this point cannot be walked back.
+    // renders as text starting "PK". Only the strong half of isFileUrl runs
+    // here, because a false positive at this point cannot be walked back.
     //
-    // The two helpers this SDK does not expose
-    // (WKNavigationResponseIsForMainFrame, WKURLResponseGetMIMEType) are
-    // deliberately avoided; reading Content-Disposition would be the better
-    // signal but needs a WKURLResponseRef, which the C API will not give us.
-    const char* redirected = WKNavigationResponseGetURL(navigationResponse);
-    if (redirected && isFileUrl(fromUtf8(redirected))) {
-        WKFramePolicyListenerDownload(listener);
-        return;
+    // The URL comes off the page rather than off the response. This SDK has no
+    // WKNavigationResponseGetURL, and the proper signal - reading Content-Type
+    // and Content-Disposition - is out of reach too, because
+    // WKURLResponseGetMIMEType and WKNavigationResponseIsForMainFrame are both
+    // missing and the C API will not hand over a WKURLResponseRef.
+    //
+    // The provisional URL is what WebKit is loading *right now*, so through a
+    // redirect chain it is the far end of the chain, not the page the user
+    // started from. That is the whole point of this second look.
+    if (page) {
+        const std::wstring current = toWide(WKPageGetProvisionalURL(page));
+        if (!current.empty() && isFileUrl(current)) {
+            WKFramePolicyListenerDownload(listener);
+            return;
+        }
     }
 
     WKFramePolicyListenerUse(listener);
