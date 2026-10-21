@@ -234,9 +234,23 @@ private:
     WKPageRef openPageFromWebKit(WKPageConfigurationRef configuration);
     void closeTabForView(WebView* view);
     void updateWindowTitle();
-    void resize();
+    // wholeClient = false limits the repaint to the chrome strip and the
+    // sidebar column, which is what an animation tick wants; a real window
+    // resize passes true because the page area really did change shape.
+    void resize(bool wholeClient = true);
+    void invalidateSidebarColumn();
     RECT contentArea() const;
     void paintBuffered(HDC target, const RECT& area, const std::function<void(HDC)>& draw);
+    // Reused back buffer for paintBuffered. A window-sized bitmap is about
+    // eight megabytes; making a fresh one per WM_PAINT was costing more than
+    // the drawing did, and the flicker came from blitting an untouched area
+    // of it back to the screen.
+    HDC m_backDC { nullptr };
+    HBITMAP m_backBitmap { nullptr };
+    HGDIOBJ m_backPrevious { nullptr };
+    int m_backWidth { 0 };
+    int m_backHeight { 0 };
+    void releaseBackBuffer();
     void drawLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text, RECT rect, COLORREF color, UINT flags) const;
     int measureLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text) const;
 

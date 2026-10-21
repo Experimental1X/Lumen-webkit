@@ -96,6 +96,96 @@ std::wstring fileNameOf(const std::wstring& path)
     return slash == std::wstring::npos ? path : path.substr(slash + 1);
 }
 
+// Every character is something a person would have typed, and there is at
+// least one letter. This is what separates a description like "AOMEI
+// Partition Assistant 10.12.2" from a name that has swallowed the opening
+// bytes of a ZIP and come out as "PK☛☚AOMEI Partition...".
+bool readsLikeWords(const std::wstring& name)
+{
+    if (name.empty() || name.size() > 120)
+        return false;
+
+    bool letter = false;
+    for (wchar_t ch : name) {
+        if (ch >= L'a' && ch <= L'z') { letter = true; continue; }
+        if (ch >= L'A' && ch <= L'Z') { letter = true; continue; }
+        if ((ch >= L'0' && ch <= L'9') || ch == L' ' || ch == L'.'
+            || ch == L'-' || ch == L'_' || ch == L'(' || ch == L')')
+            continue;
+        return false;
+    }
+    return letter;
+}
+
+// Ends in something short enough after the last dot to be an extension.
+bool hasShortExtension(const std::wstring& name)
+{
+    const size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos)
+        return false;
+
+    const size_t tail = name.size() - dot - 1;
+    if (tail < 1 || tail > 5)
+        return false;
+
+    for (size_t i = dot + 1; i < name.size(); ++i) {
+        const wchar_t ch = name[i];
+        if (!((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z')
+            || (ch >= L'0' && ch <= L'9')))
+            return false;
+    }
+    return true;
+}
+
+// A name worth keeping as it stands: readable, and it says what it is.
+bool isReadableName(const std::wstring& name)
+{
+    return readsLikeWords(name) && hasShortExtension(name);
+}
+
+// The name WebKit suggests comes from Content-Disposition, and when a server
+// sends no filename header at all it falls back to the last path segment of
+// the URL. Hosts that slug a file's own opening bytes into that path - FileCR
+// and its mirrors do, precisely so every mirror derives one URL from the file
+// alone - therefore hand us names like "PK☛☚AOMEI Partition Assistant":
+// unprintable, no extension, useless in a Downloads folder.
+//
+// So walk the path back for the most recent segment that reads like words and
+// use that instead.
+std::wstring nameFromDownloadUrl(WKDownloadRef download, const std::wstring& fallback)
+{
+    std::wstring url;
+    if (auto request = adopt(WKDownloadCopyRequest(download)))
+        if (auto handle = adopt(WKURLRequestCopyURL(request.get())))
+            url = toWide(handle.get());
+
+    const size_t cut = url.find_first_of(L"?#");
+    if (cut != std::wstring::npos)
+        url.resize(cut);
+
+    std::wstring best;
+    size_t start = 0;
+    while (start < url.size()) {
+        const size_t slash = url.find(L'/', start);
+        const std::wstring segment = percentDecode(
+            slash == std::wstring::npos ? url.substr(start) : url.substr(start, slash - start));
+        if (readsLikeWords(segment))
+            best = segment;
+
+        if (slash == std::wstring::npos)
+            break;
+        start = slash + 1;
+    }
+
+    // The salvaged segment describes the file rather than naming it, and these
+    // hosts only ever serve archives - so ".zip" is the guess worth making.
+    // Finding nothing at all means the URL said nothing useful either.
+    if (!best.empty())
+        return sanitizeFilename(best) + L".zip";
+
+    return sanitizeFilename(fallback);
+}
+
 std::wstring hostFromUrl(std::wstring url)
 {
     const size_t scheme = url.find(L"://");
@@ -324,6 +414,8 @@ WKStringRef Downloads::decideDestination(WKDownloadRef download, WKURLResponseRe
     Downloads& self = instance();
 
     std::wstring name = sanitizeFilename(toWide(suggestedFilename));
+    if (!isReadableName(name))
+        name = nameFromDownloadUrl(download, name);
     if (name.empty())
         name = L"download";
 

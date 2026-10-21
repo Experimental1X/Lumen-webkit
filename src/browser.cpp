@@ -105,6 +105,7 @@ std::wstring tabTitle(const WebView& view)
 Browser::~Browser()
 {
     destroy();
+    releaseBackBuffer();
     if (m_font)
         DeleteObject(m_font);
     if (m_addressBrush)
@@ -180,26 +181,43 @@ bool Browser::Spring::step(double dt, double response, double damping)
     if (settled())
         return false;
 
-    // A long stall - dragging the window, a modal dialog, a debugger break -
-    // would otherwise hand the integrator an enormous dt and fling the spring
-    // off screen. Treating it as one frame costs a few milliseconds of motion
-    // and keeps the simulation stable.
-    dt = std::clamp(dt, 0.0, 1.0 / 30.0);
+    // Moving the page view is the expensive part of an animation tick - every
+    // width change makes WebKit re-lay-out and re-raster the whole viewport -
+    // so consecutive ticks can easily land 150-250 ms apart. Handing that whole
+    // gap to a single Euler step would fling the spring off screen, but
+    // clamping it to one 30 ms step is worse than unstable: the spring then
+    // advances 30 ms of motion per 250 ms of wall clock and a half-second
+    // transition stretches out over nine seconds, which is exactly what the
+    // screen recording shows.
+    //
+    // So walk the elapsed time instead of truncating it. Every substep is
+    // small enough for the integrator to stay stable, and together they cover
+    // the real gap, so the animation finishes in the time the constants ask
+    // for no matter how slow the frames are.
+    dt = std::min(dt, 0.5);
     if (dt <= 0.0)
         return true;
 
     // Damped harmonic oscillator: a = -w^2(x - target) - 2*zeta*w*v
     const double omega = 2.0 * 3.14159265358979323846 / response;
-    const double accel = -omega * omega * (value - target) - 2.0 * damping * omega * velocity;
-    velocity += accel * dt;
-    value += velocity * dt;
+    const double stiffness = omega * omega;
+    const double drag = 2.0 * damping * omega;
 
-    // Snap the asymptote so the timer can actually stop. Sub-pixel, so nothing
-    // visibly jumps when it lands.
-    if (std::abs(value - target) < 0.05 && std::abs(velocity) < 0.5) {
-        value = target;
-        velocity = 0.0;
-        return false;
+    constexpr double kSubstep = 1.0 / 120.0;
+    while (dt > 0.0) {
+        const double h = std::min(dt, kSubstep);
+        dt -= h;
+
+        velocity += (-stiffness * (value - target) - drag * velocity) * h;
+        value += velocity * h;
+
+        // Snap the asymptote so the timer can actually stop. Sub-pixel, so
+        // nothing visibly jumps when it lands.
+        if (std::abs(value - target) < 0.05 && std::abs(velocity) < 0.5) {
+            value = target;
+            velocity = 0.0;
+            return false;
+        }
     }
     return true;
 }
@@ -265,7 +283,7 @@ bool Browser::stepAnimations()
         m_tabs[m_active]->setVisible(true);
 
     if (moving) {
-        resize();
+        resize(false);
         if (m_downloadsPanel && (m_downloadsVisible || m_panelAnim.value > 0.0))
             layoutDownloadsPanel();
         invalidateChrome();
@@ -337,6 +355,27 @@ void Browser::invalidateChrome() const
     GetClientRect(m_window, &area);
     area.bottom = std::min<LONG>(area.bottom, px(kToolbarHeight) + px(kTabBarHeight) + px(kFindBarHeight));
     InvalidateRect(m_window, &area, FALSE);
+}
+
+void Browser::invalidateSidebarColumn()
+{
+    if (!m_window)
+        return;
+
+    // Everything the sidebar draws itself lives in one column: the full
+    // current width, from under the chrome to the bottom of the client area.
+    // Invalidating only that column is what keeps a sidebar animation from
+    // flashing - a whole-window invalidate also repaints the page area behind
+    // the web view, whose background fill gets cleared and refilled every tick.
+    const int width = sidebarWidthNow();
+    if (width <= 0)
+        return;
+
+    RECT client { };
+    GetClientRect(m_window, &client);
+
+    RECT column { 0, chromeHeight(), width, std::max<LONG>(0, client.bottom) };
+    InvalidateRect(m_window, &column, FALSE);
 }
 
 void Browser::applyTheme(bool dark)
@@ -498,7 +537,7 @@ void Browser::placeAddressBar(const ChromeLayout& l) const
     MoveWindow(m_address, l.pill.left + inset, top, width, height, TRUE);
 }
 
-void Browser::resize()
+void Browser::resize(bool wholeClient)
 {
     if (!m_window)
         return;
@@ -511,24 +550,39 @@ void Browser::resize()
     placeAddressBar(l);
     placeFindEdit(l);
 
+    const int viewLeft = sidebarWidthNow();
+    const int viewWidth = std::max<int>(0, static_cast<int>(client.right) - viewLeft);
+    const int viewHeight = std::max<int>(0, static_cast<int>(client.bottom - l.totalHeight));
+
     for (const auto& tab : m_tabs) {
         HWND viewWindow = tab->hwnd();
         if (!viewWindow)
             continue;
 
-        const int viewLeft = sidebarWidthNow();
-        MoveWindow(
-            viewWindow,
-            viewLeft,
-            l.totalHeight,
-            std::max<int>(0, static_cast<int>(client.right) - viewLeft),
-            std::max<int>(0, static_cast<int>(client.bottom - l.totalHeight)),
-            TRUE);
+        // Moving the view already repaints it and invalidates the strip it
+        // vacated, so only the chrome we own ourselves needs a nudge. Handing
+        // MoveWindow a geometry it already has would still cost a full
+        // WebKit re-layout, and an animation runs this a dozen times a second.
+        RECT current { };
+        GetWindowRect(viewWindow, &current);
+        MapWindowPoints(HWND_DESKTOP, m_window, reinterpret_cast<POINT*>(&current), 2);
+        if (current.left == viewLeft && current.top == l.totalHeight
+            && current.right - current.left == viewWidth
+            && current.bottom - current.top == viewHeight)
+            continue;
+
+        MoveWindow(viewWindow, viewLeft, l.totalHeight, viewWidth, viewHeight, TRUE);
     }
 
-    // Repaint everything: the sidebar and the tab overview are drawn by this
-    // window and must follow every size change.
-    InvalidateRect(m_window, nullptr, FALSE);
+    // The sidebar and the tab overview are drawn by this window and have to
+    // follow every size change. Only the page area is somebody else's, and
+    // repainting it means clearing the fill behind the web view and watching
+    // it flash - so an animation tick leaves it alone and lets MoveWindow's
+    // own repaint deal with the strip that opened up.
+    if (wholeClient)
+        InvalidateRect(m_window, nullptr, FALSE);
+    else
+        invalidateSidebarColumn();
 
     if (m_downloadsVisible || m_panelAnim.value > 0.0)
         layoutDownloadsPanel();
@@ -1428,22 +1482,67 @@ void Browser::onPaint(HDC target)
     const int contentHeight = std::max(0, static_cast<int>(client.bottom - l.totalHeight));
     const RECT content { 0, l.totalHeight, width, l.totalHeight + contentHeight };
 
-    if (m_overview || m_overviewAnim.value > 0.0) {
-        paintBuffered(target, content, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
-    } else {
-        // Page area behind the web views.
-        fillSolid(target, content, m_theme.page);
+    // Paint only what was actually invalidated. WM_PAINT arrives with an
+    // update region, and using it means a twenty-pixel sidebar hover repaints
+    // twenty pixels instead of clearing and redrawing a hundred and eighty
+    // square centimetres of chrome - which is both the lag and, because the
+    // page fill gets rebuilt from scratch, the flicker.
+    RECT update { };
+    if (!GetUpdateRect(m_window, &update, FALSE))
+        update = client;
+    else
+        IntersectRect(&update, &update, &client);
 
-        const int sidebarWidth = sidebarWidthNow();
-        if (sidebarWidth > 0) {
-            const RECT panel { 0, l.totalHeight, sidebarWidth, l.totalHeight + contentHeight };
-            paintBuffered(target, panel, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
+    const bool overviewUp = m_overview || m_overviewAnim.value > 0.0;
+    const int sidebarWidth = sidebarWidthNow();
+
+    // The page fill is drawn straight to the DC - it is a single opaque
+    // rectangle - so it only runs when it is inside the update region.
+    if (update.top < content.bottom) {
+        RECT pageArea { std::max<LONG>(update.left, 0), content.top,
+            std::min<LONG>(update.right, width), content.bottom };
+        if (pageArea.right > pageArea.left && pageArea.bottom > pageArea.top)
+            fillSolid(target, pageArea, m_theme.page);
+    }
+
+    if (overviewUp) {
+        if (update.top < content.bottom) {
+            RECT area = content;
+            IntersectRect(&area, &area, &update);
+            paintBuffered(target, area, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
         }
+    } else if (sidebarWidth > 0 && update.left < sidebarWidth && update.top < content.bottom) {
+        const RECT panel { 0, l.totalHeight, sidebarWidth, l.totalHeight + contentHeight };
+        RECT area = panel;
+        IntersectRect(&area, &area, &update);
+        paintBuffered(target, area, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
     }
 
     // The chrome is drawn into an off-screen bitmap to avoid flicker.
-    const RECT chrome { 0, 0, width, l.totalHeight };
-    paintBuffered(target, chrome, [&](HDC dc) { paintChrome(dc, l); });
+    if (update.top < l.totalHeight) {
+        const RECT chrome { 0, 0, width, l.totalHeight };
+        RECT area = chrome;
+        IntersectRect(&area, &area, &update);
+        paintBuffered(target, area, [&](HDC dc) { paintChrome(dc, l); });
+    }
+}
+
+void Browser::releaseBackBuffer()
+{
+    if (m_backDC) {
+        if (m_backPrevious) {
+            SelectObject(m_backDC, m_backPrevious);
+            m_backPrevious = nullptr;
+        }
+        DeleteDC(m_backDC);
+        m_backDC = nullptr;
+    }
+    if (m_backBitmap) {
+        DeleteObject(m_backBitmap);
+        m_backBitmap = nullptr;
+    }
+    m_backWidth = 0;
+    m_backHeight = 0;
 }
 
 void Browser::paintBuffered(HDC target, const RECT& area, const std::function<void(HDC)>& draw)
@@ -1453,16 +1552,39 @@ void Browser::paintBuffered(HDC target, const RECT& area, const std::function<vo
     if (width <= 0 || height <= 0)
         return;
 
-    HDC memory = CreateCompatibleDC(target);
-    HBITMAP bitmap = CreateCompatibleBitmap(target, width, height);
-    HGDIOBJ previous = SelectObject(memory, bitmap);
+    // The buffer shares the client's origin, so it has to reach to the far
+    // edge of the area even when only a corner of it is being painted.
+    const int neededWidth = std::max(area.right, 0);
+    const int neededHeight = std::max(area.bottom, 0);
 
-    draw(memory);
-    BitBlt(target, area.left, area.top, width, height, memory, 0, 0, SRCCOPY);
+    // Drawing the chrome into a throwaway bitmap and blitting the result was
+    // costing more than the chrome itself: a window-sized bitmap is around
+    // eight megabytes, and an animation produces dozens of paints a second.
+    // Keep one and grow it only when the window outgrows it.
+    if (!m_backDC || neededWidth > m_backWidth || neededHeight > m_backHeight) {
+        releaseBackBuffer();
+        m_backDC = CreateCompatibleDC(target);
+        m_backBitmap = CreateCompatibleBitmap(target, neededWidth, neededHeight);
+        if (!m_backDC || !m_backBitmap) {
+            releaseBackBuffer();
+            return;
+        }
+        m_backWidth = neededWidth;
+        m_backHeight = neededHeight;
+        m_backPrevious = SelectObject(m_backDC, m_backBitmap);
+    }
 
-    SelectObject(memory, previous);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
+    // Confine the drawing to the damaged slice, and blit from the same place
+    // in the buffer rather than from its corner - otherwise a partial repaint
+    // would put the wrong pixels on screen.
+    HRGN clip = CreateRectRgnIndirect(&area);
+    SelectClipRgn(m_backDC, clip);
+    DeleteObject(clip);
+
+    draw(m_backDC);
+
+    BitBlt(target, area.left, area.top, width, height,
+        m_backDC, area.left, area.top, SRCCOPY);
 }
 
 void Browser::drawLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text, RECT rect, COLORREF color, UINT flags) const
@@ -1791,14 +1913,17 @@ void Browser::bookmarkCurrent()
 
     m_library.addBookmark(view->url(), tabTitle(*view));
 
-    // Show the result, like Safari opening the sidebar on Bookmarks.
+    // Show the result, like Safari opening the sidebar on Bookmarks. The
+    // width has to be synced before anything reads it - sidebarWidthNow()
+    // reports the spring's settled target, so a sidebar that was closed would
+    // stay closed no matter what m_sidebarVisible says.
     m_sidebarVisible = true;
     m_sidebarMode = 0;
     m_sidebarScroll = 0;
     if (m_overview)
         hideOverview();
-    resize();
-    InvalidateRect(m_window, nullptr, FALSE);
+    syncAnimations();
+    invalidateSidebarColumn();
 }
 
 void Browser::readingListCurrent()
@@ -1814,8 +1939,8 @@ void Browser::readingListCurrent()
     m_sidebarScroll = 0;
     if (m_overview)
         hideOverview();
-    resize();
-    InvalidateRect(m_window, nullptr, FALSE);
+    syncAnimations();
+    invalidateSidebarColumn();
 }
 
 // ---------------------------------------------------------------------------
@@ -2239,10 +2364,12 @@ void Browser::toggleSidebar()
         hideOverview();
 
     // Let the width spring to its new value rather than jumping the page
-    // sideways; resize() reads the interpolated width every frame.
+    // sideways; resize() reads the interpolated width every frame. The first
+    // animation tick does the real repaint - invalidating the whole window
+    // here as well would just clear the page fill behind the web view for
+    // nothing, which is the flash at the start of every toggle.
     syncAnimations();
-    resize();
-    InvalidateRect(m_window, nullptr, FALSE);
+    invalidateSidebarColumn();
 }
 
 bool Browser::sidebarClick(POINT local, int height)

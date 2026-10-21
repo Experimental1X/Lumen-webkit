@@ -55,6 +55,35 @@ std::wstring percentEncode(const std::wstring& value)
     return fromUtf8(encoded);
 }
 
+std::string percentDecodeBytes(const std::wstring& value)
+{
+    auto hexDigit = [](wchar_t c, int& out) {
+        if (c >= L'0' && c <= L'9') { out = c - L'0'; return true; }
+        if (c >= L'a' && c <= L'f') { out = c - L'a' + 10; return true; }
+        if (c >= L'A' && c <= L'F') { out = c - L'A' + 10; return true; }
+        return false;
+    };
+
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        int high = 0, low = 0;
+        if (value[i] == L'%' && i + 2 < value.size()
+            && hexDigit(value[i + 1], high) && hexDigit(value[i + 2], low)) {
+            decoded.push_back(static_cast<char>((high << 4) | low));
+            i += 2;
+        } else {
+            decoded.push_back(static_cast<char>(value[i]));
+        }
+    }
+    return decoded;
+}
+
+std::wstring percentDecode(const std::wstring& value)
+{
+    return fromUtf8(percentDecodeBytes(value));
+}
+
 std::wstring fileUrlFromPath(const std::wstring& path)
 {
     static constexpr char hex[] = "0123456789ABCDEF";

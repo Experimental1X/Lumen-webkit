@@ -32,6 +32,121 @@ namespace lumen {
 
 namespace {
 
+bool startsWith(const std::string& bytes, const char* signature, size_t length)
+{
+    return bytes.size() >= length && bytes.compare(0, length, signature, length) == 0;
+}
+
+// True when a path segment is really the first few bytes of a file rather
+// than a name. Direct-download hosts increasingly slug the archive's own
+// opening bytes into the path - FileCR's "Click to Download" hands you
+// .../PK%E2%80%9A%E2%80%9D%E2%80%90AOMEI%20Partition%20... - because that way
+// every mirror derives the same URL from the file alone. Nothing about that
+// path says ".zip", so without this the archive lands in the tab and renders
+// as text starting "PK".
+bool looksLikeFileSignature(const std::string& bytes)
+{
+    static const struct { const char* magic; size_t length; } signatures[] = {
+        { "PK\x03\x04", 4 },                       // zip
+        { "PK\x05\x06", 4 },                       // zip, empty archive
+        { "PK\x07\x08", 4 },                       // zip, spanned
+        { "Rar!\x1a\x07", 7 },                     // rar
+        { "7z\xbc\xaf\x27\x1c", 6 },               // 7z
+        { "\x1f\x8b", 2 },                         // gzip
+        { "\xd0\xcf\x11\xe0", 4 },                 // msi / ole compound file
+        { "!<arch>\n", 7 },                        // ar, and therefore deb
+        { "\x7f" "ELF", 4 },                       // linux binary
+        { "%PDF", 4 },                             // pdf
+    };
+
+    for (const auto& signature : signatures)
+        if (startsWith(bytes, signature.magic, signature.length))
+            return true;
+
+    // A DOS executable starts MZ too, but the header is sixty-four bytes long
+    // and a page URL's last segment is never sixty-four bytes of binary that
+    // starts with it - "MZP" for Mailbox Prime is the near miss worth ruling
+    // out, and demanding the length does that without losing a real hit.
+    return bytes.size() >= 64 && startsWith(bytes, "MZ", 2);
+}
+
+// Strips the query and fragment: neither is part of a file name.
+std::wstring pathOf(const std::wstring& url)
+{
+    std::wstring path = url;
+    const size_t fragment = path.find(L'#');
+    if (fragment != std::wstring::npos)
+        path.resize(fragment);
+    const size_t query = path.find(L'?');
+    if (query != std::wstring::npos)
+        path.resize(query);
+    return path;
+}
+
+std::wstring lowered(const std::wstring& text)
+{
+    std::wstring result = text;
+    for (wchar_t& c : result)
+        c = static_cast<wchar_t>(towlower(static_cast<int>(c)));
+    return result;
+}
+
+// The last path segment ends with a known archive, package or installer
+// extension.
+bool hasBinaryExtension(const std::wstring& url)
+{
+    const std::wstring path = pathOf(url);
+    const size_t slash = path.find_last_of(L'/');
+    const std::wstring filename = lowered(slash == std::wstring::npos ? path : path.substr(slash + 1));
+    if (filename.empty())
+        return false;
+
+    static const wchar_t* const binary[] = {
+        L".zip", L".7z", L".rar", L".tar", L".gz", L".tgz", L".bz2",
+        L".xz", L".lz", L".lzma", L".zst",
+        L".iso", L".img", L".dmg", L".bin", L".cue",
+        L".exe", L".msi", L".msp", L".dll", L".cab", L".scr",
+        L".deb", L".rpm", L".pkg", L".apk", L".ipa",
+        L".jar", L".war",
+        L".pdf",
+    };
+    for (const wchar_t* ext : binary)
+        if (filename.size() >= std::wcslen(ext)
+            && filename.compare(filename.size() - std::wcslen(ext), std::wcslen(ext), ext) == 0)
+            return true;
+
+    return false;
+}
+
+// The last path segment has no extension, but it is the head of a real file -
+// see looksLikeFileSignature for why that happens.
+bool hasFileSignature(const std::wstring& url)
+{
+    const std::wstring path = pathOf(url);
+    const size_t slash = path.find_last_of(L'/');
+    if (slash == std::wstring::npos)
+        return false;
+
+    return looksLikeFileSignature(percentDecodeBytes(path.substr(slash + 1)));
+}
+
+// Strong signals only: the URL says this is a file. Kept separate from the
+// path-marker guessing below so the response stage - where a false positive
+// cannot be walked back - can use these without that risk.
+bool isFileUrl(const std::wstring& url)
+{
+    if (hasBinaryExtension(url))
+        return true;
+
+    // FileCR's per-mirror hosts serve nothing but file payloads, and their
+    // paths carry no extension. Keyed on the mirror domain rather than the
+    // main site, because filecr.com itself is an ordinary set of pages.
+    if (lowered(url).find(L"filecr.xyz") != std::wstring::npos)
+        return true;
+
+    return hasFileSignature(url);
+}
+
 // URL-by-extension companion for download sniffing in decideNavigationAction.
 // Most direct-download links (GitHub Releases, SourceForge mirrors, FileCR,
 // macOS / Linux ISOs, browser installers) never send Content-Disposition:
@@ -42,54 +157,19 @@ namespace {
 // link on a music page does not turn into a download.
 bool isDownloadUrl(const std::wstring& url)
 {
-    // Fragment and query string are not part of the file name.
-    std::wstring path = url;
-    const size_t fragment = path.find(L'#');
-    if (fragment != std::wstring::npos)
-        path.resize(fragment);
-    const size_t query = path.find(L'?');
-    if (query != std::wstring::npos)
-        path.resize(query);
+    if (isFileUrl(url))
+        return true;
 
-    // 1. The filename is the last segment of the path - if it ends with any
-    //    known binary extension, that is overwhelmingly a download.
-    const size_t slash = path.find_last_of(L'/');
-    std::wstring filename = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
-
-    if (!filename.empty()) {
-        std::wstring lowered = filename;
-        for (wchar_t& c : lowered)
-            c = static_cast<wchar_t>(towlower(static_cast<int>(c)));
-        static const wchar_t* const binary[] = {
-            L".zip", L".7z", L".rar", L".tar", L".gz", L".tgz", L".bz2",
-            L".xz", L".lz", L".lzma", L".zst",
-            L".iso", L".img", L".dmg", L".bin", L".cue",
-            L".exe", L".msi", L".msp", L".dll", L".cab", L".scr",
-            L".deb", L".rpm", L".pkg", L".apk", L".ipa",
-            L".jar", L".war",
-            L".pdf",
-        };
-        for (const wchar_t* ext : binary)
-            if (lowered.size() >= std::wcslen(ext)
-                && lowered.compare(lowered.size() - std::wcslen(ext), std::wcslen(ext), ext) == 0)
-                return true;
-    }
-
-    // 2. Many file hosts and CDNs use a path like /download/abc/setup.exe
-    //    where the path itself advertises the intent even if there is no
-    //    trailing extension. Sniff those patterns.
-    const std::wstring loweredPath = [&] {
-        std::wstring s = path;
-        for (wchar_t& c : s)
-            c = static_cast<wchar_t>(towlower(static_cast<int>(c)));
-        return s;
-    }();
+    // Many file hosts and CDNs use a path like /download/abc/setup.exe
+    // where the path itself advertises the intent even if there is no
+    // trailing extension. Sniff those patterns.
+    const std::wstring path = lowered(pathOf(url));
     static const wchar_t* const markers[] = {
         L"/download/", L"/downloads/", L"/getfile/", L"/get/", L"/file/",
         L"/releases/download/", L"/releases/tag/",
     };
     for (const wchar_t* marker : markers)
-        if (loweredPath.find(marker) != std::wstring::npos)
+        if (path.find(marker) != std::wstring::npos)
             return true;
 
     return false;
@@ -442,14 +522,25 @@ void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WK
         WKFramePolicyListenerUse(listener);
 }
 
-void WebView::decideNavigationResponse(WKPageRef, WKNavigationResponseRef, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
+void WebView::decideNavigationResponse(WKPageRef, WKNavigationResponseRef navigationResponse, WKFramePolicyListenerRef listener, WKTypeRef, const void*)
 {
-    // Binary extensions are caught at the action stage where we have the URL.
-    // Content-Disposition: attachment flows through
-    // WKNavigationActionShouldPerformDownload above. The two older helpers
-    // this SDK does not actually expose (WKNavigationResponseIsForMainFrame,
-    // WKURLResponseGetMIMEType) are deliberately avoided: the response stage
-    // is too late to undo a navigation WebKit has already committed to.
+    // The URL is checked again here rather than only at the action stage: a
+    // redirect target never comes back through decideNavigationAction, and
+    // most "Direct Download" buttons bounce through one. Without this second
+    // look the archive that arrives after the redirect lands in the tab and
+    // renders as text starting "PK". Only the strong half of isDownloadUrl
+    // runs here, because a false positive at this point cannot be walked back.
+    //
+    // The two helpers this SDK does not expose
+    // (WKNavigationResponseIsForMainFrame, WKURLResponseGetMIMEType) are
+    // deliberately avoided; reading Content-Disposition would be the better
+    // signal but needs a WKURLResponseRef, which the C API will not give us.
+    const char* redirected = WKNavigationResponseGetURL(navigationResponse);
+    if (redirected && isFileUrl(fromUtf8(redirected))) {
+        WKFramePolicyListenerDownload(listener);
+        return;
+    }
+
     WKFramePolicyListenerUse(listener);
 }
 
