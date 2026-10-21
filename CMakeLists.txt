@@ -34,6 +34,7 @@ add_executable(Lumen WIN32
     src/dialogs.cpp
     src/downloads.cpp
     src/library.cpp
+    src/settings.cpp
     src/util.cpp
     src/webkit_host.cpp
 )

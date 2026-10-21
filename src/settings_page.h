@@ -9,77 +9,59 @@
 
 namespace lumen {
 
-// escapeHtml now lives in util.h (included transitively via settings.h).
-// Keeping a single definition across the page headers prevents the duplicate
-// "function already has a body" linker error when both pages are pulled
-// into the same translation unit.
-
 namespace {
 
-std::wstring settingValue(const wchar_t* key, const std::wstring& defaultValue)
+inline std::string escapeSettingHtml(const std::string& s)
 {
-    return Settings::instance().get(key, defaultValue);
-}
-
-std::string selectedEngine()
-{
-    const std::wstring v = settingValue(settingKey::kSearchEngine, L"google");
-    return toUtf8(v);
-}
-
-std::string selectedTheme()
-{
-    const std::wstring v = settingValue(settingKey::kTheme, L"system");
-    return toUtf8(v);
-}
-
-std::string selectedEncoding()
-{
-    return toUtf8(settingValue(settingKey::kDefaultEncoding, L"utf-8"));
+    std::string result;
+    result.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '<':  result += "&lt;";  break;
+        case '>':  result += "&gt;";  break;
+        case '&':  result += "&amp;"; break;
+        case '"':  result += "&quot;"; break;
+        case '\'': result += "&#39;"; break;
+        default:   result += c;      break;
+        }
+    }
+    return result;
 }
 
 } // namespace
 
-// Self-contained Settings page in the same visual language as the start page
-// and the downloads page. Each interactive control links to a
+// Self-contained Settings page in the same visual language as the start
+// page and the downloads page. Each interactive control links to a
 // `lumen:settings?key=X&value=Y` URL; `WebView::decideNavigationAction`
-// catches those, calls `Settings::set`, and the browser re-renders the page.
+// catches those, calls `Settings::set`, and the browser re-renders the
+// page. Mirrors Safari's settings layout, minus the Apple-service entries
+// (iCloud, Apple Pay, Apple ID, Screen Time, etc.) that don't apply.
 inline std::string settingsPageHtml(bool dark)
 {
     const Settings& s = Settings::instance();
 
     // Pull values once, formatted for the page.
-    const std::wstring homepage       = s.get(settingKey::kHomepage, L"lumen:start");
-    const std::wstring downloadsFolder= s.get(settingKey::kDownloadsFolder, L"");
-    const int          pageZoom       = s.getInt(settingKey::kPageZoom, 100);
-    const bool         blockTrackers  = s.getBool(settingKey::kBlockTrackers, true);
-    const bool         block3pCookies = s.getBool(settingKey::kBlockThirdPartyCookies, false);
-    const bool         javascript     = s.getBool(settingKey::kJavaScript, true);
-    const bool         webgl          = s.getBool(settingKey::kWebGL, true);
-    const bool         hardwareAccel  = s.getBool(settingKey::kHardwareAccel, false);
-    const bool         showFullUrl    = s.getBool(settingKey::kShowFullUrl, true);
-    const bool         searchHl       = s.getBool(settingKey::kSearchHighlights, true);
-    const bool         sidebarOnStart = s.getBool(settingKey::kShowSidebarOnStartup, false);
-    const bool         homepageInTab  = s.getBool(settingKey::kHomepageInNewTab, true);
+    const std::wstring homepage        = s.get(settingKey::kHomepage, L"lumen:start");
+    const std::wstring downloadsFolder = s.get(settingKey::kDownloadsFolder, L"");
+    const int          pageZoom        = s.getInt(settingKey::kPageZoom, 100);
+    const bool         blockTrackers   = s.getBool(settingKey::kBlockTrackers, true);
+    const bool         block3pCookies  = s.getBool(settingKey::kBlockThirdPartyCookies, false);
+    const bool         javascript      = s.getBool(settingKey::kJavaScript, true);
+    const bool         webgl           = s.getBool(settingKey::kWebGL, true);
+    const bool         hardwareAccel   = s.getBool(settingKey::kHardwareAccel, false);
+    const bool         showFullUrl     = s.getBool(settingKey::kShowFullUrl, true);
+    const bool         searchHl        = s.getBool(settingKey::kSearchHighlights, true);
+    const bool         sidebarOnStart  = s.getBool(settingKey::kShowSidebarOnStartup, false);
+    const bool         homepageInTab   = s.getBool(settingKey::kHomepageInNewTab, true);
 
-    const std::string engine   = selectedEngine();
-    const std::string theme    = selectedTheme();
-    const std::string encoding = selectedEncoding();
+    const std::string engine    = toUtf8(s.get(settingKey::kSearchEngine,    L"google"));
+    const std::string theme     = toUtf8(s.get(settingKey::kTheme,           L"system"));
+    const std::string encoding  = toUtf8(s.get(settingKey::kDefaultEncoding, L"utf-8"));
 
     auto pillToggle = [&](const wchar_t* key, bool on) {
         return std::string("<a class=\"toggle ") + (on ? "on" : "off") +
                "\" href=\"lumen:settings?key=" + toUtf8(key) + "&value=" + (on ? "0" : "1") + "\">" +
                (on ? "On" : "Off") + "</a>";
-    };
-
-    auto radioRow = [&](const char* group, const std::string& value, const char* label, bool selected, const char* optValue) {
-        std::string url = std::string("lumen:settings?key=") + group + "&value=" + optValue;
-        std::string out = "<a class=\"radio";
-        if (selected) out += " sel";
-        out += "\" href=\"" + url + "\">";
-        out += "<span class=\"dot\"></span><span>" + std::string(label) + "</span></a>";
-        (void)value;
-        return out;
     };
 
     auto selectRow = [&](const wchar_t* key, const std::string& current, const std::vector<std::pair<std::string, std::string>>& options) {
@@ -98,7 +80,7 @@ inline std::string settingsPageHtml(bool dark)
     auto textRow = [&](const wchar_t* key, const std::wstring& value, const char* placeholder) {
         std::string out = "<div class=\"text\"><form action=\"lumen:settings\" method=\"get\">";
         out += "<input type=\"hidden\" name=\"key\" value=\"" + toUtf8(key) + "\">";
-        out += "<input type=\"text\" name=\"value\" value=\"" + escapeHtml(toUtf8(value)) +
+        out += "<input type=\"text\" name=\"value\" value=\"" + escapeSettingHtml(toUtf8(value)) +
                "\" placeholder=\"" + placeholder + "\" onchange=\"this.form.submit()\">";
         out += "</form></div>";
         return out;
@@ -107,7 +89,7 @@ inline std::string settingsPageHtml(bool dark)
     auto folderRow = [&](const wchar_t* key, const std::wstring& value) {
         std::string out = "<div class=\"text\"><form action=\"lumen:settings\" method=\"get\">";
         out += "<input type=\"hidden\" name=\"key\" value=\"" + toUtf8(key) + "\">";
-        out += "<input type=\"text\" name=\"value\" value=\"" + escapeHtml(toUtf8(value)) +
+        out += "<input type=\"text\" name=\"value\" value=\"" + escapeSettingHtml(toUtf8(value)) +
                "\" placeholder=\"Default (Windows Downloads folder)\" onchange=\"this.form.submit()\">";
         out += "</form></div>";
         return out;
@@ -145,21 +127,25 @@ inline std::string settingsPageHtml(bool dark)
         ".label{flex:1 1 auto;min-width:0}\n"
         ".label .name{font-weight:500}\n"
         ".label .desc{display:block;color:var(--sub);font-size:12px;margin-top:2px}\n"
-        ".toggle,.radio,a.action{display:inline-flex;align-items:center;justify-content:center;"
+        ".toggle{display:inline-flex;align-items:center;justify-content:center;"
         "min-width:54px;height:26px;border-radius:999px;text-decoration:none;font-weight:600;"
         "font-size:12px;padding:0 14px;cursor:pointer;border:1px solid transparent}\n"
-        ".toggle.on,.radio.sel{background:var(--accent);color:#fff}\n"
-        ".toggle.off,.radio{background:var(--track);color:var(--text)}\n"
-        ".radio{display:inline-flex;justify-content:flex-start;gap:8px;padding:0 12px;min-width:120px;height:30px}\n"
-        ".radio .dot{width:8px;height:8px;border-radius:50%;background:var(--card);border:1px solid var(--border);margin-right:2px;flex:0 0 auto}\n"
-        ".radio.sel .dot{background:var(--accent);border-color:var(--accent)}\n"
+        ".toggle.on{background:var(--accent);color:#fff}\n"
+        ".toggle.off{background:var(--track);color:var(--text)}\n"
         ".select select,.text input{font:inherit;color:var(--text);background:var(--bg1);"
         "border:1px solid var(--border);border-radius:8px;padding:6px 10px;min-width:200px}\n"
         ".text input{width:260px}\n"
         ".danger{background:transparent;color:var(--danger);border-color:var(--danger)}\n"
         ".danger:hover{background:var(--danger);color:#fff}\n"
         ".action{background:var(--bg1);color:var(--text);border-color:var(--border)}\n"
-        ".grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}\n";
+        ".grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 14px}\n"
+        ".grid a{display:flex;align-items:center;gap:8px;height:30px;padding:0 12px;"
+        "border-radius:6px;text-decoration:none;color:var(--text);background:var(--track);"
+        "border:1px solid var(--border);font-size:12px}\n"
+        ".grid a.sel{background:var(--accent);color:#fff;border-color:var(--accent)}\n"
+        ".grid a .dot{width:8px;height:8px;border-radius:50%;background:var(--card);"
+        "border:1px solid var(--border)}\n"
+        ".grid a.sel .dot{background:#fff;border-color:#fff}\n";
 
     html += "</style>\n</head>\n<body>\n<div class=\"page\">\n";
     html += "<h1>Settings</h1>\n";
@@ -184,11 +170,17 @@ inline std::string settingsPageHtml(bool dark)
     html += "<div class=\"section\"><h2>Appearance</h2>";
     html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Theme</div>"
             "<span class=\"desc\">Follow the system, or pin to light or dark.</span></div>";
-    html += "<div class=\"grid\">";
-    html += radioRow("theme", theme, "System", theme == "system", "system");
-    html += radioRow("theme", theme, "Light",  theme == "light",  "light");
-    html += radioRow("theme", theme, "Dark",   theme == "dark",   "dark");
-    html += "</div></div>";
+    {
+        std::string urlSystem = std::string("lumen:settings?key=theme&value=system");
+        std::string urlLight  = std::string("lumen:settings?key=theme&value=light");
+        std::string urlDark   = std::string("lumen:settings?key=theme&value=dark");
+        html += "<div class=\"grid\">";
+        html += "<a class=\""; if (theme == "system") html += "sel"; html += "\" href=\"" + urlSystem + "\"><span class=\"dot\"></span><span>System</span></a>";
+        html += "<a class=\""; if (theme == "light")  html += "sel"; html += "\" href=\"" + urlLight  + "\"><span class=\"dot\"></span><span>Light</span></a>";
+        html += "<a class=\""; if (theme == "dark")   html += "sel"; html += "\" href=\"" + urlDark   + "\"><span class=\"dot\"></span><span>Dark</span></a>";
+        html += "</div>";
+    }
+    html += "</div>";
     html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Default page zoom</div>"
             "<span class=\"desc\">%</span></div>";
     {
@@ -233,7 +225,7 @@ inline std::string settingsPageHtml(bool dark)
     html += "<a class=\"action danger\" href=\"lumen:settings?key=__action__&value=clear_history\">Clear</a>";
     html += "</div></div>";
 
-    // Websites (placeholder)
+    // Websites (placeholder rows; per-site settings not yet wired)
     html += "<div class=\"section\"><h2>Websites</h2>";
     html += "<div class=\"row\"><div class=\"label\"><div class=\"name\">Camera, microphone, location</div>"
             "<span class=\"desc\">Use the prompt defaults set here for every site that asks.</span></div>";

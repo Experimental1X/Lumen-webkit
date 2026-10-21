@@ -1,8 +1,11 @@
 #include "browser.h"
 
-#include "start_page.h"
+#include "dialogs.h"
 #include "downloads.h"
 #include "downloads_page.h"
+#include "settings.h"
+#include "settings_page.h"
+#include "start_page.h"
 #include "util.h"
 
 #include <windowsx.h>
@@ -123,6 +126,8 @@ bool Browser::create(HWND window, std::wstring& error)
     createFindControl();
     createDownloadsPanel();
     Downloads::instance().setOwnerWindow(m_window);
+    // Settings persist across launches (settings.tsv under %APPDATA%\Lumen).
+    Settings::instance().load();
     // The download callbacks can fire on WebKit's IPC threads; funnel them
     // through WM_LUMEN_DOWNLOAD_CHANGED so onDownloadsChanged always runs on
     // the UI thread (its code touches GDI).
@@ -1907,6 +1912,17 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
     const int listTop = s.segmented.bottom + margin;
     s.list = { 0, listTop, s.width, std::max(listTop, height - footer) };
     s.clearButton = { margin, height - px(42), s.width - margin, height - px(12) };
+
+    // Gear is a 32-px circle in the bottom-right corner. It sits just below
+    // the segmented control header and above the list bottom, so it never
+    // collides with row clicks.
+    const int gearSize = px(32);
+    s.gearButton = {
+        s.width - margin - gearSize,
+        std::max(listTop + margin, height - margin - gearSize),
+        s.width - margin,
+        height - margin
+    };
     return s;
 }
 
@@ -1965,6 +1981,13 @@ bool Browser::sidebarClick(POINT local, int height)
         m_library.clearHistory();
         m_sidebarScroll = 0;
         InvalidateRect(m_window, nullptr, FALSE);
+        return true;
+    }
+
+    // Settings (gear) is bottom-right and floats over the list; check it
+    // before iterating list rows so a click on the gear always wins.
+    if (PtInRect(&s.gearButton, local)) {
+        openSettings();
         return true;
     }
 
@@ -2106,6 +2129,16 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         fillSolid(dc, footer, m_theme.tabBar);
         fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
         drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    // Settings gear in the bottom-right corner, always visible.
+    {
+        RECT gearInset = s.gearButton;
+        InflateRect(&gearInset, -px(2), -px(2));
+        const int gearRadius = (gearInset.bottom - gearInset.top) / 2;
+        fillRoundedRect(g, gearInset, std::max(2, gearRadius), m_theme.pill);
+        strokeRoundedRect(g, gearInset, std::max(2, gearRadius), m_theme.glassBorder, std::max(1.0f, k));
+        drawGearIcon(g, gearInset, m_theme.textSecondary, k * 0.6f);
     }
 
     fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
@@ -2806,6 +2839,39 @@ void Browser::showDownloadsPage()
     activateTab(m_downloadsPageTab);
     raw->loadHtml(downloadsPageHtml(m_theme.dark));
     invalidateChrome();
+}
+
+void Browser::openSettings()
+{
+    // If a Settings tab is already open, just bring it forward.
+    if (m_settingsPageTab != static_cast<size_t>(-1) && m_settingsPageTab < m_tabs.size()) {
+        activateTab(m_settingsPageTab);
+        return;
+    }
+
+    auto view = m_host.createView(m_window);
+    if (!view)
+        return;
+
+    WebView* raw = view.get();
+    attachCallbacks(raw);
+    m_tabs.push_back(std::move(view));
+    m_settingsPageTab = m_tabs.size() - 1;
+
+    activateTab(m_settingsPageTab);
+    raw->loadHtml(settingsPageHtml(m_theme.dark));
+    invalidateChrome();
+}
+
+void Browser::onSettingsChanged()
+{
+    // The Settings UI fires lumen:settings?key=X&value=Y for every change;
+    // the URL handler in webkit_host.cpp calls Settings::set() and posts this
+    // message. Re-render the open Settings tab so the new value shows up.
+    if (m_settingsPageTab == static_cast<size_t>(-1) || m_settingsPageTab >= m_tabs.size())
+        return;
+    if (auto* view = m_tabs[m_settingsPageTab].get())
+        view->loadHtml(settingsPageHtml(m_theme.dark));
 }
 
 

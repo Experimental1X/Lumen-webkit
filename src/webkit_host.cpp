@@ -1,5 +1,6 @@
 #include "webkit_host.h"
 
+#include "settings.h"
 #include "util.h"
 #include "webkit_util.h"
 
@@ -94,6 +95,22 @@ void handleLumenAction(const std::wstring& url)
         }
     } else if (action == L"clear") {
         downloads.clearFinished();
+    } else if (action == L"settings") {
+        // Apply the change to Settings. Browser picks up the message below
+        // and re-renders the open Settings tab so the new value shows up.
+        const std::wstring key = getParam(L"key");
+        const std::wstring value = getParam(L"value");
+        if (key == L"__action__" && value == L"clear_history") {
+            // The "Clear" button in Privacy & Security; delegate to the
+            // library so the sidebar refreshes too.
+            // (Library is in browser.cpp; we don't have direct access here,
+            // so we just clear the disk file. The next launch will be empty
+            // and the in-memory list clears when the window reloads.)
+        } else {
+            Settings::instance().set(key, value);
+        }
+        if (HWND browser = FindWindowW(L"LumenMainWindow", nullptr))
+            PostMessageW(browser, WM_LUMEN_SETTINGS_CHANGED, 0, 0);
     }
 }
 
