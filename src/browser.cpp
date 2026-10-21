@@ -2157,21 +2157,33 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
         s.segments[i] = { left, s.segmented.top, right, s.segmented.bottom };
     }
 
-    const int footer = m_sidebarMode == 2 ? px(52) : 0;
-    const int listTop = s.segmented.bottom + margin;
-    s.list = { 0, listTop, s.width, std::max(listTop, height - footer) };
-    s.clearButton = { margin, height - px(42), s.width - margin, height - px(12) };
-
-    // Gear is a 36-px accent-filled circle in the bottom-left corner, aligned
-    // with the segmented control's left margin so it reads as the bottom of
-    // the sidebar column rather than a floating afterthought.
+    // The footer holds the always-visible gear (right at the bottom) and, in
+    // History mode, the "Clear History" button stacked above it. Each gets its
+    // own band so neither one bleeds onto the row list nor onto each other.
     const int gearSize = px(36);
+    const int gearBand = margin + gearSize;        // bottom band
+    const int clearBandHeight = px(40);
+    const int clearBand = m_sidebarMode == 2 ? (margin + clearBandHeight) : 0;
+
+    const int listTop = s.segmented.bottom + margin;
+    s.list = { 0, listTop, s.width, std::max(listTop, height - gearBand - clearBand) };
+
+    if (m_sidebarMode == 2) {
+        // Clear sits directly above the gear band.
+        s.clearButton = {
+            margin,
+            height - gearBand - clearBandHeight + (clearBandHeight - px(28)) / 2,
+            s.width - margin,
+            height - gearBand - (clearBandHeight - px(28)) / 2 };
+    }
+
+    // Gear at the very bottom-left, with the same left margin as the segmented
+    // control so the eye reads it as part of the sidebar column.
     s.gearButton = {
         margin,
-        std::max(listTop + margin, height - margin - gearSize),
+        std::max(listTop, height - margin - gearSize),
         margin + gearSize,
-        height - margin
-    };
+        height - margin };
     return s;
 }
 

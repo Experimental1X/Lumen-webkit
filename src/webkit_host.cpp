@@ -42,7 +42,7 @@ namespace {
 // link on a music page does not turn into a download.
 bool isDownloadUrl(const std::wstring& url)
 {
-    // Query string and fragment are not part of the file name.
+    // Fragment and query string are not part of the file name.
     std::wstring path = url;
     const size_t fragment = path.find(L'#');
     if (fragment != std::wstring::npos)
@@ -51,27 +51,47 @@ bool isDownloadUrl(const std::wstring& url)
     if (query != std::wstring::npos)
         path.resize(query);
 
+    // 1. The filename is the last segment of the path - if it ends with any
+    //    known binary extension, that is overwhelmingly a download.
     const size_t slash = path.find_last_of(L'/');
-    const size_t dot = path.find_last_of(L'.');
-    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash))
-        return false;
+    std::wstring filename = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
 
-    std::wstring ext = path.substr(dot);
-    for (wchar_t& c : ext)
-        c = static_cast<wchar_t>(towlower(static_cast<unsigned wchar_t>(c)));
+    if (!filename.empty()) {
+        std::wstring lowered = filename;
+        for (wchar_t& c : lowered)
+            c = static_cast<wchar_t>(towlower(static_cast<unsigned wchar_t>(c)));
+        static const wchar_t* const binary[] = {
+            L".zip", L".7z", L".rar", L".tar", L".gz", L".tgz", L".bz2",
+            L".xz", L".lz", L".lzma", L".zst",
+            L".iso", L".img", L".dmg", L".bin", L".cue",
+            L".exe", L".msi", L".msp", L".dll", L".cab", L".scr",
+            L".deb", L".rpm", L".pkg", L".apk", L".ipa",
+            L".jar", L".war",
+            L".pdf",
+        };
+        for (const wchar_t* ext : binary)
+            if (lowered.size() >= std::wcslen(ext)
+                && lowered.compare(lowered.size() - std::wcslen(ext), std::wcslen(ext), ext) == 0)
+                return true;
+    }
 
-    static const wchar_t* const binary[] = {
-        L".zip", L".7z", L".rar", L".tar", L".gz", L".tgz", L".bz2",
-        L".xz", L".lz", L".lzma", L".zst",
-        L".iso", L".img", L".dmg", L".bin", L".cue",
-        L".exe", L".msi", L".msp", L".dll", L".cab", L".scr",
-        L".deb", L".rpm", L".pkg", L".apk", L".ipa",
-        L".jar", L".war",
-        L".pdf",
+    // 2. Many file hosts and CDNs use a path like /download/abc/setup.exe
+    //    where the path itself advertises the intent even if there is no
+    //    trailing extension. Sniff those patterns.
+    const std::wstring loweredPath = [&] {
+        std::wstring s = path;
+        for (wchar_t& c : s)
+            c = static_cast<wchar_t>(towlower(static_cast<unsigned wchar_t>(c)));
+        return s;
+    }();
+    static const wchar_t* const markers[] = {
+        L"/download/", L"/downloads/", L"/getfile/", L"/get/", L"/file/",
+        L"/releases/download/", L"/releases/tag/",
     };
-    for (const wchar_t* candidate : binary)
-        if (ext == candidate)
+    for (const wchar_t* marker : markers)
+        if (loweredPath.find(marker) != std::wstring::npos)
             return true;
+
     return false;
 }
 
