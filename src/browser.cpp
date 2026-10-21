@@ -2160,30 +2160,40 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
     // The footer holds the always-visible gear (right at the bottom) and, in
     // History mode, the "Clear History" button stacked above it. Each gets its
     // own band so neither one bleeds onto the row list nor onto each other.
-    const int gearSize = px(36);
+    const int gearSize = px(32);
     const int gearBand = margin + gearSize;        // bottom band
-    const int clearBandHeight = px(40);
-    const int clearBand = m_sidebarMode == 2 ? (margin + clearBandHeight) : 0;
+    const int clearHeight = px(28);
+    const int clearGap = px(18);                   // visible breathing room above the gear
 
-    const int listTop = s.segmented.bottom + margin;
-    s.list = { 0, listTop, s.width, std::max(listTop, height - gearBand - clearBand) };
+    // Gear always sits in its own band at the very bottom of the sidebar.
+    const int gearTop = std::max(listTop, height - gearBand);
+    const int gearBottom = height - margin;
+
+    int listBottom = gearTop - margin;
+    int clearTop = 0, clearBottom = 0;
+    if (m_sidebarMode == 2) {
+        clearBottom = std::max(listTop + clearHeight, gearTop - clearGap);
+        clearTop = clearBottom - clearHeight;
+        listBottom = clearTop - margin;
+    }
+    s.list = { 0, listTop, s.width, std::max(listTop, listBottom) };
 
     if (m_sidebarMode == 2) {
-        // Clear sits directly above the gear band.
+        // Clear sits directly above the gear band with a real gap between them.
         s.clearButton = {
             margin,
-            height - gearBand - clearBandHeight + (clearBandHeight - px(28)) / 2,
+            clearTop,
             s.width - margin,
-            height - gearBand - (clearBandHeight - px(28)) / 2 };
+            clearBottom };
     }
 
     // Gear at the very bottom-left, with the same left margin as the segmented
     // control so the eye reads it as part of the sidebar column.
     s.gearButton = {
         margin,
-        std::max(listTop, height - margin - gearSize),
+        gearTop,
         margin + gearSize,
-        height - margin };
+        gearBottom };
     return s;
 }
 
@@ -2318,9 +2328,23 @@ void Browser::sidebarMove(POINT local, int height)
     if (hoverRow == m_sidebarHoverRow && hoverClose == m_sidebarHoverClose)
         return;
 
+    // The previous hover row needs to lose its highlight, the new row needs
+    // to gain one. The actual updated band is at most two row-high slices of
+    // the list plus the footer; repainting the whole window clears the page
+    // area behind the WebView and produces a flicker every time the cursor
+    // crosses a row, so we invalidate the sidebar bounds only.
+    int heightPx = 0;
+    {
+        RECT client { };
+        GetClientRect(m_window, &client);
+        heightPx = std::max(0, static_cast<int>(client.bottom));
+    }
+    const int chromeH = chromeHeight();
+    RECT sidebarArea { 0, chromeH, s.width, heightPx };
+    InvalidateRect(m_window, &sidebarArea, FALSE);
+
     m_sidebarHoverRow = hoverRow;
     m_sidebarHoverClose = hoverClose;
-    InvalidateRect(m_window, nullptr, FALSE);
 }
 
 void Browser::paintSidebar(HDC dc, int width, int height)

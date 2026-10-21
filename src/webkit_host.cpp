@@ -59,7 +59,7 @@ bool isDownloadUrl(const std::wstring& url)
     if (!filename.empty()) {
         std::wstring lowered = filename;
         for (wchar_t& c : lowered)
-            c = static_cast<wchar_t>(towlower(static_cast<unsigned wchar_t>(c)));
+            c = static_cast<wchar_t>(towlower(static_cast<int>(c)));
         static const wchar_t* const binary[] = {
             L".zip", L".7z", L".rar", L".tar", L".gz", L".tgz", L".bz2",
             L".xz", L".lz", L".lzma", L".zst",
@@ -81,7 +81,7 @@ bool isDownloadUrl(const std::wstring& url)
     const std::wstring loweredPath = [&] {
         std::wstring s = path;
         for (wchar_t& c : s)
-            c = static_cast<wchar_t>(towlower(static_cast<unsigned wchar_t>(c)));
+            c = static_cast<wchar_t>(towlower(static_cast<int>(c)));
         return s;
     }();
     static const wchar_t* const markers[] = {
