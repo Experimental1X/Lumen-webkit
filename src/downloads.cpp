@@ -56,8 +56,8 @@ std::wstring sanitizeFilename(const std::wstring& name)
     for (auto& ch : stem)
         ch = static_cast<wchar_t>(towupper(ch));
     static const wchar_t* const reserved[] = { L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4", L"LPT1", L"LPT2", L"LPT3" };
-    for (const wchar_t* name : reserved) {
-        if (stem == name) {
+    for (const wchar_t* blocked : reserved) {
+        if (stem == blocked) {
             result = L"_" + result;
             break;
         }

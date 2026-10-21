@@ -185,7 +185,7 @@ inline std::string settingsPageHtml(bool dark)
             icon("<rect x='1.9' y='2.9' width='12.2' height='10.2' rx='1.9'/>"
                  "<path d='M1.9 6.3h12.2'/>") },
         { "privacy", "Privacy & Security",
-            icon("<path d='M8 1.5 13.1 3.4v4.3c0 3.3-2.15 5.9-5.1 6.9'
+            icon("<path d='M8 1.5 13.1 3.4v4.3c0 3.3-2.15 5.9-5.1 6.9'"
                      " -2.95-1-5.1-3.6-5.1-6.9V3.4z'/>") },
         { "search", "Search",
             icon("<circle cx='6.9' cy='6.9' r='4.45'/><path d='M10.2 10.2 14 14'/>") },
@@ -196,8 +196,8 @@ inline std::string settingsPageHtml(bool dark)
             icon("<rect x='1.7' y='3.7' width='12.6' height='8.6' rx='1.9'/>"
                  "<path d='M1.7 6.7h12.6'/><path d='M4.2 9.6h3.2'/>") },
         { "extensions", "Extensions",
-            icon("<path d='M6.6 2.2h2.8v1.9h2.2a1 1 0 0 1 1 1v2.2h1.9v2.8h-1.9v2.2'
-                     "a1 1 0 0 1-1 1H9.4v1.9H6.6v-1.9H4.4a1 1 0 0 1-1-1V10.1H1.5'
+            icon("<path d='M6.6 2.2h2.8v1.9h2.2a1 1 0 0 1 1 1v2.2h1.9v2.8h-1.9v2.2'"
+                     "a1 1 0 0 1-1 1H9.4v1.9H6.6v-1.9H4.4a1 1 0 0 1-1-1V10.1H1.5'"
                      "V7.3h1.9V5.1a1 1 0 0 1 1-1h2.2z'/>") },
         { "engines", "Search Engines",
             icon("<circle cx='11.3' cy='11.3' r='2.7'/><path d='M13.4 13.4 15 15'/>"
@@ -210,13 +210,13 @@ inline std::string settingsPageHtml(bool dark)
                  "<path d='M8 1.95c1.75 2.05 2.7 4 2.7 6.05S9.75 11.95 8 14.05'/>"
                  "<path d='M8 1.95C6.25 4 5.3 5.95 5.3 8S6.25 11.95 8 14.05'/>") },
         { "controllers", "Game Controllers",
-            icon("<path d='M4.5 5.4h7a3.5 3.5 0 0 1 3.45 4.4l-.42 1.9'
-                     "a1.75 1.75 0 0 1-3.1.55L10.2 10.4H5.8l-1.23 1.85'
+            icon("<path d='M4.5 5.4h7a3.5 3.5 0 0 1 3.45 4.4l-.42 1.9'"
+                     "a1.75 1.75 0 0 1-3.1.55L10.2 10.4H5.8l-1.23 1.85'"
                      "a1.75 1.75 0 0 1-3.1-.55l-.42-1.9A3.5 3.5 0 0 1 4.5 5.4z'/>"
                  "<path d='M4.7 7.9v1.8M3.8 8.8h1.8'/>"
                  "<circle cx='10.9' cy='8.4' r='.75'/><circle cx='12.5' cy='10' r='.75'/>") },
         { "reading", "Reading List",
-            icon("<path d='M2.4 3.1h3.7a2.05 2.05 0 0 1 1.9 1.35 2.05 2.05 0 0 1 1.9-1.35'
+            icon("<path d='M2.4 3.1h3.7a2.05 2.05 0 0 1 1.9 1.35 2.05 2.05 0 0 1 1.9-1.35'"
                      "h3.7v9.7h-3.7a1.65 1.65 0 0 0-1.9 1.25 1.65 1.65 0 0 0-1.9-1.25H2.4z'/>"
                  "<path d='M8 4.45v9.6'/>") },
         { "downloads", "Downloads",
