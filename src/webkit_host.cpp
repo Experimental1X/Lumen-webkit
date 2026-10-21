@@ -510,15 +510,23 @@ void WebView::decideNavigationAction(WKPageRef, WKNavigationActionRef action, WK
     // send Content-Disposition: attachment, so the attachment check alone
     // missed them and the bytes got rendered into the tab as mojibake
     // beginning "MZ" or "PK".
+    //
+    // This is now the only place a download is recognised, so say so in the
+    // log. If a download does not appear, "Download attached" is missing from
+    // the log while these lines are not, which says the URL never reached this
+    // function at all; the opposite says the rule fired and the failure is
+    // somewhere inside WebKit's own download machinery.
     if (!wurl.empty() && isDownloadUrl(wurl)) {
+        log(L"Download rule matched on URL: " + wurl);
         WKFramePolicyListenerDownload(listener);
         return;
     }
 
     // <a download> and similar requests become downloads; the rest load.
-    if (WKNavigationActionShouldPerformDownload(action))
+    if (WKNavigationActionShouldPerformDownload(action)) {
+        log(L"Download rule matched on the navigation action: " + wurl);
         WKFramePolicyListenerDownload(listener);
-    else
+    } else
         WKFramePolicyListenerUse(listener);
 }
 

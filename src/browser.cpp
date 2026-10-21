@@ -106,6 +106,7 @@ Browser::~Browser()
 {
     destroy();
     releaseBackBuffer();
+    releaseOverviewSurface();
     if (m_font)
         DeleteObject(m_font);
     if (m_addressBrush)
@@ -1580,11 +1581,27 @@ void Browser::paintBuffered(HDC target, const RECT& area, const std::function<vo
     // Confine the drawing to the damaged slice, and blit from the same place
     // in the buffer rather than from its corner - otherwise a partial repaint
     // would put the wrong pixels on screen.
+    //
+    // The draw callbacks paint in their *own* coordinates, with (0,0) at the
+    // top-left of whatever they own. The chrome starts at the top of the
+    // client so its origin is already (0,0), but the sidebar and the overview
+    // start below the chrome and paint from (0,0) too. The buffer, on the
+    // other hand, shares the client's origin, so for those two the origin has
+    // to be moved onto the area's corner first. Without this the top
+    // chromeHeight() pixels of the sidebar and the overview fall outside the
+    // clip region and are thrown away, and the blit reads rows that were
+    // never drawn - which is what collapsed the tab overview into a thin
+    // strip along the top of an otherwise black window.
+    POINT previousOrigin { };
+    SetViewportOrgEx(m_backDC, area.left, area.top, &previousOrigin);
+
     HRGN clip = CreateRectRgnIndirect(&area);
     SelectClipRgn(m_backDC, clip);
     DeleteObject(clip);
 
     draw(m_backDC);
+
+    SetViewportOrgEx(m_backDC, previousOrigin.x, previousOrigin.y, nullptr);
 
     BitBlt(target, area.left, area.top, width, height,
         m_backDC, area.left, area.top, SRCCOPY);
@@ -2134,6 +2151,12 @@ void Browser::overviewMove(POINT local, int width)
     InvalidateRect(m_window, nullptr, FALSE);
 }
 
+void Browser::releaseOverviewSurface()
+{
+    delete m_overviewSurface;
+    m_overviewSurface = nullptr;
+}
+
 void Browser::paintOverview(HDC dc, int width, int height)
 {
     // The overview eases in and out, so it is drawn offscreen and composited
@@ -2144,9 +2167,25 @@ void Browser::paintOverview(HDC dc, int width, int height)
     if (t <= 0.002 || width <= 0 || height <= 0)
         return;
 
-    Gdiplus::Bitmap buffer(width, height, PixelFormat32bppPARGB);
+    // Compositing needs a scratch surface the size of the content area, and a
+    // 1920-wide one at four bytes a pixel is about seven megabytes. Building
+    // one per paint threw away that much memory a dozen times a second for the
+    // whole time the grid was animating, which is a lot of allocator churn on
+    // the thread that also has to answer clicks. Keep one and grow it only when
+    // the window outgrows it; paintOverviewContent fills the whole surface
+    // before it draws anything, so nothing stale can survive.
+    if (!m_overviewSurface
+        || m_overviewSurface->GetWidth() < width
+        || m_overviewSurface->GetHeight() < height) {
+        releaseOverviewSurface();
+        m_overviewSurface = new Gdiplus::Bitmap(width, height, PixelFormat32bppPARGB);
+        log(L"Overview surface resized.");
+    }
+    if (!m_overviewSurface)
+        return;
+
     {
-        Gdiplus::Graphics scratch(&buffer);
+        Gdiplus::Graphics scratch(m_overviewSurface);
         scratch.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         HDC bufferDc = scratch.GetHDC();
         paintOverviewContent(bufferDc, width, height);
@@ -2176,7 +2215,7 @@ void Browser::paintOverview(HDC dc, int width, int height)
         static_cast<Gdiplus::REAL>(height * (1.0 - scale) * 0.5),
         static_cast<Gdiplus::REAL>(width * scale),
         static_cast<Gdiplus::REAL>(height * scale));
-    g.DrawImage(&buffer, destRect,
+    g.DrawImage(m_overviewSurface, destRect,
         0.0f, 0.0f,
         static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
         Gdiplus::UnitPixel, &attributes);

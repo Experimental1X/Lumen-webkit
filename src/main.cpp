@@ -11,11 +11,13 @@
 #include <windows.h>
 #include <windowsx.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cwchar>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -100,6 +102,162 @@ HACCEL createAccelerators()
         { FCONTROL | FVIRTKEY, 'J', kCmdDownloads },
     };
     return CreateAcceleratorTableW(keys, static_cast<int>(sizeof(keys) / sizeof(keys[0])));
+}
+
+// ---------------------------------------------------------------------------
+// Freeze diagnostics
+// ---------------------------------------------------------------------------
+//
+// The window has been seen to stop answering clicks entirely - tab switching
+// dead, close button dead, page still faintly repainting underneath - while
+// the machine stayed alive. Nothing in the log said where the UI thread went,
+// because "the UI is frozen" is a symptom, not a cause, and there are several
+// very different ways to get here: stuck inside one handler, stuck in a wait
+// that never returns, or spinning through a queue that never drains. Guessing
+// has already cost a few build cycles.
+//
+// So the pump keeps a small ring of the messages it has run, marking each one
+// as it starts and again as it finishes, and a watchdog thread watches that
+// ring move. A one-hertz timer on the window gives the pump a message even
+// when nothing else is happening, which is what distinguishes "idle and
+// healthy" from "wedged". When the ring stops, the watchdog writes the last
+// message that started and never finished: that is the handler the thread was
+// sitting in, named outright.
+//
+// The watchdog writes to its own file rather than to lumen.log. lumen::log
+// opens and closes the file through the CRT, and the UI thread may itself be
+// stuck inside one of those calls - in which case reusing it would hang the
+// watchdog too and lose the diagnosis it exists to capture.
+constexpr UINT_PTR kPumpTimer = 0x4C01;
+constexpr size_t kPumpRingSize = 64;
+// Silence this long is a wedge: the timer fires every second, so a healthy
+// pump cannot go a full five without being seen.
+constexpr unsigned long long kPumpStaleMs = 5000;
+// ...and if it is still stuck this much later the process is going nowhere,
+// so end it rather than leave a dead window that has to be killed by hand.
+constexpr unsigned long long kPumpExitMs = 15000;
+
+struct PumpEntry {
+    UINT message { 0 };
+    WPARAM wParam { 0 };
+    LPARAM lParam { 0 };
+    unsigned long long stamp { 0 };
+    bool completed { false };
+};
+
+// Written by the UI thread only.
+PumpEntry g_ring[kPumpRingSize];
+size_t g_ringNext { 0 };
+// Read by the watchdog thread.
+std::atomic<unsigned long long> g_lastBeat { 0 };
+std::atomic<bool> g_pumpStopping { false };
+std::atomic<bool> g_pumpReported { false };
+
+void pumpRecord(UINT message, WPARAM wParam, LPARAM lParam, bool completed)
+{
+    PumpEntry& entry = g_ring[g_ringNext];
+    g_ringNext = (g_ringNext + 1) % kPumpRingSize;
+    entry.message = message;
+    entry.wParam = wParam;
+    entry.lParam = lParam;
+    entry.stamp = GetTickCount64();
+    entry.completed = completed;
+    g_lastBeat.store(entry.stamp, std::memory_order_release);
+}
+
+// Plain Win32 append. Deliberately not lumen::log - see the note above.
+void watchdogLog(const std::wstring& text)
+{
+    const std::wstring path = lumen::executableDirectory() + L"\\lumen-watchdog.log";
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+
+    SYSTEMTIME now { };
+    GetLocalTime(&now);
+    wchar_t stamp[32] { };
+    std::swprintf(stamp, std::size(stamp), L"[%02d:%02d:%02d] ",
+        now.wHour, now.wMinute, now.wSecond);
+
+    const std::wstring line = std::wstring(stamp) + text + L"\r\n";
+    DWORD written = 0;
+    WriteFile(file, line.c_str(), static_cast<DWORD>(line.size() * sizeof(wchar_t)), &written, nullptr);
+    CloseHandle(file);
+}
+
+void pumpWatchdog()
+{
+    while (!g_pumpStopping.load(std::memory_order_acquire)) {
+        Sleep(500);
+
+        const unsigned long long now = GetTickCount64();
+        const unsigned long long beat = g_lastBeat.load(std::memory_order_acquire);
+        if (beat == 0 || now - beat < kPumpStaleMs)
+            continue;
+
+        if (!g_pumpReported.exchange(true)) {
+            // The culprit is the newest entry that started and never finished.
+            // The array wraps, so walk it from the next free slot to keep the
+            // answer "the last thing that began" whatever the wrap point is.
+            const PumpEntry* stuck = nullptr;
+            for (size_t step = 0; step < kPumpRingSize; ++step) {
+                const PumpEntry& entry = g_ring[(g_ringNext + step) % kPumpRingSize];
+                if (entry.stamp != 0 && !entry.completed)
+                    stuck = &entry;
+            }
+
+            wchar_t line[320] { };
+            if (stuck) {
+                std::swprintf(line, std::size(line),
+                    L"UI THREAD STALLED for %llu ms. Stuck inside: msg=0x%04X wParam=0x%llX lParam=0x%llX.",
+                    now - beat,
+                    static_cast<unsigned>(stuck->message),
+                    static_cast<unsigned long long>(stuck->wParam),
+                    static_cast<unsigned long long>(stuck->lParam));
+            } else {
+                std::swprintf(line, std::size(line),
+                    L"UI THREAD STALLED for %llu ms between messages - the pump is not being reached, so this is a spin or a wait, not a handler.",
+                    now - beat);
+            }
+            watchdogLog(line);
+
+            // Dump the recent history too. A handler can complete but leave
+            // something behind that only bites on the next pass.
+            wchar_t tail[1024] { };
+            std::size_t used = 0;
+            for (size_t step = 0; step < kPumpRingSize && used < 900u; ++step) {
+                const PumpEntry& entry = g_ring[(g_ringNext + step) % kPumpRingSize];
+                if (entry.stamp == 0)
+                    continue;
+                const int written = std::swprintf(tail + used, std::size(tail) - used,
+                    L"  %6llu ms ago  msg=0x%04X wParam=0x%llX %s\r\n",
+                    now - entry.stamp,
+                    static_cast<unsigned>(entry.message),
+                    static_cast<unsigned long long>(entry.wParam),
+                    entry.completed ? "done" : "STUCK");
+                // A negative return means the line did not fit or failed to
+                // encode; either way there is nothing useful left to add, and
+                // adding it would run the index off the end of the buffer.
+                if (written <= 0)
+                    break;
+                used += static_cast<std::size_t>(written);
+                if (used >= std::size(tail))
+                    used = std::size(tail) - 1;
+            }
+            watchdogLog(std::wstring(L"Recent messages, oldest first:") + L"\r\n" + tail);
+        }
+
+        if (now - beat >= kPumpExitMs) {
+            watchdogLog(L"UI thread never came back; ending the process so the window is not left dead.");
+            // There is no clean shutdown available: the thread that owns the
+            // WebKit objects is the one stuck, and TerminateProcess is the
+            // only way out that still gives us a usable desktop.
+            TerminateProcess(GetCurrentProcess(), 2);
+            return;
+        }
+    }
 }
 
 LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -218,6 +376,13 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         break;
 
     case WM_TIMER:
+        // The pump's own heartbeat. It exists only so that a healthy but idle
+        // browser still produces a message once a second, which is what lets
+        // the watchdog tell "nothing is happening" apart from "the thread is
+        // stuck". Browser has timers of its own on the same window and must
+        // not be handed this one.
+        if (wParam == kPumpTimer)
+            return 0;
         if (browser)
             browser->onTimer(wParam);
         return 0;
@@ -342,13 +507,31 @@ int run(HINSTANCE instance, int showCommand)
     ShowWindow(window, showCommand);
     UpdateWindow(window);
 
+    // Start the watchdog and the heartbeat before the pump, so a stall during
+    // startup is caught too.
+    lumen::log(L"Pump watchdog running: a wedged UI thread is written to lumen-watchdog.log after 5 s.");
+    g_pumpStopping.store(false, std::memory_order_release);
+    g_pumpReported.store(false, std::memory_order_release);
+    SetTimer(window, kPumpTimer, 1000, nullptr);
+    std::thread watchdog(pumpWatchdog);
+
     MSG message { };
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        if (accelerators && TranslateAcceleratorW(window, accelerators, &message))
+        pumpRecord(message.message, message.wParam, message.lParam, false);
+
+        if (accelerators && TranslateAcceleratorW(window, accelerators, &message)) {
+            pumpRecord(message.message, message.wParam, message.lParam, true);
             continue;
+        }
+
         TranslateMessage(&message);
         DispatchMessageW(&message);
+        pumpRecord(message.message, message.wParam, message.lParam, true);
     }
+
+    KillTimer(window, kPumpTimer);
+    g_pumpStopping.store(true, std::memory_order_release);
+    watchdog.join();
 
     if (accelerators)
         DestroyAcceleratorTable(accelerators);

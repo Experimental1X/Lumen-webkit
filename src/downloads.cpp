@@ -374,6 +374,7 @@ void Downloads::attach(WKDownloadRef download)
         Lock lock(m_lock);
         if (findLocked(download)) {
             WKRelease(download);
+            log(L"Download attach: already known, ignoring duplicate.");
             return;
         }
 
@@ -387,6 +388,11 @@ void Downloads::attach(WKDownloadRef download)
             auto url = adopt(WKURLRequestCopyURL(request.get()));
             item.source = hostFromUrl(toWide(url.get()));
         }
+
+        // Read the host out before item is moved into the list below; after
+        // the move it is a moved-from string and would log as empty.
+        const std::wstring origin = item.source.empty() ? L"(unknown host)" : item.source;
+        const int id = static_cast<int>(item.id);
 
         m_items.insert(m_items.begin(), std::move(item));
 
@@ -403,9 +409,15 @@ void Downloads::attach(WKDownloadRef download)
 
         m_clients[download] = std::move(client);
         WKDownloadSetClient(download, &m_clients[download]->base);
+
+        // Name the item here. A panel that opens with nothing in it, or a
+        // download that never reaches decideDestination, is impossible to tell
+        // apart from the log without knowing whether WebKit ever handed us one.
+        log(L"Download attached: id=" + std::to_wstring(id)
+            + L" from " + origin
+            + L", " + std::to_wstring(m_items.size()) + L" in the list.");
     }
 
-    log(L"Download started.");
     notify(true);
 }
 

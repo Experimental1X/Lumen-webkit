@@ -251,6 +251,12 @@ private:
     LONG m_backWidth { 0 };
     LONG m_backHeight { 0 };
     void releaseBackBuffer();
+    // Scratch surface for the overview's alpha composite. Compositing needs a
+    // bitmap the size of the content area; allocating one inside every paint
+    // meant roughly seven megabytes a tick, a dozen times a second while the
+    // grid eases in and out.
+    Gdiplus::Bitmap* m_overviewSurface { nullptr };
+    void releaseOverviewSurface();
     void drawLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text, RECT rect, COLORREF color, UINT flags) const;
     int measureLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text) const;
 
