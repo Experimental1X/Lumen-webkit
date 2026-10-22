@@ -3095,7 +3095,11 @@ Browser::SidebarLayout Browser::sidebarLayout(int width, int height) const
     const int insetRight = std::max(margin, s.width - margin);
     s.segmented = { margin, margin, insetRight, margin + px(30) };
 
-    const int segmentWidth = std::max(0, (s.segmented.right - s.segmented.left) / 3);
+    // The cast is load-bearing: RECT's members are LONG, so the subtraction and
+    // the division are LONG, and std::max(0, LONG) has no single _Ty that both
+    // arguments convert to - it fails to deduce, C2672, and everything after it
+    // cascades. Same trap as the paintBuffered fix in task #33.
+    const int segmentWidth = std::max(0, static_cast<int>((s.segmented.right - s.segmented.left) / 3));
     for (int i = 0; i < 3; ++i) {
         const int left = s.segmented.left + i * segmentWidth;
         const int right = i == 2 ? s.segmented.right : left + segmentWidth;
