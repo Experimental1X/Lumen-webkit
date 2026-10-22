@@ -666,67 +666,86 @@ void Browser::resize(bool wholeClient)
     const int viewWidth = std::max<int>(0, static_cast<int>(client.right) - viewLeft);
     const int viewHeight = std::max<int>(0, static_cast<int>(client.bottom - l.totalHeight));
 
-    for (const auto& tab : m_tabs) {
-        HWND viewWindow = tab->hwnd();
-        if (!viewWindow)
-            continue;
+    // While the overview is up, or easing out, every tab view is hidden. There
+    // is nothing on screen that their geometry could be wrong about, so moving
+    // them buys no pixels - but it is not free, and it is not harmless.
+    //
+    // MoveWindow on a WebKit child costs a re-layout every time, and a child
+    // that is repositioned while it is hidden is a child that can come back
+    // visible. When it does, it paints its own black straight over the overview.
+    // That is the second failure in the 2026-10-22 60fps recording: with the
+    // grid settled, the content area right of x=350 went to RGB(4,4,4) and
+    // stayed there for two and a half seconds. 4,4,4 is not our fill -
+    // m_theme.page is RGB(30,30,32), which measures 30 - it is the view
+    // window's class background, and the edge lands at exactly 350, which is
+    // px(kSidebarWidth) at 125% DPI: the view's own left edge.
+    const bool overviewOwnsThePage = m_overview || m_overviewAnim.value > 0.0;
 
-        // Moving the view already repaints it and invalidates the strip it
-        // vacated, so only the chrome we own ourselves needs a nudge. Handing
-        // MoveWindow a geometry it already has would still cost a full
-        // WebKit re-layout, and an animation runs this a dozen times a second.
-        RECT current { };
-        GetWindowRect(viewWindow, &current);
-        MapWindowPoints(HWND_DESKTOP, m_window, reinterpret_cast<POINT*>(&current), 2);
-        if (current.left == viewLeft && current.top == l.totalHeight
-            && current.right - current.left == viewWidth
-            && current.bottom - current.top == viewHeight)
-            continue;
+    if (!overviewOwnsThePage) {
+        for (const auto& tab : m_tabs) {
+            HWND viewWindow = tab->hwnd();
+            if (!viewWindow)
+                continue;
 
-        MoveWindow(viewWindow, viewLeft, l.totalHeight, viewWidth, viewHeight, TRUE);
+            // Moving the view already repaints it and invalidates the strip it
+            // vacated, so only the chrome we own ourselves needs a nudge.
+            // Handing MoveWindow a geometry it already has would still cost a
+            // full WebKit re-layout, and an animation runs this a dozen times
+            // a second.
+            RECT current { };
+            GetWindowRect(viewWindow, &current);
+            MapWindowPoints(HWND_DESKTOP, m_window, reinterpret_cast<POINT*>(&current), 2);
+            if (current.left == viewLeft && current.top == l.totalHeight
+                && current.right - current.left == viewWidth
+                && current.bottom - current.top == viewHeight)
+                continue;
 
-        // ...except it does not, quite. MoveWindow invalidates the child and
-        // asks Windows to repaint it, but the freshly exposed strip is not part
-        // of the frame WebKit last rendered, and until the next one catches up
-        // the area shows the view window's class background - which is black.
-        // That is the "the sidebar still draws that black side on right when
-        // switching it on/off" report: a solid black band down the right edge of
-        // the page for the whole length of the toggle.
-        //
-        // Measured in the 2026-10-22 recording, the page's left edge tracks the
-        // sidebar exactly (131, 253 and 326 px as the spring moved) while its
-        // right edge fell 95-97px short of the window's, so the geometry passed
-        // to MoveWindow is right and what is missing is the paint.
-        //
-        // RDW_INVALIDATE ONLY. update-21 also passed RDW_UPDATENOW, which asks
-        // for the repaint to happen *now*, synchronously, inside this call.
-        // Forcing a WebKit child to repaint dozens of times a second means most
-        // of those repaints land before WebKit has produced a new frame, so
-        // the child paints its black class background again. RDW_ERASE stays
-        // out for the same reason: erasing is the flash this whole design
-        // avoids.
-        //
-        // The repeated-move half of that same black is gone for a different
-        // reason, up at viewLeft: the view is placed at the sidebar's settled
-        // width, so this block runs once per toggle rather than once per tick.
-        // What is left is a single reflow, and its strip clears on the next
-        // frame WebKit produces rather than being forced.
-        if (!wholeClient)
-            RedrawWindow(viewWindow, nullptr, nullptr, RDW_INVALIDATE);
+            MoveWindow(viewWindow, viewLeft, l.totalHeight, viewWidth, viewHeight, TRUE);
 
-        // ...and the strip this window now owns on the right of the view.
-        //
-        // When the sidebar opens the view narrows by its width, and the band
-        // from the view's new right edge out to where its old one was stops
-        // belonging to anybody. MoveWindow's bRepaint=TRUE does ask for that to
-        // be repainted, but it asks the child's parent at a moment of Windows'
-        // choosing, and the original report - "that black side on right when
-        // switching it on/off" - is what it looks like when that ask is not
-        // serviced. One explicit invalidate costs nothing and settles it.
-        const LONG exposedRight = static_cast<LONG>(viewLeft + viewWidth);
-        if (exposedRight < current.right) {
-            RECT exposed { 0, l.totalHeight, exposedRight, current.right };
-            InvalidateRect(m_window, &exposed, FALSE);
+            // ...except it does not, quite. MoveWindow invalidates the child and
+            // asks Windows to repaint it, but the freshly exposed strip is not
+            // part of the frame WebKit last rendered, and until the next one
+            // catches up the area shows the view window's class background -
+            // which is black. That is the "the sidebar still draws that black
+            // side on right when switching it on/off" report: a solid black band
+            // down the right edge of the page for the whole length of the toggle.
+            //
+            // Measured in the 2026-10-22 recording, the page's left edge tracks
+            // the sidebar exactly (131, 253 and 326 px as the spring moved) while
+            // its right edge fell 95-97px short of the window's, so the geometry
+            // passed to MoveWindow is right and what is missing is the paint.
+            //
+            // RDW_INVALIDATE ONLY. update-21 also passed RDW_UPDATENOW, which
+            // asks for the repaint to happen *now*, synchronously, inside this
+            // call. Forcing a WebKit child to repaint dozens of times a second
+            // means most of those repaints land before WebKit has produced a new
+            // frame, so the child paints its black class background again.
+            // RDW_ERASE stays out for the same reason: erasing is the flash this
+            // whole design avoids.
+            //
+            // The repeated-move half of that same black is gone for a different
+            // reason, up at viewLeft: the view is placed at the sidebar's
+            // settled width, so this block runs once per toggle rather than once
+            // per tick. What is left is a single reflow, and its strip clears on
+            // the next frame WebKit produces rather than being forced.
+            if (!wholeClient)
+                RedrawWindow(viewWindow, nullptr, nullptr, RDW_INVALIDATE);
+
+            // ...and the strip this window now owns on the right of the view.
+            //
+            // When the sidebar opens the view narrows by its width, and the band
+            // from the view's new right edge out to where its old one was stops
+            // belonging to anybody. MoveWindow's bRepaint=TRUE does ask for that
+            // to be repainted, but it asks the child's parent at a moment of
+            // Windows' choosing, and the original report - "that black side on
+            // right when switching it on/off" - is what it looks like when that
+            // ask is not serviced. One explicit invalidate costs nothing and
+            // settles it.
+            const LONG exposedRight = static_cast<LONG>(viewLeft + viewWidth);
+            if (exposedRight < current.right) {
+                RECT exposed { 0, l.totalHeight, exposedRight, current.right };
+                InvalidateRect(m_window, &exposed, FALSE);
+            }
         }
     }
 
@@ -735,7 +754,12 @@ void Browser::resize(bool wholeClient)
     // repainting it means clearing the fill behind the web view and watching
     // it flash - so an animation tick leaves it alone and lets MoveWindow's
     // own repaint deal with the strip that opened up.
-    if (wholeClient)
+    //
+    // The overview is the exception: it owns the whole content area, so a resize
+    // under it has to repaint all of it. invalidateSidebarColumn would hand it
+    // a 350px strip and leave the rest of the grid showing the last frame's
+    // layout, which is how a resize while the overview was up used to shear it.
+    if (wholeClient || overviewOwnsThePage)
         InvalidateRect(m_window, nullptr, FALSE);
     else
         invalidateSidebarColumn();
@@ -2235,7 +2259,20 @@ void Browser::onPaint(HDC target)
 
     // The page fill is drawn straight to the DC - it is a single opaque
     // rectangle - so it only runs when it is inside the update region.
-    if (update.top < content.bottom) {
+    //
+    // It does not run at all while the overview is up. The overview is opaque
+    // and owns the entire content area, and every tab view is hidden for as long
+    // as it is on screen, so there is nothing underneath to protect - but
+    // putting the fill down anyway is what turned a lost composite into a hole.
+    //
+    // Measured across the 2026-10-22 60fps recording: with the grid settled at a
+    // content-area mean of 66.6, that area alternated for fifteen seconds between
+    // the overview and a flat RGB(33,32,35). That is m_theme.page; the overview's
+    // own backdrop is RGB(22,22,24) and reads 26,25,28 on screen. Runs of 4 to
+    // 35 frames each way at roughly 3Hz - the scroll rate - so the composite was
+    // being lost on some paints and not on others, and every paint that lost it
+    // showed the bare fill underneath. That is the flicker.
+    if (!overviewUp && update.top < content.bottom) {
         RECT pageArea { std::max<LONG>(update.left, 0), content.top,
             std::min<LONG>(update.right, width), content.bottom };
         if (pageArea.right > pageArea.left && pageArea.bottom > pageArea.top)
@@ -2248,16 +2285,18 @@ void Browser::onPaint(HDC target)
     const POINT contentOrigin { 0, l.totalHeight };
 
     if (overviewUp) {
-        if (update.top < content.bottom) {
-            RECT area = content;
-            IntersectRect(&area, &area, &update);
-            paintBuffered(target, area, contentOrigin, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
-        }
+        // The whole content area, never content-interior-update. Both panels are
+        // opaque and both are composited out of a buffer in a single BitBlt, so
+        // honouring the update region cannot make either of them cheaper - it can
+        // only make them wrong, because an update region that clipped the
+        // composite left whatever was underneath showing through. paintBuffered
+        // still confines its own drawing to the rectangle it is handed, so this
+        // asks for the full area rather than removing any clipping.
+        if (update.top < content.bottom)
+            paintBuffered(target, content, contentOrigin, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
     } else if (sidebarWidth > 0 && update.left < sidebarWidth && update.top < content.bottom) {
         const RECT panel { 0, l.totalHeight, sidebarWidth, l.totalHeight + contentHeight };
-        RECT area = panel;
-        IntersectRect(&area, &area, &update);
-        paintBuffered(target, area, contentOrigin, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
+        paintBuffered(target, panel, contentOrigin, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
     }
 
     // The chrome is drawn into an off-screen bitmap to avoid flicker. It owns
