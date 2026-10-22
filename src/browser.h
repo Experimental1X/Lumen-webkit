@@ -371,7 +371,7 @@ private:
         // drawn in paintSidebar.
         RECT gearButton { };
     };
-    SidebarLayout sidebarLayout(int height) const;
+    SidebarLayout sidebarLayout(int width, int height) const;
     const std::vector<LibraryEntry>& sidebarEntries() const;
     RECT sidebarRow(const SidebarLayout& layout, size_t index) const;
     RECT sidebarRowClose(const RECT& row) const;

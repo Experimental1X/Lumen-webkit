@@ -648,6 +648,23 @@ void Browser::resize(bool wholeClient)
             continue;
 
         MoveWindow(viewWindow, viewLeft, l.totalHeight, viewWidth, viewHeight, TRUE);
+
+        // ...except it does not, quite. MoveWindow invalidates the child and
+        // asks Windows to repaint it, but the freshly exposed strip is not part
+        // of the frame WebKit last rendered, and until the next one catches up
+        // the area shows the view window's class background - which is black.
+        // That is the "the sidebar still draws that black side on right when
+        // switching it on/off" report: a solid black band down the right edge of
+        // the page for the whole length of the toggle.
+        //
+        // Measured in the 2026-10-22 recording, the page's left edge tracks the
+        // sidebar exactly (131, 253 and 326 px as the spring moved) while its
+        // right edge fell 95-97px short of the window's, so the geometry passed
+        // to MoveWindow is right and what is missing is the paint. RDW_ERASE is
+        // deliberately not included: erasing would flash, and all that is wanted
+        // here is for the exposed strip to be repainted rather than erased.
+        if (!wholeClient)
+            RedrawWindow(viewWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
     }
 
     // The sidebar and the tab overview are drawn by this window and have to
@@ -2636,13 +2653,6 @@ void Browser::readingListCurrent()
 // Tab overview
 // ---------------------------------------------------------------------------
 
-// PW_RENDERFULLCONTENT arrived in Windows 8.1. Defining it here keeps the
-// build working against an older SDK header that predates it; the value is
-// part of the documented ABI and has never changed.
-#ifndef PW_RENDERFULLCONTENT
-#define PW_RENDERFULLCONTENT 0x00000002
-#endif
-
 void Browser::captureThumbnail(WebView& view)
 {
     HWND window = view.hwnd();
@@ -2668,58 +2678,35 @@ void Browser::captureThumbnail(WebView& view)
     bool copied = false;
     HBITMAP bitmap = nullptr;
 
-    // Ask the window to render ITSELF, rather than reading the screen.
+    // Read the composited desktop, because that is the only thing that
+    // reliably contains a WebKit child window's pixels.
     //
-    // This is the whole fix. The old version grabbed pixels off the desktop
-    // with GetDC(nullptr) + StretchBlt, which only ever returns whatever is
-    // composited at those coordinates *right now*. showOverview shows every
-    // tab in one loop, but showing a window does not composite it - that
-    // happens at the next DWM frame, and we never yield to the message pump
-    // inside the loop. So every tab in the loop sampled the same screen
-    // region and every card ended up showing the same page. Confirmed in the
-    // 2026-10-22 recording: opening the overview with Reddit active painted
-    // Reddit on all five cards.
+    // This was a PrintWindow(PW_RENDERFULLCONTENT) call, added because reading
+    // the screen had the obvious flaw that every tab sampled the same pixels
+    // and every card showed the same page. PW_RENDERFULLCONTENT does not fix
+    // that: it is served from DWM's redirection surface, and that surface
+    // belongs to a TOP-LEVEL window. These views are child HWNDs, so there is
+    // no surface to read - PrintWindow falls through to sending WM_PRINT, which
+    // WebKit does not handle, and the destination bitmap is left exactly as
+    // CreateCompatibleBitmap made it, which in practice is zero-filled. It still
+    // returns nonzero, so the screen read never happened and every card was
+    // stored solid black. Confirmed in the 2026-10-22 recording: all five
+    // overview cards rendered as pure black rectangles with correct titles,
+    // favicons and active-card border on top of them.
     //
-    // PrintWindow with PW_RENDERFULLCONTENT is served from DWM's redirection
-    // surface, and that surface is per-window - so each tab reads back its own
-    // last composited content. It renders 1:1, so we print at full size and
-    // scale down afterwards rather than asking a scaled DC to do the scaling.
-    HDC full = CreateCompatibleDC(screen);
-    HBITMAP fullBitmap = CreateCompatibleBitmap(screen, sourceWidth, sourceHeight);
-    if (full && fullBitmap) {
-        HGDIOBJ oldFull = SelectObject(full, fullBitmap);
-        if (PrintWindow(window, full, PW_RENDERFULLCONTENT)) {
-            // Not named `small`: windef.h declares `typedef char small, *psmall`,
-            // so the preprocessor rewrites the declaration into "HDC char" and
-            // the build fails with C2628 plus a cascade of nonsense after it.
-            HDC scaled = CreateCompatibleDC(screen);
-            HBITMAP scaledBitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
-            if (scaled && scaledBitmap) {
-                HGDIOBJ oldScaled = SelectObject(scaled, scaledBitmap);
-                SetStretchBltMode(scaled, HALFTONE);
-                SetBrushOrgEx(scaled, 0, 0, nullptr);
-                copied = StretchBlt(scaled, 0, 0, thumbWidth, thumbHeight,
-                    full, 0, 0, sourceWidth, sourceHeight, SRCCOPY) != 0;
-                SelectObject(scaled, oldScaled);
-                if (copied)
-                    bitmap = scaledBitmap;
-                else
-                    DeleteObject(scaledBitmap);
-                DeleteDC(scaled);
-            }
-        }
-        SelectObject(full, oldFull);
-        DeleteObject(fullBitmap);
-        DeleteDC(full);
-    }
-
-    // Fallback for a window that will not print (minimised, or a window
-    // without a redirection surface yet). Old behaviour, which is right for
-    // the one tab that really is on screen and merely stale for the rest.
-    if (!copied) {
-        HDC memory = CreateCompatibleDC(screen);
+    // So the "same page on every card" problem has to be solved a different
+    // way, and it already is: a tab is photographed while it is still the
+    // visible one, at the moment it is deactivated (see activateTab), when it
+    // genuinely is on screen and genuinely is showing that page. The only tab
+    // that has to be photographed on demand is the active one, and showOverview
+    // captures just that one.
+    //
+    // CAPTUREBLT is what makes this legal: the source is a layered/DWM-
+    // composited surface, and without it the StretchBlt below misses the very
+    // content it is after.
+    if (HDC memory = CreateCompatibleDC(screen)) {
         HBITMAP screenBitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
-        if (memory && screenBitmap) {
+        if (screenBitmap) {
             HGDIOBJ previous = SelectObject(memory, screenBitmap);
             SetStretchBltMode(memory, HALFTONE);
             SetBrushOrgEx(memory, 0, 0, nullptr);
@@ -2752,32 +2739,22 @@ void Browser::showOverview()
 
     endAddressEdit();
 
-    // Every tab needs a picture, not just whichever one happens to be active.
-    // captureThumbnail reads the screen, so it refuses a view that is not
-    // visible - and inactive tabs have theirs hidden - which used to leave
-    // every card but the active one with no thumbnail at all. A card with no
-    // thumbnail is painted in m_theme.page, which in the dark theme sits a
-    // couple of shades off the overlay background, so those cards vanished:
-    // the grid read as empty space with one lone picture floating in it.
+    // Only the active tab can be photographed right now, because it is the
+    // only one actually on screen. This used to show every tab in a loop and
+    // capture each in turn - which cannot work: the views all occupy the same
+    // rectangle, the top one hides the rest, and captureThumbnail reads the
+    // composited desktop rather than asking the window to render itself. Every
+    // card ended up showing the same page. (The intervening attempt used
+    // PrintWindow(PW_RENDERFULLCONTENT) instead, which is worse - see
+    // captureThumbnail - and gave every card a solid black bitmap.)
     //
-    // captureThumbnail now asks each window to render itself rather than
-    // sampling the desktop, so the order of this loop no longer decides what
-    // every card ends up showing. The show/capture/hide dance is still needed
-    // though: a window that has never been visible has no redirection surface
-    // for PrintWindow to read, and RedrawWindow with RDW_UPDATENOW is what
-    // pushes a fresh frame into it. It paints synchronously, so by the time
-    // captureThumbnail runs there is real content to grab. The whole loop runs
-    // inside this one command handler, before any paint, so none of the
-    // intermediate shows are ever seen.
-    for (auto& tab : m_tabs) {
-        tab->setVisible(true);
-        if (HWND window = tab->hwnd()) {
-            RedrawWindow(window, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_FRAME | RDW_ERASE);
-            UpdateWindow(window);
-        }
-        captureThumbnail(*tab);
-    }
+    // The rest of the grid is covered without any of this: activateTab
+    // photographs a tab at the moment it is deactivated, while it is still the
+    // visible one, so every tab already holds a picture of the page it was last
+    // showing. A card with no thumbnail at all falls back to its favicon and
+    // site colour, which is what a brand-new tab should look like anyway.
+    if (WebView* current = active())
+        captureThumbnail(*current);
 
     m_overview = true;
     m_overviewScroll = 0;
@@ -3091,17 +3068,34 @@ const std::vector<LibraryEntry>& Browser::sidebarEntries() const
     return m_library.history();
 }
 
-Browser::SidebarLayout Browser::sidebarLayout(int height) const
+Browser::SidebarLayout Browser::sidebarLayout(int width, int height) const
 {
     SidebarLayout s;
-    s.width = px(kSidebarWidth);
+    // The width the caller is painting with, NOT the sidebar's final width.
+    //
+    // Once the open/close spring has settled the two are the same, and the
+    // layout was measured correct in the 2026-10-22 recording: the pill ran
+    // from x=15 to x=335 with the selected segment inset to 19..116, exactly
+    // where margin and a thirding of the full width put them. Mid-animation
+    // they are not the same, though - the panel is painted at its interpolated
+    // width while every position inside it was computed from the final one -
+    // so the control used to be drawn out past the panel's right edge and the
+    // header band's fill stopped short of it. Harmless while fully open, which
+    // is why it went unnoticed.
+    s.width = std::max(0, width);
     s.height = height;
     s.rowHeight = px(46);
 
     const int margin = px(12);
-    s.segmented = { margin, margin, s.width - margin, margin + px(30) };
+    // The right inset is clamped so the control can never come out right-to-left.
+    // Early in the open and late in the close the panel is narrower than twice
+    // the margin, which would leave segmentWidth negative. Note this does NOT
+    // change the vertical layout: margin stays fixed, so the list does not shift
+    // as the panel slides, only the control's horizontal extent shrinks with it.
+    const int insetRight = std::max(margin, s.width - margin);
+    s.segmented = { margin, margin, insetRight, margin + px(30) };
 
-    const int segmentWidth = (s.segmented.right - s.segmented.left) / 3;
+    const int segmentWidth = std::max(0, (s.segmented.right - s.segmented.left) / 3);
     for (int i = 0; i < 3; ++i) {
         const int left = s.segmented.left + i * segmentWidth;
         const int right = i == 2 ? s.segmented.right : left + segmentWidth;
@@ -3135,7 +3129,7 @@ Browser::SidebarLayout Browser::sidebarLayout(int height) const
         s.clearButton = {
             margin,
             clearTop,
-            s.width - margin,
+            insetRight,
             clearBottom };
     }
 
@@ -3165,7 +3159,7 @@ RECT Browser::sidebarRowClose(const RECT& row) const
 
 int Browser::sidebarMaxScroll(int height) const
 {
-    const SidebarLayout s = sidebarLayout(height);
+    const SidebarLayout s = sidebarLayout(sidebarWidthNow(), height);
     const int total = static_cast<int>(sidebarEntries().size()) * s.rowHeight;
     return std::max(0, total - static_cast<int>(s.list.bottom - s.list.top));
 }
@@ -3200,7 +3194,7 @@ void Browser::toggleSidebar()
 
 bool Browser::sidebarClick(POINT local, int height)
 {
-    const SidebarLayout s = sidebarLayout(height);
+    const SidebarLayout s = sidebarLayout(sidebarWidthNow(), height);
     if (local.x < 0 || local.x >= s.width)
         return false;
 
@@ -3261,7 +3255,7 @@ bool Browser::sidebarClick(POINT local, int height)
 
 void Browser::sidebarMove(POINT local, int height)
 {
-    const SidebarLayout s = sidebarLayout(height);
+    const SidebarLayout s = sidebarLayout(sidebarWidthNow(), height);
 
     int hoverRow = -1;
     bool hoverClose = false;
@@ -3312,7 +3306,7 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
 
     const float k = scaleFactor();
-    const SidebarLayout s = sidebarLayout(height);
+    const SidebarLayout s = sidebarLayout(width, height);
     const std::vector<LibraryEntry>& entries = sidebarEntries();
 
     // Rows first; the header and footer are painted over them afterwards, so
@@ -3370,8 +3364,26 @@ void Browser::paintSidebar(HDC dc, int width, int height)
             fillRoundedRect(g, inset, px(6), m_theme.glass);
             strokeRoundedRect(g, inset, px(6), m_theme.glassBorder, std::max(1.0f, k));
         }
+        // No DT_END_ELLIPSIS here, and that is the fix.
+        //
+        // These three strings are fixed and short, so there is nothing for an
+        // ellipsis to ever do - but passing it made drawLabel's DrawTextW draw
+        // absolutely nothing, so the segmented control came out as an empty
+        // pill. That is the "the buttons headers of bookmarks, history etc are
+        // invisible" report, and it is verifiable rather than inferred: in the
+        // 2026-10-22 recording the pill, the selected segment's highlight and
+        // border all render, and the gear and the "No Bookmarks" line below
+        // both render, while the three segment rects contain six flat
+        // background shades and not one pixel of glyph.
+        //
+        // "No Bookmarks" - the message right above, drawn by the same helper on
+        // the same DC in the same frame - is the control case. Its flags differ
+        // from these only by not carrying DT_END_ELLIPSIS, and it draws. The
+        // flush is belt and braces: it pushes the pill and the highlight out
+        // before any glyph lands on top of them.
+        g.Flush(Gdiplus::FlushIntentionSync);
         drawLabel(dc, g, names[i], s.segments[i], selected ? m_theme.text : m_theme.textSecondary,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
 
     // Footer with "Clear History" on the History tab.
@@ -4215,6 +4227,23 @@ void Browser::revealDownloadedFile(const std::wstring& path)
 
 void Browser::showDownloadsPage()
 {
+    // Leaving the overview comes first, before anything else in here. Every
+    // other entry point that swaps what the window is showing - bookmarkCurrent,
+    // readingListCurrent, openSettings - does this, and this one did not, which
+    // is the "switching from tab overview to downloads freezes the browser"
+    // report.
+    //
+    // The failure is not in this function at all, it is in activateTab: while
+    // m_overview is set it runs setVisible(!m_overview && i == index) for every
+    // tab, so it hides ALL of them including the one it just activated, and
+    // deliberately does not focus the new view either. The Downloads page was
+    // therefore loaded into a hidden window and never painted, leaving the dark
+    // overview background filling the content area with no way to get out of it
+    // - a black screen that reads exactly like a hang. The overview has to be
+    // gone before activateTab runs, not after.
+    if (m_overview)
+        hideOverview();
+
     // Switching to the Downloads tab that is already open, rather than opening
     // another one. This used to create a fresh WebView on every click, which
     // is both wrong (Safari brings the existing tab forward, the toolbar button
