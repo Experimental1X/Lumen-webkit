@@ -51,47 +51,6 @@ bool isStartPage(const std::wstring& url)
     return url.empty() || url == L"about:blank";
 }
 
-// Is what the user typed a destination, or a phrase to search for? Exactly one
-// definition of that, shared by normalizeInput (which navigates) and the
-// suggestions builder (which has to decide whether to offer a search row). If
-// these ever lived separately they would drift, and the dropdown would offer
-// "Search for github.com" while Enter navigated to the site.
-struct AddressShape {
-    bool hasScheme { false };
-    bool localHost { false };
-    bool bareHost { false };
-    bool isAddress() const { return hasScheme || localHost || bareHost; }
-};
-
-AddressShape classifyAddress(const std::wstring& text)
-{
-    AddressShape shape;
-    shape.hasScheme = text.find(L"://") != std::wstring::npos
-        || text.rfind(L"about:", 0) == 0
-        || text.rfind(L"file:", 0) == 0;
-    shape.localHost = text.rfind(L"localhost", 0) == 0 || text.rfind(L"127.0.0.1", 0) == 0;
-    shape.bareHost = !shape.hasScheme
-        && text.find_first_of(L" \t") == std::wstring::npos
-        && (text.rfind(L"www.", 0) == 0 || text.find(L'.') != std::wstring::npos);
-    return shape;
-}
-
-// ASCII-only case folding. Deliberately not towlower: that drags in <cwctype>
-// and its locale behaviour for no benefit, since every string compared here is
-// a URL, a host or an English query.
-std::wstring folded(const std::wstring& value)
-{
-    std::wstring result;
-    result.reserve(value.size());
-    for (wchar_t ch : value) {
-        if (ch >= L'A' && ch <= L'Z')
-            result += static_cast<wchar_t>(ch - L'A' + L'a');
-        else
-            result += ch;
-    }
-    return result;
-}
-
 // "https://www.example.com/path?x" becomes "example.com".
 std::wstring hostOf(const std::wstring& url)
 {
@@ -168,7 +127,6 @@ bool Browser::create(HWND window, std::wstring& error)
 
     createAddressControl();
     createFindControl();
-    createSuggestionsPanel();
     createDownloadsPanel();
 
     // Nothing is mid-transition at startup: every spring starts parked at the
@@ -330,43 +288,10 @@ bool Browser::stepAnimations()
         if (m_downloadsPanel && (m_downloadsVisible || m_panelAnim.value > 0.0))
             layoutDownloadsPanel();
         invalidateChrome();
-
-        // The tab overview is drawn into the CONTENT area, which resize(false)
-        // deliberately leaves alone and invalidateChrome never reaches, so
-        // without this the grid never repaints while its own spring is moving.
-        // It painted once - at whatever m_overviewAnim.value happened to be,
-        // which on the way in is still 0, and paintOverview returns early at 0
-        // after filling only the background - and then sat there for the whole
-        // half-second fade. That is the "overview animation is broken" report:
-        // a flat panel where the grid should be.
-        //
-        // Invalidate the whole content area here rather than just the grid's
-        // bounding box because the alpha changes on every tick. It is safe
-        // even though this is normally the path that avoids repainting the
-        // page area and its flash: every tab view is hidden for as long as
-        // the overview is up or fading out (stepAnimations restores them only
-        // once the spring has settled), so there is no WebKit surface
-        // underneath to repaint and nothing to flash.
-        if (m_overview || m_overviewAnim.value > 0.0)
-            invalidateContentArea();
     } else
         ensureAnimTimer();
 
     return moving;
-}
-
-void Browser::invalidateContentArea()
-{
-    if (!m_window)
-        return;
-
-    RECT client { };
-    GetClientRect(m_window, &client);
-
-    const LONG top = chromeHeight();
-    RECT area { 0, top, std::max<LONG>(0, client.right), std::max<LONG>(0, client.bottom) };
-    if (area.bottom > area.top)
-        InvalidateRect(m_window, &area, FALSE);
 }
 
 int Browser::sidebarWidthNow() const
@@ -648,40 +573,6 @@ void Browser::resize(bool wholeClient)
             continue;
 
         MoveWindow(viewWindow, viewLeft, l.totalHeight, viewWidth, viewHeight, TRUE);
-
-        // ...except it does not, quite. MoveWindow invalidates the child and
-        // asks Windows to repaint it, but the freshly exposed strip is not part
-        // of the frame WebKit last rendered, and until the next one catches up
-        // the area shows the view window's class background - which is black.
-        // That is the "the sidebar still draws that black side on right when
-        // switching it on/off" report: a solid black band down the right edge of
-        // the page for the whole length of the toggle.
-        //
-        // Measured in the 2026-10-22 recording, the page's left edge tracks the
-        // sidebar exactly (131, 253 and 326 px as the spring moved) while its
-        // right edge fell 95-97px short of the window's, so the geometry passed
-        // to MoveWindow is right and what is missing is the paint.
-        //
-        // RDW_INVALIDATE ONLY, and that is the correction to the update-21
-        // version of this line. update-21 also passed RDW_UPDATENOW, which asks
-        // for the repaint to happen *now*, synchronously, inside this call. That
-        // turned a cosmetic band into a strobe: forcing a WebKit child to
-        // repaint dozens of times a second means most of those repaints land
-        // before WebKit has produced a new frame, so the child paints its black
-        // class background again. In the 2026-10-22 recording the sidebar toggle
-        // produced 42 black/non-black transitions over 27-47s, with 13.5 of
-        // those 17.7 seconds showing black, and the sidebar itself flipping
-        // between (38,37,40) and (3,3,3). That is the "the sidebar even makes
-        // the page go black for a few seconds" report, and it was a regression
-        // introduced by the fix for the band.
-        //
-        // Invalidating without UPDATENOW only marks the child dirty and lets
-        // WebKit repaint on its own schedule, which it was already doing. The
-        // strip still clears, just a frame or two later, and nothing is forced.
-        // RDW_ERASE stays out for the same reason it did before: erasing is the
-        // flash this whole design avoids.
-        if (!wholeClient)
-            RedrawWindow(viewWindow, nullptr, nullptr, RDW_INVALIDATE);
     }
 
     // The sidebar and the tab overview are drawn by this window and have to
@@ -864,44 +755,12 @@ LRESULT CALLBACK Browser::addressProc(HWND window, UINT message, WPARAM wParam, 
         break;
 
     case WM_KEYDOWN:
-        // Everything below is only reachable while the edit has focus, because
-        // the field is a real EDIT child and this subclass sees its keys first.
-        // onKeyDown on the main window never sees any of it.
         if (wParam == VK_RETURN) {
-            // Enter opens the highlighted row when there is one, and otherwise
-            // navigates to whatever was typed. That is what makes the arrow keys
-            // useful rather than decorative.
-            if (browser->m_suggestionsVisible && browser->m_suggestionsSelected >= 0)
-                browser->openSuggestion(browser->m_suggestionsSelected, false);
-            else
-                browser->commitAddress();
+            browser->commitAddress();
             return 0;
         }
         if (wParam == VK_ESCAPE) {
-            // First Escape closes the dropdown and leaves the field alone, like
-            // Safari; a second one leaves the field.
-            if (browser->m_suggestionsVisible) {
-                browser->hideSuggestions();
-                return 0;
-            }
             browser->cancelAddressEdit();
-            return 0;
-        }
-        // Only swallow the arrows while the dropdown is up. With no dropdown
-        // they have to keep moving the caret, which is what the user expects
-        // from a single-line edit.
-        if ((wParam == VK_DOWN || wParam == VK_UP) && browser->m_suggestionsVisible) {
-            browser->suggestionsKey(static_cast<int>(wParam));
-            return 0;
-        }
-        break;
-
-    case WM_MOUSEWHEEL:
-        // WM_MOUSEWHEEL is delivered to the focused window, and the focused
-        // window is this edit - the dropdown is WS_EX_NOACTIVATE and never
-        // takes focus. Without this the list could not be scrolled at all.
-        if (browser->m_suggestionsVisible) {
-            browser->suggestionsWheel(GET_WHEEL_DELTA_WPARAM(wParam));
             return 0;
         }
         break;
@@ -936,10 +795,6 @@ void Browser::beginAddressEdit()
         std::wstring url;
         if (auto* view = active(); view && !isStartPage(view->url()))
             url = view->url();
-        // SetWindowText fires EN_CHANGE. Arm the guard first so seeding the
-        // field does not immediately raise a dropdown over the page the user
-        // was just looking at; the first keystroke is what should open it.
-        m_suggestionsPrimed = false;
         SetWindowTextW(m_address, url.c_str());
 
         placeAddressBar(layout());
@@ -953,7 +808,6 @@ void Browser::beginAddressEdit()
 
 void Browser::endAddressEdit()
 {
-    hideSuggestions();
     if (!m_editing)
         return;
 
@@ -984,556 +838,6 @@ void Browser::cancelAddressEdit()
     endAddressEdit();
 }
 
-// ---------------------------------------------------------------------------
-// Address bar suggestions
-//
-// The dropdown Safari raises under the address field while you type: matching
-// history and bookmarks, a search row when the text is a phrase, arrow-key
-// navigation, Enter to open, Escape to dismiss.
-//
-// Two structural facts drive the whole design:
-//
-//  1. The address field is a real EDIT child window. Keyboard events land in
-//     its subclass proc, not in Browser::onKeyDown, so that is where the arrow
-//     and Enter handling had to go.
-//
-//  2. The dropdown has to float above the WebKit view, and a child window of
-//     the main window cannot reliably do that - the same reason the downloads
-//     panel is an owned popup. So this is one too, with WS_EX_NOACTIVATE so
-//     that clicking a row does not pull focus out of the field and kill the
-//     editing session mid-keystroke.
-// ---------------------------------------------------------------------------
-
-namespace {
-
-constexpr int kSuggestionsRow = 46;
-constexpr int kSuggestionsPad = 6;
-constexpr int kSuggestionsInset = 4;
-constexpr int kSuggestionsMaxVisible = 7;
-constexpr int kSuggestionsRadius = 12;
-constexpr int kSuggestionsMaxResults = 24;
-
-// Higher is better. Host and title matches outrank URL matches because that is
-// what the user is usually remembering, and a prefix match outranks a substring
-// one because it is nearly always the more specific intent. Zero means no match.
-//
-// Takes plain strings rather than Browser::Suggestion on purpose: this is a
-// free function, and Suggestion is private to Browser, so it could not be named
-// from here even spelled Browser::Suggestion.
-int scoreEntry(const std::wstring& host, const std::wstring& title,
-    const std::wstring& url, const std::wstring& needle)
-{
-    const std::wstring hostFolded = folded(host);
-    const std::wstring titleFolded = folded(title);
-    const std::wstring urlFolded = folded(url);
-
-    int score = 0;
-    if (!hostFolded.empty() && hostFolded.rfind(needle, 0) == 0)
-        score = 100;
-    else if (urlFolded.rfind(needle, 0) == 0)
-        score = 95;
-    else if (!titleFolded.empty() && titleFolded.rfind(needle, 0) == 0)
-        score = 90;
-    else if (hostFolded.find(needle) != std::wstring::npos)
-        score = 70;
-    else if (!titleFolded.empty() && titleFolded.find(needle) != std::wstring::npos)
-        score = 65;
-    else if (urlFolded.find(needle) != std::wstring::npos)
-        score = 60;
-
-    if (score == 0)
-        return 0;
-
-    // Prefer the tighter match: "example.com" over "example.com/a/very/long/
-    // path/that/also/contains/the/words". Capped so a long URL can never
-    // outrank a genuinely better match on the strength of being short.
-    const int lengthPenalty = static_cast<int>(std::min<size_t>(url.size() / 4, 20));
-    return score - lengthPenalty;
-}
-
-} // namespace
-
-void Browser::createSuggestionsPanel()
-{
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW windowClass { };
-        windowClass.cbSize = sizeof(windowClass);
-        windowClass.lpfnWndProc = &Browser::suggestionsProc;
-        windowClass.hInstance = GetModuleHandleW(nullptr);
-        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        windowClass.hbrBackground = nullptr;
-        windowClass.lpszClassName = L"LumenSuggestions";
-        RegisterClassExW(&windowClass);
-        registered = true;
-    }
-
-    // WS_EX_NOACTIVATE is the important flag: the field keeps focus and keeps
-    // receiving keystrokes while the dropdown is up and being clicked.
-    m_suggestionsPanel = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"LumenSuggestions", L"",
-        WS_POPUP,
-        0, 0, 10, 10,
-        m_window, nullptr, GetModuleHandleW(nullptr), this);
-}
-
-void Browser::rebuildSuggestions(const std::wstring& text)
-{
-    // Local rather than file-local: it holds a Suggestion, which is private to
-    // Browser and so cannot be named from outside the class.
-    struct Ranked {
-        int score { 0 };
-        size_t order { 0 };
-        std::wstring url;
-        Suggestion suggestion;
-    };
-
-    m_suggestions.clear();
-    m_suggestionsSelected = -1;
-    m_suggestionsHover = -1;
-    m_suggestionsScroll = 0;
-
-    std::wstring query = text;
-    while (!query.empty() && (query.front() == L' ' || query.front() == L'\t'))
-        query.erase(query.begin());
-    while (!query.empty() && (query.back() == L' ' || query.back() == L'\t'))
-        query.pop_back();
-
-    if (query.empty())
-        return;
-
-    const std::wstring needle = folded(query);
-    std::vector<Ranked> ranked;
-    size_t order = 0;
-
-    // Bookmarks first: they are the ones the user deliberately kept, and Safari
-    // puts them ahead of raw history.
-    for (const auto& entry : m_library.bookmarks()) {
-        if (entry.url.empty())
-            continue;
-        Suggestion suggestion;
-        suggestion.host = hostOf(entry.url);
-        suggestion.title = entry.title.empty() ? suggestion.host : entry.title;
-        suggestion.url = entry.url;
-        const int score = scoreEntry(suggestion.host, suggestion.title, suggestion.url, needle);
-        if (score > 0)
-            ranked.push_back(Ranked { score, order++, entry.url, suggestion });
-    }
-
-    // Then history, which is already newest-first. The order index doubles as
-    // that recency, and it breaks ties between otherwise equal matches.
-    for (const auto& entry : m_library.history()) {
-        if (entry.url.empty())
-            continue;
-        Suggestion suggestion;
-        suggestion.host = hostOf(entry.url);
-        suggestion.title = entry.title.empty() ? suggestion.host : entry.title;
-        suggestion.url = entry.url;
-        const int score = scoreEntry(suggestion.host, suggestion.title, suggestion.url, needle);
-        if (score > 0)
-            ranked.push_back(Ranked { score, order++, entry.url, suggestion });
-    }
-
-    std::stable_sort(ranked.begin(), ranked.end(), [](const Ranked& a, const Ranked& b) {
-        if (a.score != b.score)
-            return a.score > b.score;
-        return a.order < b.order;
-    });
-
-    // Dedupe by URL: a bookmarked page is almost always in history too, and
-    // showing it twice reads as a bug.
-    for (const auto& candidate : ranked) {
-        const bool duplicate = std::any_of(m_suggestions.begin(), m_suggestions.end(),
-            [&](const Suggestion& existing) { return existing.url == candidate.url; });
-        if (duplicate)
-            continue;
-        m_suggestions.push_back(candidate.suggestion);
-        if (static_cast<int>(m_suggestions.size()) >= kSuggestionsMaxResults)
-            break;
-    }
-
-    // The search row goes on top, but only when the text really is a phrase.
-    // Offering "Search for github.com" above a github.com history row would be
-    // nonsense, and classifyAddress is the same test normalizeInput uses, so
-    // the row can never contradict what Enter would do.
-    if (!classifyAddress(query).isAddress()) {
-        Suggestion search;
-        search.title = query;
-        search.url = L"https://www.google.com/search?q=" + percentEncode(query);
-        search.isSearch = true;
-        m_suggestions.insert(m_suggestions.begin(), search);
-    }
-}
-
-void Browser::updateSuggestions()
-{
-    if (!m_suggestionsPanel || !m_address)
-        return;
-
-    // The seeding SetWindowText in beginAddressEdit is not the user typing.
-    if (!m_suggestionsPrimed) {
-        m_suggestionsPrimed = true;
-        return;
-    }
-
-    const int length = GetWindowTextLengthW(m_address);
-    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
-    GetWindowTextW(m_address, text.data(), length + 1);
-    text.resize(static_cast<size_t>(length));
-
-    rebuildSuggestions(text);
-
-    if (m_suggestions.empty()) {
-        hideSuggestions();
-        return;
-    }
-    showSuggestions();
-}
-
-void Browser::showSuggestions()
-{
-    if (!m_suggestionsPanel || m_suggestions.empty())
-        return;
-    m_suggestionsVisible = true;
-    layoutSuggestionsPanel();
-    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
-}
-
-void Browser::hideSuggestions()
-{
-    m_suggestionsSelected = -1;
-    m_suggestionsHover = -1;
-    m_suggestionsHoverNewTab = false;
-    m_suggestionsScroll = 0;
-    if (!m_suggestionsVisible)
-        return;
-    m_suggestionsVisible = false;
-    if (m_suggestionsPanel)
-        ShowWindow(m_suggestionsPanel, SW_HIDE);
-}
-
-int Browser::suggestionsHeight() const
-{
-    const int rows = static_cast<int>(m_suggestions.size());
-    const int content = px(kSuggestionsPad * 2) + rows * px(kSuggestionsRow);
-    return std::min(content, px(kSuggestionsPad * 2) + px(kSuggestionsMaxVisible) * px(kSuggestionsRow));
-}
-
-int Browser::suggestionsMaxScroll() const
-{
-    return std::max(0, px(kSuggestionsPad * 2)
-        + static_cast<int>(m_suggestions.size()) * px(kSuggestionsRow)
-        - suggestionsHeight());
-}
-
-void Browser::layoutSuggestionsPanel()
-{
-    if (!m_suggestionsPanel)
-        return;
-
-    const ChromeLayout l = layout();
-    RECT client { };
-    GetClientRect(m_window, &client);
-
-    // As wide as the field it belongs to, which is what Safari does and what
-    // makes the dropdown read as attached to the address bar.
-    const int width = std::max(px(220), static_cast<int>(l.pill.right - l.pill.left));
-    const int height = suggestionsHeight();
-    const int gap = px(4);
-
-    const int x = std::clamp(static_cast<int>(l.pill.left), 0,
-        std::max(0, static_cast<int>(client.right) - width));
-    const int y = static_cast<int>(l.pill.bottom) + gap;
-
-    m_suggestionsWidth = width;
-    m_suggestionsScroll = std::clamp(m_suggestionsScroll, 0, suggestionsMaxScroll());
-
-    POINT origin { x, y };
-    ClientToScreen(m_window, &origin);
-    SetWindowPos(m_suggestionsPanel, HWND_TOP, origin.x, origin.y, width, height,
-        SWP_SHOWWINDOW | SWP_NOACTIVATE);
-
-    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
-        px(kSuggestionsRadius), px(kSuggestionsRadius));
-    SetWindowRgn(m_suggestionsPanel, region, TRUE);
-}
-
-RECT Browser::suggestionRow(int index) const
-{
-    const int pad = px(kSuggestionsPad);
-    const int inset = px(kSuggestionsInset);
-    const int rowHeight = px(kSuggestionsRow);
-    const int top = pad + index * rowHeight - m_suggestionsScroll;
-    return RECT { inset, top, m_suggestionsWidth - inset, top + rowHeight };
-}
-
-RECT Browser::suggestionNewTab(int index) const
-{
-    const RECT row = suggestionRow(index);
-    const int size = px(22);
-    return RECT { row.right - px(10) - size, row.top + (row.bottom - row.top - size) / 2,
-        row.right - px(10), row.top + (row.bottom - row.top + size) / 2 };
-}
-
-void Browser::paintSuggestions(HDC dc, int width, int height)
-{
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-    const float k = scaleFactor();
-
-    // Opaque, deliberately. paintBuffered clips to the damaged slice and never
-    // clears the buffer, so any alpha here would blend against the *previous*
-    // paint - which, on a hover change, is the old row highlight. At 246 that
-    // is a 4% ghost that shimmers as the pointer moves down the list.
-    const RECT card { 0, 0, width, height };
-    fillRoundedRect(g, card, px(kSuggestionsRadius),
-        m_theme.dark ? RGB(40, 40, 43) : RGB(253, 253, 255));
-    strokeRoundedRect(g, RECT { 0, 0, width - 1, height - 1 }, px(kSuggestionsRadius),
-        m_theme.dark ? RGB(62, 62, 66) : RGB(0, 0, 0), 1.0f,
-        m_theme.dark ? 200 : 20);
-
-    for (size_t i = 0; i < m_suggestions.size(); ++i) {
-        const RECT row = suggestionRow(static_cast<int>(i));
-        if (row.bottom < 0 || row.top > height)
-            continue;
-
-        const bool selected = static_cast<int>(i) == m_suggestionsSelected;
-        const bool hot = static_cast<int>(i) == m_suggestionsHover;
-        if (selected)
-            fillRoundedRect(g, row, px(8), m_theme.accent, 240);
-        else if (hot)
-            fillRoundedRect(g, row, px(8), m_theme.pill);
-
-        const COLORREF primary = selected ? RGB(255, 255, 255) : m_theme.text;
-        const COLORREF secondary = selected ? RGB(226, 230, 240) : m_theme.textSecondary;
-
-        const int badge = px(22);
-        const int badgeTop = row.top + (row.bottom - row.top - badge) / 2;
-        const RECT badgeRect { row.left + px(10), badgeTop, row.left + px(10) + badge, badgeTop + badge };
-        if (m_suggestions[i].isSearch) {
-            // A magnifier on an accent disc, rather than a site badge.
-            fillRoundedRect(g, badgeRect, badge / 2,
-                selected ? RGB(255, 255, 255) : m_theme.accent, selected ? 70 : 34);
-            drawMagnifierIcon(g, badgeRect, selected ? RGB(255, 255, 255) : m_theme.accent, k);
-        } else {
-            // Keeps its own hue even on the selected row: drawSiteBadge paints
-            // the letter in white, so a white badge would make it invisible.
-            drawSiteBadge(g, badgeRect, badgeLetter(m_suggestions[i].host),
-                colorFromHue(hueOf(m_suggestions[i].host)), k);
-        }
-
-        const int textLeft = badgeRect.right + px(10);
-        const int textRight = row.right - px(40);
-        const int mid = row.top + (row.bottom - row.top) / 2;
-        if (m_suggestions[i].isSearch) {
-            // One centred line: there is no URL worth showing for a search.
-            const RECT label { textLeft, row.top, textRight, row.bottom };
-            drawLabel(dc, g, L"Search for \"" + m_suggestions[i].title + L"\"", label,
-                primary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        } else {
-            const RECT titleRect { textLeft, mid - px(19), textRight, mid + px(1) };
-            const RECT urlRect { textLeft, mid + px(1), textRight, mid + px(19) };
-            drawLabel(dc, g, m_suggestions[i].title, titleRect, primary,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            drawLabel(dc, g, m_suggestions[i].url, urlRect, secondary,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        }
-
-        // Open in a new tab, on the hovered or keyboard-selected row only, so
-        // the list stays quiet until you aim at a row.
-        if (selected || hot) {
-            const RECT target = suggestionNewTab(static_cast<int>(i));
-            const bool targetHot = hot && m_suggestionsHoverNewTab;
-            if (targetHot)
-                fillRoundedRect(g, target, (target.right - target.left) / 2, RGB(255, 255, 255), 46);
-            drawPlusIcon(g, target, selected ? RGB(255, 255, 255) : m_theme.textSecondary, k);
-        }
-    }
-}
-
-void Browser::suggestionsClick(POINT point)
-{
-    for (size_t i = 0; i < m_suggestions.size(); ++i) {
-        const RECT row = suggestionRow(static_cast<int>(i));
-        if (!PtInRect(&row, point))
-            continue;
-        // Into a named local first: suggestionNewTab returns by value, and & on
-        // a function call result is C2102 ("'&' requires l-value") because a
-        // prvalue has no address to take.
-        const RECT newTab = suggestionNewTab(static_cast<int>(i));
-        const bool inNewTab = PtInRect(&newTab, point) != FALSE;
-        openSuggestion(static_cast<int>(i), inNewTab);
-        return;
-    }
-    // A click on the card but not on a row just dismisses, like Safari.
-    hideSuggestions();
-}
-
-void Browser::suggestionsMove(POINT point)
-{
-    int hover = -1;
-    bool hoverNewTab = false;
-    for (size_t i = 0; i < m_suggestions.size(); ++i) {
-        const RECT row = suggestionRow(static_cast<int>(i));
-        if (!PtInRect(&row, point))
-            continue;
-        hover = static_cast<int>(i);
-        // Named local, same reason as in suggestionsClick.
-        const RECT newTab = suggestionNewTab(static_cast<int>(i));
-        hoverNewTab = PtInRect(&newTab, point) != FALSE;
-        break;
-    }
-    if (hover == m_suggestionsHover && hoverNewTab == m_suggestionsHoverNewTab)
-        return;
-    m_suggestionsHover = hover;
-    m_suggestionsHoverNewTab = hoverNewTab;
-    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
-}
-
-void Browser::suggestionsWheel(int delta)
-{
-    const int maxScroll = suggestionsMaxScroll();
-    if (maxScroll <= 0)
-        return;
-    const int step = delta / WHEEL_DELTA;
-    if (step == 0)
-        return;
-    const int next = std::clamp(m_suggestionsScroll - step * px(kSuggestionsRow), 0, maxScroll);
-    if (next == m_suggestionsScroll)
-        return;
-    m_suggestionsScroll = next;
-    // Move the highlight with the viewport, or the keyboard would drive a row
-    // that has scrolled out of sight.
-    const int firstVisible = m_suggestionsScroll / px(kSuggestionsRow);
-    const int lastVisible = (m_suggestionsScroll + suggestionsHeight()) / px(kSuggestionsRow);
-    if (m_suggestionsSelected >= 0
-        && (m_suggestionsSelected < firstVisible || m_suggestionsSelected > lastVisible)) {
-        m_suggestionsSelected = std::clamp(m_suggestionsSelected, firstVisible, lastVisible);
-    }
-    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
-}
-
-void Browser::suggestionsKey(int key)
-{
-    if (m_suggestions.empty())
-        return;
-    const int count = static_cast<int>(m_suggestions.size());
-    const int rowHeight = px(kSuggestionsRow);
-
-    int next = m_suggestionsSelected;
-    if (key == VK_DOWN)
-        next = m_suggestionsSelected < 0 ? 0 : (m_suggestionsSelected + 1) % count;
-    else if (key == VK_UP)
-        next = m_suggestionsSelected < 0 ? count - 1
-            : (m_suggestionsSelected == 0 ? count - 1 : m_suggestionsSelected - 1);
-    else
-        return;
-    m_suggestionsSelected = next;
-
-    // Keep the highlighted row inside the viewport.
-    const int top = px(kSuggestionsPad) + next * rowHeight - m_suggestionsScroll;
-    const int bottom = top + rowHeight;
-    const int visible = suggestionsHeight();
-    if (top < px(kSuggestionsPad))
-        m_suggestionsScroll = std::max(0, m_suggestionsScroll - (px(kSuggestionsPad) - top));
-    else if (bottom > visible - px(kSuggestionsPad))
-        m_suggestionsScroll = std::min(suggestionsMaxScroll(),
-            m_suggestionsScroll + (bottom - (visible - px(kSuggestionsPad))));
-    m_suggestionsScroll = std::clamp(m_suggestionsScroll, 0, suggestionsMaxScroll());
-
-    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
-}
-
-void Browser::openSuggestion(int index, bool inNewTab)
-{
-    if (index < 0 || index >= static_cast<int>(m_suggestions.size()))
-        return;
-    const Suggestion suggestion = m_suggestions[index];
-    const std::wstring url = suggestion.url;
-
-    hideSuggestions();
-    if (auto* view = active())
-        view->focus();
-    endAddressEdit();
-
-    if (url.empty())
-        return;
-    if (inNewTab)
-        newTab(url);
-    else
-        navigate(url);
-}
-
-LRESULT CALLBACK Browser::suggestionsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    if (message == WM_NCCREATE) {
-        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
-        return DefWindowProcW(window, message, wParam, lParam);
-    }
-
-    auto* browser = reinterpret_cast<Browser*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (!browser)
-        return DefWindowProcW(window, message, wParam, lParam);
-
-    switch (message) {
-    case WM_ERASEBKGND:
-        return 1;
-
-    case WM_PAINT: {
-        PAINTSTRUCT paint { };
-        HDC dc = BeginPaint(window, &paint);
-        RECT client { };
-        GetClientRect(window, &client);
-        browser->paintBuffered(dc, client, POINT { 0, 0 }, [&](HDC memory) {
-            browser->paintSuggestions(memory, static_cast<int>(client.right),
-                static_cast<int>(client.bottom));
-        });
-        EndPaint(window, &paint);
-        return 0;
-    }
-
-    // A WS_EX_NOACTIVATE window still asks whether to activate on click. Answer
-    // no, so the click is delivered here without the field losing focus.
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-
-    case WM_LBUTTONDOWN:
-        browser->suggestionsClick(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
-        return 0;
-
-    case WM_MOUSEMOVE: {
-        TRACKMOUSEEVENT track { sizeof(track), TME_LEAVE, window, 0 };
-        TrackMouseEvent(&track);
-        browser->suggestionsMove(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
-        return 0;
-    }
-
-    case WM_MOUSELEAVE:
-        browser->suggestionsMove(POINT { -1, -1 });
-        return 0;
-
-    case WM_MOUSEWHEEL:
-        browser->suggestionsWheel(GET_WHEEL_DELTA_WPARAM(wParam));
-        return 0;
-
-    // The field owns the keyboard, so these never arrive. Kept for safety: a
-    // stray key should dismiss rather than be swallowed forever.
-    case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) {
-            browser->hideSuggestions();
-            return 0;
-        }
-        break;
-
-    default:
-        break;
-    }
-
-    return DefWindowProcW(window, message, wParam, lParam);
-}
-
 std::wstring Browser::normalizeInput(const std::wstring& input)
 {
     std::wstring cleaned = input;
@@ -1545,13 +849,19 @@ std::wstring Browser::normalizeInput(const std::wstring& input)
     if (cleaned.empty())
         return { };
 
-    const AddressShape shape = classifyAddress(cleaned);
+    const bool hasScheme = cleaned.find(L"://") != std::wstring::npos
+        || cleaned.rfind(L"about:", 0) == 0
+        || cleaned.rfind(L"file:", 0) == 0;
+    const bool localHost = cleaned.rfind(L"localhost", 0) == 0 || cleaned.rfind(L"127.0.0.1", 0) == 0;
+    const bool bareHost = !hasScheme
+        && cleaned.find_first_of(L" \t") == std::wstring::npos
+        && (cleaned.rfind(L"www.", 0) == 0 || cleaned.find(L'.') != std::wstring::npos);
 
-    if (shape.hasScheme)
+    if (hasScheme)
         return cleaned;
-    if (shape.localHost)
+    if (localHost)
         return L"http://" + cleaned;
-    if (shape.bareHost)
+    if (bareHost)
         return L"https://" + cleaned;
     return L"https://www.google.com/search?q=" + percentEncode(cleaned);
 }
@@ -2196,31 +1506,25 @@ void Browser::onPaint(HDC target)
             fillSolid(target, pageArea, m_theme.page);
     }
 
-    // The overlay and the sidebar both start below the chrome, so both paint
-    // from the content area's top-left no matter how much of them is being
-    // repainted.
-    const POINT contentOrigin { 0, l.totalHeight };
-
     if (overviewUp) {
         if (update.top < content.bottom) {
             RECT area = content;
             IntersectRect(&area, &area, &update);
-            paintBuffered(target, area, contentOrigin, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
+            paintBuffered(target, area, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
         }
     } else if (sidebarWidth > 0 && update.left < sidebarWidth && update.top < content.bottom) {
         const RECT panel { 0, l.totalHeight, sidebarWidth, l.totalHeight + contentHeight };
         RECT area = panel;
         IntersectRect(&area, &area, &update);
-        paintBuffered(target, area, contentOrigin, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
+        paintBuffered(target, area, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
     }
 
-    // The chrome is drawn into an off-screen bitmap to avoid flicker. It owns
-    // the client's top-left, so its origin is (0,0).
+    // The chrome is drawn into an off-screen bitmap to avoid flicker.
     if (update.top < l.totalHeight) {
         const RECT chrome { 0, 0, width, l.totalHeight };
         RECT area = chrome;
         IntersectRect(&area, &area, &update);
-        paintBuffered(target, area, POINT { 0, 0 }, [&](HDC dc) { paintChrome(dc, l); });
+        paintBuffered(target, area, [&](HDC dc) { paintChrome(dc, l); });
     }
 }
 
@@ -2242,8 +1546,7 @@ void Browser::releaseBackBuffer()
     m_backHeight = 0;
 }
 
-void Browser::paintBuffered(HDC target, const RECT& area, const POINT& origin,
-    const std::function<void(HDC)>& draw)
+void Browser::paintBuffered(HDC target, const RECT& area, const std::function<void(HDC)>& draw)
 {
     const int width = area.right - area.left;
     const int height = area.bottom - area.top;
@@ -2279,25 +1582,19 @@ void Browser::paintBuffered(HDC target, const RECT& area, const POINT& origin,
     // in the buffer rather than from its corner - otherwise a partial repaint
     // would put the wrong pixels on screen.
     //
-    // The draw callbacks paint their whole panel from their own (0,0): the
-    // chrome from the window's top-left, the sidebar and the overview from
-    // theirs, which sit below the chrome. `origin` is where that (0,0) lands
-    // in device space, and it is the top-left of the PANEL, not of `area`.
-    //
-    // That distinction is the whole reason this takes an explicit origin. If
-    // the viewport is moved onto the damaged slice's corner instead, then
-    // whenever only part of a panel is invalidated - a row hover, a scroll, the
-    // Clear History band appearing - the entire panel is drawn shifted down by
-    // however much of it was skipped, and the part that lands outside `area` is
-    // thrown away by the clip. For the sidebar that put the header and its
-    // segment labels in the middle of the list, or dropped them entirely on a
-    // repaint near the bottom, which is why the labels kept going invisible and
-    // the rows kept bleeding over the header. The buffer is never cleared, so
-    // the stale frame underneath showed through wherever the shift left a gap.
+    // The draw callbacks paint in their *own* coordinates, with (0,0) at the
+    // top-left of whatever they own. The chrome starts at the top of the
+    // client so its origin is already (0,0), but the sidebar and the overview
+    // start below the chrome and paint from (0,0) too. The buffer, on the
+    // other hand, shares the client's origin, so for those two the origin has
+    // to be moved onto the area's corner first. Without this the top
+    // chromeHeight() pixels of the sidebar and the overview fall outside the
+    // clip region and are thrown away, and the blit reads rows that were
+    // never drawn - which is what collapsed the tab overview into a thin
+    // strip along the top of an otherwise black window.
     POINT previousOrigin { };
-    SetViewportOrgEx(m_backDC, origin.x, origin.y, &previousOrigin);
+    SetViewportOrgEx(m_backDC, area.left, area.top, &previousOrigin);
 
-    // Clip regions are device coordinates, so this stays absolute.
     HRGN clip = CreateRectRgnIndirect(&area);
     SelectClipRgn(m_backDC, clip);
     DeleteObject(clip);
@@ -2688,62 +1985,28 @@ void Browser::captureThumbnail(WebView& view)
     const int thumbWidth = 480;
     const int thumbHeight = std::max(1, sourceHeight * thumbWidth / sourceWidth);
 
+    // Copy what is on screen: the page is composited by the graphics system,
+    // so reading the window's own surface would not work reliably.
     HDC screen = GetDC(nullptr);
     if (!screen)
         return;
 
-    bool copied = false;
-    HBITMAP bitmap = nullptr;
-
-    // Read the composited desktop, because that is the only thing that
-    // reliably contains a WebKit child window's pixels.
-    //
-    // This was a PrintWindow(PW_RENDERFULLCONTENT) call, added because reading
-    // the screen had the obvious flaw that every tab sampled the same pixels
-    // and every card showed the same page. PW_RENDERFULLCONTENT does not fix
-    // that: it is served from DWM's redirection surface, and that surface
-    // belongs to a TOP-LEVEL window. These views are child HWNDs, so there is
-    // no surface to read - PrintWindow falls through to sending WM_PRINT, which
-    // WebKit does not handle, and the destination bitmap is left exactly as
-    // CreateCompatibleBitmap made it, which in practice is zero-filled. It still
-    // returns nonzero, so the screen read never happened and every card was
-    // stored solid black. Confirmed in the 2026-10-22 recording: all five
-    // overview cards rendered as pure black rectangles with correct titles,
-    // favicons and active-card border on top of them.
-    //
-    // So the "same page on every card" problem has to be solved a different
-    // way, and it already is: a tab is photographed while it is still the
-    // visible one, at the moment it is deactivated (see activateTab), when it
-    // genuinely is on screen and genuinely is showing that page. The only tab
-    // that has to be photographed on demand is the active one, and showOverview
-    // captures just that one.
-    //
-    // CAPTUREBLT is what makes this legal: the source is a layered/DWM-
-    // composited surface, and without it the StretchBlt below misses the very
-    // content it is after.
-    if (HDC memory = CreateCompatibleDC(screen)) {
-        HBITMAP screenBitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
-        if (screenBitmap) {
-            HGDIOBJ previous = SelectObject(memory, screenBitmap);
-            SetStretchBltMode(memory, HALFTONE);
-            SetBrushOrgEx(memory, 0, 0, nullptr);
-            copied = StretchBlt(memory, 0, 0, thumbWidth, thumbHeight,
-                screen, rect.left, rect.top, sourceWidth, sourceHeight,
-                SRCCOPY | CAPTUREBLT) != 0;
-            SelectObject(memory, previous);
-            if (copied)
-                bitmap = screenBitmap;
-            else
-                DeleteObject(screenBitmap);
-            DeleteDC(memory);
-        }
-    }
-
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    SetStretchBltMode(memory, HALFTONE);
+    SetBrushOrgEx(memory, 0, 0, nullptr);
+    const BOOL copied = StretchBlt(
+        memory, 0, 0, thumbWidth, thumbHeight,
+        screen, rect.left, rect.top, sourceWidth, sourceHeight,
+        SRCCOPY | CAPTUREBLT);
+    SelectObject(memory, previous);
+    DeleteDC(memory);
     ReleaseDC(nullptr, screen);
 
-    if (copied && bitmap)
+    if (copied)
         view.setThumbnail(bitmap);
-    else if (bitmap)
+    else
         DeleteObject(bitmap);
 }
 
@@ -2756,22 +2019,22 @@ void Browser::showOverview()
 
     endAddressEdit();
 
-    // Only the active tab can be photographed right now, because it is the
-    // only one actually on screen. This used to show every tab in a loop and
-    // capture each in turn - which cannot work: the views all occupy the same
-    // rectangle, the top one hides the rest, and captureThumbnail reads the
-    // composited desktop rather than asking the window to render itself. Every
-    // card ended up showing the same page. (The intervening attempt used
-    // PrintWindow(PW_RENDERFULLCONTENT) instead, which is worse - see
-    // captureThumbnail - and gave every card a solid black bitmap.)
+    // Every tab needs a picture, not just whichever one happens to be active.
+    // captureThumbnail reads the screen, so it refuses a view that is not
+    // visible - and inactive tabs have theirs hidden - which used to leave
+    // every card but the active one with no thumbnail at all. A card with no
+    // thumbnail is painted in m_theme.page, which in the dark theme sits a
+    // couple of shades off the overlay background, so those cards vanished:
+    // the grid read as empty space with one lone picture floating in it.
     //
-    // The rest of the grid is covered without any of this: activateTab
-    // photographs a tab at the moment it is deactivated, while it is still the
-    // visible one, so every tab already holds a picture of the page it was last
-    // showing. A card with no thumbnail at all falls back to its favicon and
-    // site colour, which is what a brand-new tab should look like anyway.
-    if (WebView* current = active())
-        captureThumbnail(*current);
+    // Showing a view again puts its last composited content straight back on
+    // screen from DWM's redirection surface, so it can be grabbed immediately.
+    // The whole loop runs inside this one command handler, before any paint,
+    // so none of the intermediate shows are ever seen.
+    for (auto& tab : m_tabs) {
+        tab->setVisible(true);
+        captureThumbnail(*tab);
+    }
 
     m_overview = true;
     m_overviewScroll = 0;
@@ -2929,18 +2192,10 @@ void Browser::paintOverview(HDC dc, int width, int height)
     fillSolid(dc, RECT { 0, 0, width, height },
         m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
 
-    // The overview eases in and out, so it is drawn offscreen and composited.
-    // The whole grid no longer shares one global fade-and-shrink: that read as
-    // a single 0.55s dissolve rather than as animation, and the report was
-    // "the tab overview basically has no animations".
-    //
-    // Safari instead brings the cards up as a staggered cascade - each arriving
-    // a beat after the last, fading in, growing from 90% and settling - with the
-    // background already sitting behind them. That is what
-    // paintOverviewContent does now, driven by this same spring, so the
-    // composite at the bottom of this function runs at full strength and all
-    // the motion is per card. The background has always been filled opaquely
-    // above, so nothing shows through while the cards arrive.
+    // The overview eases in and out, so it is drawn offscreen and composited
+    // with an alpha rather than being painted straight onto the chrome. Two
+    // things happen at once: the whole grid fades, and the cards grow from
+    // 94% to full size about the centre of the content area.
     const double t = std::clamp(m_overviewAnim.value, 0.0, 1.0);
     if (t <= 0.002)
         return;
@@ -2952,17 +2207,9 @@ void Browser::paintOverview(HDC dc, int width, int height)
     // the thread that also has to answer clicks. Keep one and grow it only when
     // the window outgrows it; paintOverviewContent fills the whole surface
     // before it draws anything, so nothing stale can survive.
-    // GetWidth/GetHeight return Gdiplus::INT, which does not compare cleanly
-    // against plain int under /W4 - the compiler flags a signed/unsigned
-    // mismatch on the comparison. Explicit casts through the same width type
-    // make the intent obvious and the warning go away.
-    const int surfaceWidth = m_overviewSurface
-        ? static_cast<int>(m_overviewSurface->GetWidth()) : 0;
-    const int surfaceHeight = m_overviewSurface
-        ? static_cast<int>(m_overviewSurface->GetHeight()) : 0;
     if (!m_overviewSurface
-        || surfaceWidth < width
-        || surfaceHeight < height) {
+        || m_overviewSurface->GetWidth() < width
+        || m_overviewSurface->GetHeight() < height) {
         releaseOverviewSurface();
         m_overviewSurface = new Gdiplus::Bitmap(width, height, PixelFormat32bppPARGB);
         log(L"Overview surface resized.");
@@ -2974,7 +2221,7 @@ void Browser::paintOverview(HDC dc, int width, int height)
         Gdiplus::Graphics scratch(m_overviewSurface);
         scratch.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         HDC bufferDc = scratch.GetHDC();
-        paintOverviewContent(bufferDc, width, height, t);
+        paintOverviewContent(bufferDc, width, height);
         scratch.ReleaseHDC(bufferDc);
     }
 
@@ -2982,20 +2229,32 @@ void Browser::paintOverview(HDC dc, int width, int height)
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
-    // Full strength, 1:1. The fade and the shrink both moved down into
-    // paintOverviewContent, where they run per card on a stagger, so this
-    // composite has nothing left to animate - it just puts the finished grid
-    // onto the page. ImageAttributes and its ColorMatrix went with it; there is
-    // no global alpha left to apply.
-    g.DrawImage(m_overviewSurface,
-        Gdiplus::RectF(0.0f, 0.0f, static_cast<Gdiplus::REAL>(width),
-            static_cast<Gdiplus::REAL>(height)),
+    Gdiplus::ImageAttributes attributes;
+    attributes.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+    // Gdiplus::ColorMatrix is a plain REAL[5][5]; fill it by hand rather than
+    // calling a method that does not exist in this SDK.
+    Gdiplus::ColorMatrix matrix { };
+    matrix.m[0][0] = 1.0f;
+    matrix.m[1][1] = 1.0f;
+    matrix.m[2][2] = 1.0f;
+    matrix.m[3][3] = static_cast<Gdiplus::REAL>(t);
+    matrix.m[4][4] = 1.0f;
+    attributes.SetColorMatrix(&matrix);
+
+    const float scale = 0.94f + 0.06f * static_cast<float>(t);
+
+    Gdiplus::RectF destRect(
+        static_cast<Gdiplus::REAL>(width * (1.0 - scale) * 0.5),
+        static_cast<Gdiplus::REAL>(height * (1.0 - scale) * 0.5),
+        static_cast<Gdiplus::REAL>(width * scale),
+        static_cast<Gdiplus::REAL>(height * scale));
+    g.DrawImage(m_overviewSurface, destRect,
         0.0f, 0.0f,
         static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
-        Gdiplus::UnitPixel);
+        Gdiplus::UnitPixel, &attributes);
 }
 
-void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
+void Browser::paintOverviewContent(HDC dc, int width, int height)
 {
     const RECT whole { 0, 0, width, height };
     fillSolid(dc, whole, m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
@@ -3009,144 +2268,60 @@ void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
     const float k = scaleFactor();
     const int radius = px(10);
     const std::vector<OverviewCard> cards = overviewLayout(width);
-    const COLORREF backdrop = m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232);
-
-    // The stagger. Every card starts a beat after the last, so the grid fills
-    // in as a cascade rather than the whole thing dissolving at once - which is
-    // what Safari does, and what the report "the tab overview basically has no
-    // animations" was about. The per-card window shrinks as the grid gets
-    // longer so the LAST card still lands inside the spring, and it is capped
-    // at 8 steps: that is as many cards as fit on a laptop screen, and beyond
-    // it a longer stagger would only stretch the tail out of the animation.
-    const size_t staggerSteps = std::min(cards.empty() ? 0u : static_cast<unsigned>(cards.size() - 1), 7u);
-    constexpr double kStaggerStep = 0.045;
-    const double staggerSpan = kStaggerStep * static_cast<double>(staggerSteps);
-    const double cardWindow = std::max(0.22, 1.0 - staggerSpan);
-
-    // Blends an icon colour toward the flat backdrop. The card's small glyphs -
-    // the site badge, the close X, the start-page mark - take a plain COLORREF
-    // with nowhere to pass an alpha, and every one of them sits on that flat
-    // colour, so mixing by hand is exact rather than a cheat. The thumbnail
-    // bitmap, the fills and the strokes all take a real alpha and get one.
-    auto fade = [backdrop](COLORREF color, double amount) -> COLORREF {
-        const int a = static_cast<int>(std::clamp(amount, 0.0, 1.0) * 255.0 + 0.5);
-        return RGB(
-            GetRValue(backdrop) + (GetRValue(color) - GetRValue(backdrop)) * a / 255,
-            GetGValue(backdrop) + (GetGValue(color) - GetGValue(backdrop)) * a / 255,
-            GetBValue(backdrop) + (GetBValue(color) - GetBValue(backdrop)) * a / 255);
-    };
 
     for (size_t i = 0; i < cards.size(); ++i) {
         const OverviewCard& card = cards[i];
         if (card.card.bottom < 0 || card.card.top > height)
             continue;
 
-        // 0 before this card's beat, 1 once it has fully arrived. Cubic
-        // ease-out, so it decelerates into place instead of stopping dead.
-        const double delay = kStaggerStep * static_cast<double>(std::min(i, static_cast<size_t>(staggerSteps)));
-        const double ct = std::clamp((t - delay) / cardWindow, 0.0, 1.0);
-        if (ct <= 0.0)
-            continue;
-        const double eased = 1.0 - std::pow(1.0 - ct, 3.0);
-
-        const BYTE alpha = static_cast<BYTE>(eased * 255.0 + 0.5);
-        // Skip the transform entirely once the card has landed: at rest it is
-        // the identity, and the resting grid is what gets painted every frame
-        // the overview is simply open, so this is the path that has to stay
-        // cheap.
-        const bool moving = eased < 0.999;
-        if (moving) {
-            // Scale about the card's centre and lift it, as
-            // Translate * Scale * Translate under MatrixOrderAppend - GDI+
-            // multiplies onto the right, so the point is transformed in the
-            // order the calls are made and ends up centred, scaled, and risen.
-            const Gdiplus::REAL cardScale = static_cast<Gdiplus::REAL>(0.90 + 0.10 * eased);
-            const Gdiplus::REAL cx = static_cast<Gdiplus::REAL>((card.card.left + card.card.right) / 2.0);
-            const Gdiplus::REAL cy = static_cast<Gdiplus::REAL>((card.card.top + card.card.bottom) / 2.0);
-            const Gdiplus::REAL rise = static_cast<Gdiplus::REAL>(px(18) * (1.0 - eased));
-            g.Save();
-            g.TranslateTransform(cx, cy + rise, Gdiplus::MatrixOrderAppend);
-            g.ScaleTransform(cardScale, cardScale, Gdiplus::MatrixOrderAppend);
-            g.TranslateTransform(-cx, -cy, Gdiplus::MatrixOrderAppend);
-        }
-
         const WebView& view = *m_tabs[i];
         const bool isActive = i == m_active;
         const bool hot = static_cast<int>(i) == m_overviewHoverCard;
 
         // Picture of the page.
-        fillRoundedRect(g, card.thumb, radius, m_theme.page, alpha);
+        fillRoundedRect(g, card.thumb, radius, m_theme.page);
         if (HBITMAP bitmap = view.thumbnail()) {
             Gdiplus::GraphicsPath path;
             addRoundedRect(path, toRectF(card.thumb), static_cast<Gdiplus::REAL>(radius));
             g.SetClip(&path);
             Gdiplus::Bitmap image(bitmap, nullptr);
-            if (moving) {
-                // The bitmap is the one thing on a card big enough for a real
-                // alpha, and the route is the same ColorMatrix that used to
-                // fade the whole grid in paintOverview, now applied per card.
-                Gdiplus::ImageAttributes thumbAlpha;
-                thumbAlpha.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
-                Gdiplus::ColorMatrix matrix { };
-                matrix.m[0][0] = 1.0f;
-                matrix.m[1][1] = 1.0f;
-                matrix.m[2][2] = 1.0f;
-                matrix.m[3][3] = static_cast<Gdiplus::REAL>(alpha / 255.0);
-                matrix.m[4][4] = 1.0f;
-                thumbAlpha.SetColorMatrix(&matrix);
-                g.DrawImage(&image, toRectF(card.thumb), 0.0f, 0.0f,
-                    static_cast<Gdiplus::REAL>(image.GetWidth()),
-                    static_cast<Gdiplus::REAL>(image.GetHeight()),
-                    Gdiplus::UnitPixel, &thumbAlpha);
-            } else {
-                g.DrawImage(&image, toRectF(card.thumb));
-            }
+            g.DrawImage(&image, toRectF(card.thumb));
             g.ResetClip();
         } else if (isStartPage(view.url())) {
-            drawStartPageIcon(g, card.thumb, fade(m_theme.textSecondary, eased), k * 3.0f);
+            drawStartPageIcon(g, card.thumb, m_theme.textSecondary, k * 3.0f);
         }
 
         strokeRoundedRect(
             g, card.thumb, radius,
             isActive ? m_theme.accent : m_theme.tabBorder,
-            isActive ? 3.0f * k : std::max(1.0f, k), alpha);
+            isActive ? 3.0f * k : std::max(1.0f, k));
 
         // Close button, shown on hover (and always for the active tab).
         if (hot || isActive) {
             fillRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2,
-                (hot && m_overviewHoverClose) ? m_theme.glassHover : m_theme.glass, alpha);
-            strokeRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2,
-                m_theme.glassBorder, std::max(1.0f, k), alpha);
-            drawCloseIcon(g, card.close, fade(m_theme.text, eased), k);
+                (hot && m_overviewHoverClose) ? m_theme.glassHover : m_theme.glass);
+            strokeRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2, m_theme.glassBorder, std::max(1.0f, k));
+            drawCloseIcon(g, card.close, m_theme.text, k);
         }
 
         // Title with the site badge, centered under the picture.
-        //
-        // GDI+ text, not drawLabel: GDI's DrawTextW draws in DC space and would
-        // ignore the transform above, leaving the label pinned at full size
-        // inside a card that is still growing.
         const std::wstring title = tabTitle(view);
         const int iconSize = px(14);
-        const Gdiplus::SizeF titleSize = measureLabelGdiPlus(g, m_font, title);
-        const int textWidth = std::min(static_cast<int>(titleSize.Width),
-            std::max(0, static_cast<int>(card.title.right - card.title.left) - iconSize - px(6)));
+        const int textWidth = std::min(measureLabel(dc, g, title), std::max(0, static_cast<int>(card.title.right - card.title.left) - iconSize - px(6)));
         const int groupWidth = iconSize + px(6) + textWidth;
         const int groupLeft = card.title.left + ((card.title.right - card.title.left) - groupWidth) / 2;
         const int centerY = (card.title.top + card.title.bottom) / 2;
         const RECT iconRect { groupLeft, centerY - iconSize / 2, groupLeft + iconSize, centerY - iconSize / 2 + iconSize };
 
         if (isStartPage(view.url())) {
-            drawStartPageIcon(g, iconRect, fade(m_theme.textSecondary, eased), k);
+            drawStartPageIcon(g, iconRect, m_theme.textSecondary, k);
         } else {
             const std::wstring host = hostOf(view.url());
-            drawSiteBadge(g, iconRect, badgeLetter(host), colorFromHue(hueOf(host)), k, alpha);
+            drawSiteBadge(g, iconRect, badgeLetter(host), colorFromHue(hueOf(host)), k);
         }
 
         const RECT textRect { iconRect.right + px(6), card.title.top, iconRect.right + px(6) + textWidth, card.title.bottom };
-        drawLabelGdiPlus(g, m_font, title, toRectF(textRect), m_theme.text, alpha);
-
-        if (moving)
-            g.Restore();
+        drawLabel(dc, g, title, textRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
 
     g.Flush(Gdiplus::FlushIntentionSync);
@@ -3165,38 +2340,17 @@ const std::vector<LibraryEntry>& Browser::sidebarEntries() const
     return m_library.history();
 }
 
-Browser::SidebarLayout Browser::sidebarLayout(int width, int height) const
+Browser::SidebarLayout Browser::sidebarLayout(int height) const
 {
     SidebarLayout s;
-    // The width the caller is painting with, NOT the sidebar's final width.
-    //
-    // Once the open/close spring has settled the two are the same, and the
-    // layout was measured correct in the 2026-10-22 recording: the pill ran
-    // from x=15 to x=335 with the selected segment inset to 19..116, exactly
-    // where margin and a thirding of the full width put them. Mid-animation
-    // they are not the same, though - the panel is painted at its interpolated
-    // width while every position inside it was computed from the final one -
-    // so the control used to be drawn out past the panel's right edge and the
-    // header band's fill stopped short of it. Harmless while fully open, which
-    // is why it went unnoticed.
-    s.width = std::max(0, width);
+    s.width = px(kSidebarWidth);
     s.height = height;
     s.rowHeight = px(46);
 
     const int margin = px(12);
-    // The right inset is clamped so the control can never come out right-to-left.
-    // Early in the open and late in the close the panel is narrower than twice
-    // the margin, which would leave segmentWidth negative. Note this does NOT
-    // change the vertical layout: margin stays fixed, so the list does not shift
-    // as the panel slides, only the control's horizontal extent shrinks with it.
-    const int insetRight = std::max(margin, s.width - margin);
-    s.segmented = { margin, margin, insetRight, margin + px(30) };
+    s.segmented = { margin, margin, s.width - margin, margin + px(30) };
 
-    // The cast is load-bearing: RECT's members are LONG, so the subtraction and
-    // the division are LONG, and std::max(0, LONG) has no single _Ty that both
-    // arguments convert to - it fails to deduce, C2672, and everything after it
-    // cascades. Same trap as the paintBuffered fix in task #33.
-    const int segmentWidth = std::max(0, static_cast<int>((s.segmented.right - s.segmented.left) / 3));
+    const int segmentWidth = (s.segmented.right - s.segmented.left) / 3;
     for (int i = 0; i < 3; ++i) {
         const int left = s.segmented.left + i * segmentWidth;
         const int right = i == 2 ? s.segmented.right : left + segmentWidth;
@@ -3230,7 +2384,7 @@ Browser::SidebarLayout Browser::sidebarLayout(int width, int height) const
         s.clearButton = {
             margin,
             clearTop,
-            insetRight,
+            s.width - margin,
             clearBottom };
     }
 
@@ -3260,7 +2414,7 @@ RECT Browser::sidebarRowClose(const RECT& row) const
 
 int Browser::sidebarMaxScroll(int height) const
 {
-    const SidebarLayout s = sidebarLayout(sidebarWidthNow(), height);
+    const SidebarLayout s = sidebarLayout(height);
     const int total = static_cast<int>(sidebarEntries().size()) * s.rowHeight;
     return std::max(0, total - static_cast<int>(s.list.bottom - s.list.top));
 }
@@ -3295,7 +2449,7 @@ void Browser::toggleSidebar()
 
 bool Browser::sidebarClick(POINT local, int height)
 {
-    const SidebarLayout s = sidebarLayout(sidebarWidthNow(), height);
+    const SidebarLayout s = sidebarLayout(height);
     if (local.x < 0 || local.x >= s.width)
         return false;
 
@@ -3356,7 +2510,7 @@ bool Browser::sidebarClick(POINT local, int height)
 
 void Browser::sidebarMove(POINT local, int height)
 {
-    const SidebarLayout s = sidebarLayout(sidebarWidthNow(), height);
+    const SidebarLayout s = sidebarLayout(height);
 
     int hoverRow = -1;
     bool hoverClose = false;
@@ -3407,7 +2561,7 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
 
     const float k = scaleFactor();
-    const SidebarLayout s = sidebarLayout(width, height);
+    const SidebarLayout s = sidebarLayout(height);
     const std::vector<LibraryEntry>& entries = sidebarEntries();
 
     // Rows first; the header and footer are painted over them afterwards, so
@@ -3452,14 +2606,8 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     }
 
     // Header band with the segmented control.
-    //
-    // fillSolidGdiPlus, not fillSolid: a raw GDI FillRect on a DC that the
-    // Graphics above owns is what stopped these three labels rendering at all.
-    // See fillSolidGdiPlus in gfx.h. The band is still drawn after the rows,
-    // which is the whole point of it - rows scrolled past the top get covered
-    // rather than needing clipping.
     const RECT header { 0, 0, width, s.list.top };
-    fillSolidGdiPlus(g, header, m_theme.tabBar);
+    fillSolid(dc, header, m_theme.tabBar);
 
     fillRoundedRect(g, s.segmented, px(8), m_theme.pill);
     static const wchar_t* const names[3] = { L"Bookmarks", L"Reading List", L"History" };
@@ -3471,22 +2619,14 @@ void Browser::paintSidebar(HDC dc, int width, int height)
             fillRoundedRect(g, inset, px(6), m_theme.glass);
             strokeRoundedRect(g, inset, px(6), m_theme.glassBorder, std::max(1.0f, k));
         }
-        // Nothing clever here, and update-21's theory about DT_END_ELLIPSIS was
-        // wrong. The flags are now the plain centred set, shared with the
-        // working "No Bookmarks" call above, but the labels still did not
-        // render - measured across 55 seconds of the 2026-10-22 recording, the
-        // pill's peak brightness was 94 in every single frame the sidebar was
-        // open, with zero pixels above 110, while "No Bookmarks" reached 196.
-        // The real cause was the GDI FillRect above; see fillSolidGdiPlus.
-        g.Flush(Gdiplus::FlushIntentionSync);
         drawLabel(dc, g, names[i], s.segments[i], selected ? m_theme.text : m_theme.textSecondary,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
 
     // Footer with "Clear History" on the History tab.
     if (m_sidebarMode == 2) {
         const RECT footer { 0, s.list.bottom, width, height };
-        fillSolidGdiPlus(g, footer, m_theme.tabBar);
+        fillSolid(dc, footer, m_theme.tabBar);
         fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
         drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
@@ -3501,7 +2641,7 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         drawGearIcon(g, gearInset, RGB(255, 255, 255), m_theme.accent, k * 0.78f);
     }
 
-    fillSolidGdiPlus(g, RECT { width - 1, 0, width, height }, m_theme.separator);
+    fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
     g.Flush(Gdiplus::FlushIntentionSync);
 }
 
@@ -3551,15 +2691,8 @@ void Browser::closeTabForView(WebView* view)
 
 void Browser::onControlNotify(HWND control, UINT code)
 {
-    if (control == m_find && code == EN_CHANGE) {
+    if (control == m_find && code == EN_CHANGE)
         runFind(false, true);
-        return;
-    }
-    // The address field has no ID-driven command of its own worth routing
-    // through onCommand; EN_CHANGE is the signal that the query changed, which
-    // is also what rebuilds the suggestions.
-    if (control == m_address && code == EN_CHANGE && m_editing)
-        updateSuggestions();
 }
 
 void Browser::createFindControl()
@@ -3698,39 +2831,6 @@ RECT downloadsActionRect(const RECT& row, int size, int margin)
     return { row.right - margin - size, top, row.right - margin, top + size };
 }
 
-// The two buttons every download row ends with. `primary` is always the
-// rightmost button and holds whatever ends the row: Stop while the transfer is
-// still live, Show-in-folder once it has finished, Remove once it has failed or
-// been stopped. `toggle` is the Pause / Resume button immediately to its left,
-// and comes back empty when the row has nothing to toggle. Pinning both to a
-// fixed right edge is what stops the row reflowing when the transfer changes
-// state. `gap` comes in from the caller because this is a free function - px()
-// is a Browser member and cannot be reached from here.
-struct RowButtons {
-    RECT primary { };
-    RECT toggle { };
-};
-
-RowButtons rowButtonRects(const RECT& row, int size, int margin, int gap,
-    DownloadItem::State state, bool canToggle)
-{
-    RowButtons buttons;
-    const RECT right = downloadsActionRect(row, size, margin);
-    buttons.primary = right;
-
-    // A settled row has nothing to pause or resume, so it gets a single button
-    // and does not reserve the slot.
-    const bool live = state == DownloadItem::State::Active
-        || state == DownloadItem::State::Paused;
-    if (live && canToggle) {
-        buttons.toggle.left = right.left - gap - size;
-        buttons.toggle.top = right.top;
-        buttons.toggle.right = right.left - gap;
-        buttons.toggle.bottom = right.bottom;
-    }
-    return buttons;
-}
-
 bool isRiskyFile(const std::wstring& path)
 {
     const size_t dot = path.find_last_of(L'.');
@@ -3801,7 +2901,7 @@ LRESULT CALLBACK Browser::downloadsProc(HWND window, UINT message, WPARAM wParam
         HDC dc = BeginPaint(window, &paint);
         RECT client { };
         GetClientRect(window, &client);
-        browser->paintBuffered(dc, client, POINT { 0, 0 }, [&](HDC memory) {
+        browser->paintBuffered(dc, client, [&](HDC memory) {
             browser->paintDownloadsPanel(memory, static_cast<int>(client.right), static_cast<int>(client.bottom));
         });
         EndPaint(window, &paint);
@@ -3914,7 +3014,6 @@ void Browser::hideDownloadsPanel(bool refocusPage)
     m_downloadsVisible = false;
     m_downloadsHoverRow = -1;
     m_downloadsHoverAction = false;
-    m_downloadsHoverToggle = false;
     m_downloadsHoverClear = false;
     m_downloadsHoverShowAll = false;
 
@@ -4024,23 +3123,9 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
         const RECT badgeRect { row.left + px(18), row.top + (rowHeight - badge) / 2, row.left + px(18) + badge, row.top + (rowHeight - badge) / 2 + badge };
         drawSiteBadge(g, badgeRect, badgeLetter(extension), colorFromHue(hueOf(extension)), k * 1.6f);
 
-        // Which two buttons this row ends with. The toggle is Pause while the
-        // transfer is running and Resume only once it is actually paused, so
-        // the play triangle never sits on a row that is already downloading -
-        // which is what made the old single toggle read as a fast-forward
-        // control. A WKDownload row has no engine-level pause, so it gets no
-        // toggle at all; the primary Stop still works on it.
-        const bool paused = item.state == DownloadItem::State::Paused;
-        const RowButtons buttons = rowButtonRects(row, actionSize, actionMargin,
-            px(8), item.state, item.resumable());
+        const RECT action = downloadsActionRect(row, actionSize, actionMargin);
         const int textLeft = badgeRect.right + px(12);
-        // A settled row has no toggle, so the text runs to the primary button
-        // instead. Testing the rect rather than the state keeps the two in
-        // step even if the layout rules change later.
-        const int textRight
-            = (buttons.toggle.right > buttons.toggle.left ? buttons.toggle.left
-                                                           : buttons.primary.left)
-            - px(10);
+        const int textRight = action.left - px(10);
 
         const RECT nameRect { textLeft, row.top + px(10), textRight, row.top + px(10) + px(20) };
         drawLabel(dc, g, item.filename, nameRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -4054,14 +3139,6 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
                 status = formatBytes(item.received) + L" \u2014 Downloading";
             else
                 status = L"Starting\u2026";
-            break;
-        case DownloadItem::State::Paused:
-            if (item.received > 0)
-                status = formatBytes(item.received) + L" of "
-                    + (item.total > 0 ? formatBytes(item.total) : L"?")
-                    + L" \u2014 Paused";
-            else
-                status = L"Paused";
             break;
         case DownloadItem::State::Finished:
             status = formatBytes(item.total > 0 ? item.total : item.received);
@@ -4078,8 +3155,7 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
         const RECT statusRect { textLeft, row.top + px(30), textRight, row.top + px(30) + px(18) };
         drawLabel(dc, g, status, statusRect, m_theme.textSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-        if (item.state == DownloadItem::State::Active
-            || item.state == DownloadItem::State::Paused) {
+        if (item.state == DownloadItem::State::Active) {
             const int barTop = row.top + px(52);
             const int barHeight = px(4);
             const RECT track { textLeft, barTop, textRight, barTop + barHeight };
@@ -4087,11 +3163,7 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
             if (item.total > 0) {
                 const double fraction = std::clamp(static_cast<double>(item.received) / static_cast<double>(item.total), 0.0, 1.0);
                 const RECT fill { textLeft, barTop, textLeft + static_cast<LONG>((textRight - textLeft) * fraction), barTop + barHeight };
-                // Paused rows keep their bar so the amount already fetched is
-                // still visible, but dimmed so they do not read as running.
-                fillRoundedRect(g, fill, barHeight / 2, m_theme.accent,
-                    item.state == DownloadItem::State::Paused
-                        ? static_cast<BYTE>(90) : static_cast<BYTE>(255));
+                fillRoundedRect(g, fill, barHeight / 2, m_theme.accent);
             } else {
                 // Total size unknown (chunked transfer, no Content-Length):
                 // draw a centred "pulse" so the row still reads as in-progress.
@@ -4102,55 +3174,23 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
             }
         }
 
-        // Primary: Stop while the transfer is live, Show in folder once it has
-        // finished, Remove once it failed or was stopped. Stop and Remove are
-        // destructive but not undoable, so they keep the cross rather than
-        // borrowing the square.
-        const bool primaryHot = hot && m_downloadsHoverAction;
-        fillRoundedRect(g, buttons.primary, actionSize / 2,
-            primaryHot ? m_theme.glassHover : m_theme.pillHover);
+        // Round button: cancel, show in folder, or remove.
+        const bool actionHot = hot && m_downloadsHoverAction;
+        fillRoundedRect(g, action, actionSize / 2, actionHot ? m_theme.glassHover : m_theme.pillHover);
         if (item.state == DownloadItem::State::Finished)
-            drawMagnifierIcon(g, buttons.primary, m_theme.text, k);
-        else if (item.state == DownloadItem::State::Active || paused)
-            drawStopIcon(g, buttons.primary,
-                primaryHot ? m_theme.text : m_theme.textSecondary, k);
+            drawMagnifierIcon(g, action, m_theme.text, k);
         else
-            drawCloseIcon(g, buttons.primary, m_theme.text, k);
-
-        // Toggle: two bars while running, a bare triangle while paused. They
-        // are different shapes rather than the same glyph in two colours, so
-        // the button cannot read as fast-forward at any zoom.
-        if (buttons.toggle.right > buttons.toggle.left) {
-            const bool toggleHot = hot && m_downloadsHoverToggle;
-            // Resume is drawn in the accent because it is the one thing a
-            // paused row is waiting for; Pause stays neutral so the two never
-            // compete for attention.
-            fillRoundedRect(g, buttons.toggle, actionSize / 2,
-                toggleHot ? m_theme.glassHover
-                          : (paused ? m_theme.pillFocused : m_theme.pillHover));
-            const COLORREF icon = paused ? m_theme.accent : m_theme.textSecondary;
-            if (paused)
-                drawPlayIcon(g, buttons.toggle, icon, k);
-            else
-                drawPauseIcon(g, buttons.toggle, icon, k);
-        }
+            drawCloseIcon(g, action, m_theme.text, k);
     }
 
     // Header over the rows, so rows scrolled past the top are hidden.
-    //
-    // fillSolidGdiPlus rather than fillSolid, for the same reason as the
-    // sidebar's header band: a raw GDI FillRect after the Graphics took the DC
-    // is what made DrawTextW silently draw nothing. See fillSolidGdiPlus.
-    fillSolidGdiPlus(g, RECT { 0, 0, width, header }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    fillSolid(dc, RECT { 0, 0, width, header }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
     const RECT titleRect { px(18), 0, width / 2, header };
     drawLabel(dc, g, L"Downloads", titleRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     bool anyFinished = false;
     for (const auto& item : items) {
-        // A paused download is waiting for the user, not settled, so it does
-        // not make "Clear" available.
-        if (item.state != DownloadItem::State::Active
-            && item.state != DownloadItem::State::Paused)
+        if (item.state != DownloadItem::State::Active)
             anyFinished = true;
     }
     const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
@@ -4159,15 +3199,15 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
     drawLabel(dc, g, L"Clear", clearRect, anyFinished ? m_theme.accent : m_theme.textDisabled,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-    fillSolidGdiPlus(g, RECT { 0, header - 1, width, header }, m_theme.separator);
+    fillSolid(dc, RECT { 0, header - 1, width, header }, m_theme.separator);
     strokeRoundedRect(g, RECT { 0, 0, width, height }, px(14), m_theme.glassBorder, std::max(1.0f, k));
 
     // Footer with the "Show in Page" link, painted last so it covers any
     // row that has scrolled past the bottom edge.
     const int footer = px(kDownloadsFooter);
     const RECT footerRect { 0, height - footer, width, height };
-    fillSolidGdiPlus(g, footerRect, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
-    fillSolidGdiPlus(g, RECT { 0, height - footer, width, height - footer + 1 }, m_theme.separator);
+    fillSolid(dc, footerRect, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    fillSolid(dc, RECT { 0, height - footer, width, height - footer + 1 }, m_theme.separator);
 
     const RECT showAllRect { px(16), height - footer + px(6), width - px(16), height - px(6) };
     if (m_downloadsHoverShowAll)
@@ -4210,24 +3250,9 @@ void Browser::downloadsClick(POINT point)
             continue;
 
         const DownloadItem& item = items[i];
-
-        // Same availability rule the painter uses, so what lights up under the
-        // cursor and what the click actually does can never disagree.
-        const bool paused = item.state == DownloadItem::State::Paused;
-        const RowButtons buttons = rowButtonRects(row, px(26), px(16), px(8),
-            item.state, item.resumable());
-
-        if (buttons.toggle.right > buttons.toggle.left
-            && PtInRect(&buttons.toggle, point)) {
-            if (paused)
-                Downloads::instance().resume(item.id);
-            else
-                Downloads::instance().pause(item.id);
-            return;
-        }
-
-        if (PtInRect(&buttons.primary, point)) {
-            if (item.state == DownloadItem::State::Active || paused)
+        const RECT action = downloadsActionRect(row, px(26), px(16));
+        if (PtInRect(&action, point)) {
+            if (item.state == DownloadItem::State::Active)
                 Downloads::instance().cancel(item.id);
             else if (item.state == DownloadItem::State::Finished)
                 revealDownloadedFile(item.path);
@@ -4255,7 +3280,6 @@ void Browser::downloadsMove(POINT point)
 
     int hoverRow = -1;
     bool hoverAction = false;
-    bool hoverToggle = false;
     bool hoverClear = false;
     bool hoverShowAll = false;
 
@@ -4274,25 +3298,19 @@ void Browser::downloadsMove(POINT point)
                     continue;
 
                 hoverRow = static_cast<int>(i);
-                const DownloadItem& item = items[i];
-                const RowButtons buttons = rowButtonRects(row, px(26), px(16),
-                    px(8), item.state, item.resumable());
-                hoverAction = PtInRect(&buttons.primary, point) != FALSE;
-                if (buttons.toggle.right > buttons.toggle.left)
-                    hoverToggle = PtInRect(&buttons.toggle, point) != FALSE;
+                const RECT action = downloadsActionRect(row, px(26), px(16));
+                hoverAction = PtInRect(&action, point) != FALSE;
                 break;
             }
         }
     }
 
     if (hoverRow == m_downloadsHoverRow && hoverAction == m_downloadsHoverAction
-        && hoverToggle == m_downloadsHoverToggle
         && hoverClear == m_downloadsHoverClear && hoverShowAll == m_downloadsHoverShowAll)
         return;
 
     m_downloadsHoverRow = hoverRow;
     m_downloadsHoverAction = hoverAction;
-    m_downloadsHoverToggle = hoverToggle;
     m_downloadsHoverClear = hoverClear;
     m_downloadsHoverShowAll = hoverShowAll;
     InvalidateRect(m_downloadsPanel, nullptr, FALSE);
@@ -4328,63 +3346,20 @@ void Browser::revealDownloadedFile(const std::wstring& path)
 
 void Browser::showDownloadsPage()
 {
-    // Leaving the overview comes first, before anything else in here. Every
-    // other entry point that swaps what the window is showing - bookmarkCurrent,
-    // readingListCurrent, openSettings - does this, and this one did not, which
-    // is the "switching from tab overview to downloads freezes the browser"
-    // report.
-    //
-    // The failure is not in this function at all, it is in activateTab: while
-    // m_overview is set it runs setVisible(!m_overview && i == index) for every
-    // tab, so it hides ALL of them including the one it just activated, and
-    // deliberately does not focus the new view either. The Downloads page was
-    // therefore loaded into a hidden window and never painted, leaving the dark
-    // overview background filling the content area with no way to get out of it
-    // - a black screen that reads exactly like a hang. The overview has to be
-    // gone before activateTab runs, not after.
-    if (m_overview)
-        hideOverview();
-
-    // Switching to the Downloads tab that is already open, rather than opening
-    // another one. This used to create a fresh WebView on every click, which
-    // is both wrong (Safari brings the existing tab forward, the toolbar button
-    // does the same) and a crash: each click ran another WKViewCreate, and the
-    // one immediately before the recorded crash killed the process outright.
-    // openSettings() has guarded its tab this way since the Settings pane landed;
-    // Downloads was simply never given the same treatment.
-    if (m_downloadsPageTab != static_cast<size_t>(-1)
-        && m_downloadsPageTab < m_tabs.size()) {
-        activateTab(m_downloadsPageTab);
-        // Push a fresh snapshot so the page reflects anything that happened
-        // while another tab was in front, rather than waiting for the next tick.
-        m_downloadsPagePushedAt = GetTickCount64();
-        if (auto* view = m_tabs[m_downloadsPageTab].get())
-            view->loadHtml(downloadsPageHtml(m_theme.dark));
-        return;
-    }
-
-    // Breadcrumbs. A crash anywhere in the three steps below used to end with
-    // nothing at all in lumen.log - no watchdog entry, no last line - because
-    // the only log call in this path comes from inside createView, after the
-    // part that actually faults. These say how far it got.
-    log(L"Downloads page: creating tab.");
+    // Open a new tab that lists every download. The browser pushes an
+    // updated HTML snapshot to it whenever Downloads::onChanged fires, so
+    // the page itself does not have to self-reload.
     auto view = m_host.createView(m_window);
-    if (!view) {
-        log(L"Downloads page: createView failed.");
+    if (!view)
         return;
-    }
 
     WebView* raw = view.get();
     attachCallbacks(raw);
     m_tabs.push_back(std::move(view));
     m_downloadsPageTab = m_tabs.size() - 1;
 
-    log(L"Downloads page: activating tab.");
     activateTab(m_downloadsPageTab);
-    log(L"Downloads page: loading HTML.");
     raw->loadHtml(downloadsPageHtml(m_theme.dark));
-    m_downloadsPagePushedAt = GetTickCount64();
-    log(L"Downloads page: ready.");
     invalidateChrome();
 }
 

@@ -26,20 +26,9 @@ namespace lumen {
 // The item has already been pushed onto the Downloads list with the right
 // destination path; we pass that id back here and let the worker stream
 // the body to disk through Downloads::reportProgress.
-//
-// resumeFrom is the number of bytes already sitting at the destination.
-// 0 starts a fresh transfer and truncates the file; anything higher sends
-// `Range: bytes=<resumeFrom>-` and appends, which is what makes a paused
-// download pick up where it stopped.
-//
-// generation must match the item's current generation. The worker retires
-// itself as soon as Downloads reports a different one, which is what keeps a
-// pause-then-resume from leaving two threads writing the same file.
-void startWinhttpTransfer(unsigned id, std::wstring url, long long resumeFrom,
-    unsigned generation);
+void startWinhttpTransfer(unsigned id, std::wstring url);
 
 // Implementation detail. The detached thread runs this; nothing else does.
-void runWinhttpTransfer(unsigned id, std::wstring url, long long resumeFrom,
-    unsigned generation);
+void runWinhttpTransfer(unsigned id, std::wstring url);
 
 } // namespace lumen

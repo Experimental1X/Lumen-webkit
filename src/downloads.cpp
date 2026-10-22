@@ -437,11 +437,7 @@ void Downloads::refreshFromDisk()
     {
         Lock lock(m_lock);
         for (auto& item : m_items) {
-            // Paused rows are included: a download can finish reaching its
-            // advertised size in the same chunk the user hits pause, and a
-            // poll is the only thing that would notice.
-            if (item.state != DownloadItem::State::Active
-                && item.state != DownloadItem::State::Paused)
+            if (item.state != DownloadItem::State::Active)
                 continue;
 
             if (item.path.empty()) {
@@ -576,9 +572,6 @@ void Downloads::startTransfer(std::wstring url)
         item.filename = filename;
         item.path = path;
         item.source = host;
-        // Kept so a paused download can be resumed later; resume() re-reads
-        // this to issue its Range request.
-        item.url = url;
         item.received = 0;
         item.total = 0;
         item.state = DownloadItem::State::Active;
@@ -593,10 +586,10 @@ void Downloads::startTransfer(std::wstring url)
 
     // Spawn the worker outside the lock; it will pull item.path through
     // destinationFor() and the byte counts through reportProgress().
-    startWinhttpTransfer(id, url, 0, 0);
+    startWinhttpTransfer(id, std::move(url));
 }
 
-std::wstring Downloads::destinationFor(unsigned id)
+std::wstring Downloads::destinationFor(unsigned id) const
 {
     Lock lock(m_lock);
     if (DownloadItem* item = findIdLocked(id))
@@ -604,131 +597,17 @@ std::wstring Downloads::destinationFor(unsigned id)
     return { };
 }
 
-TransferControl Downloads::transferControl(unsigned id, unsigned generation)
+bool Downloads::stillActive(unsigned id) const
 {
     Lock lock(m_lock);
-    DownloadItem* item = findIdLocked(id);
-    if (!item)
-        return TransferControl::Gone;
-    // A newer worker owns this item now. Whatever we were doing is stale:
-    // retire without touching the state, because the new worker is already
-    // using it.
-    if (item->generation != generation)
-        return TransferControl::Gone;
-    switch (item->state) {
-    case DownloadItem::State::Active:
-        return TransferControl::Continue;
-    case DownloadItem::State::Paused:
-        return TransferControl::Paused;
-    default:
-        return TransferControl::Cancelled;
-    }
-}
-
-void Downloads::pause(unsigned id)
-{
-    {
-        Lock lock(m_lock);
-        DownloadItem* item = findIdLocked(id);
-        // A WKDownload row has no engine-level pause, so refuse rather than
-        // show a button that silently does nothing.
-        if (!item || item->state != DownloadItem::State::Active || item->ref || item->url.empty())
-            return;
-        item->state = DownloadItem::State::Paused;
-    }
-    log(L"Download paused (WinHTTP): id=" + std::to_wstring(id));
-    notify(false);
-}
-
-void Downloads::resume(unsigned id)
-{
-    std::wstring url;
-    std::wstring path;
-    long long offset = 0;
-    unsigned generation = 0;
-
-    {
-        Lock lock(m_lock);
-        DownloadItem* item = findIdLocked(id);
-        if (!item || item->state != DownloadItem::State::Paused)
-            return;
-        url = item->url;
-        path = item->path;
-        // Retire the old worker before it can observe the state flip back to
-        // Active. It may still be inside a blocking read, and when it comes
-        // back round it will see a generation it no longer owns and stop.
-        item->generation += 1;
-        generation = item->generation;
-        item->state = DownloadItem::State::Active;
-    }
-
-    if (url.empty()) {
-        // Should not happen - pause() refuses to set Paused without a URL -
-        // but do not leave the row stuck in a state with no way out of it.
-        reportFail(id, L"paused download has no URL to resume from");
-        return;
-    }
-
-    // Resume from what is actually on disk, not from item.received. The
-    // worker counts what it hands to WriteFile, so the two normally agree,
-    // but a truncated write or a file the user moved would desynchronise
-    // them and asking for the wrong offset corrupts the result.
-    WIN32_FILE_ATTRIBUTE_DATA data { };
-    if (!path.empty()
-        && GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
-        offset = (static_cast<long long>(data.nFileSizeHigh) << 32)
-            | static_cast<long long>(data.nFileSizeLow);
-    }
-    if (offset <= 0) {
-        // Nothing usable on disk. Start over rather than request a Range
-        // from byte zero, which some servers answer with a 416.
-        offset = 0;
-        {
-            Lock lock(m_lock);
-            if (DownloadItem* item = findIdLocked(id))
-                item->received = 0;
-        }
-    }
-
-    log(L"Download resumed (WinHTTP): id=" + std::to_wstring(id)
-        + L" from byte " + std::to_wstring(offset)
-        + L" (generation " + std::to_wstring(generation) + L")");
-    notify(false);
-
-    startWinhttpTransfer(id, url, offset, generation);
+    if (DownloadItem* item = findIdLocked(id))
+        return item->state == DownloadItem::State::Active;
+    return false;
 }
 
 void Downloads::reportProgress(unsigned id, long long received, long long total)
 {
-    // Rate limit, and this is the whole fix for "downloading freezes the
-    // browser".
-    //
-    // The WinHTTP worker calls this after every 64KB chunk it writes and
-    // `changed` is true for every one of them, because `received` really did
-    // move. Each call posted a WM_LUMEN_DOWNLOAD_CHANGED, and on the UI thread
-    // that message runs onDownloadsChanged, which copies the whole item list
-    // out of the critical section, re-lays-out the downloads panel, invalidates
-    // the panel and invalidates the chrome. That is fine at a few messages a
-    // second and catastrophic at a few thousand.
-    //
-    // Measured in the 2026-10-22 recording: a 4GB Kali Linux ISO pulled at
-    // roughly 75MB/s, which is 64KB every 0.8ms, so about 1,200 messages a
-    // second. The window stopped repainting entirely at t=96.1s and stayed
-    // frozen - no chrome repaint at all, only the mouse cursor moving - until
-    // t=149.7s, 53.6 seconds later, at which point the backlog drained and
-    // every queued input flushed at once. Windows itself was alive the whole
-    // time; only Lumen's thread was saturated.
-    //
-    // 100ms is far finer than the eye can follow a progress bar move, so the
-    // bar still looks continuous, and it caps the message rate at 10/s
-    // regardless of line speed. Terminal transitions are not rate limited -
-    // they go through reportFinish and reportFail, which never throttle - so a
-    // download that completes still updates the instant it does.
-    static constexpr unsigned long long kNotifyIntervalMs = 100;
-
     bool changed = false;
-    bool notifyNow = false;
-    const unsigned long long now = GetTickCount64();
     {
         Lock lock(m_lock);
         if (DownloadItem* item = findIdLocked(id)) {
@@ -740,17 +619,9 @@ void Downloads::reportProgress(unsigned id, long long received, long long total)
                 item->total = total;
                 changed = true;
             }
-            // A size we only just learned is worth showing immediately even
-            // inside the interval: without it the bar sits indeterminate until
-            // the next tick, which on a fast transfer may be 100ms of "pulse".
-            const bool sizeArrived = total > 0 && item->lastNotifiedAt == 0;
-            if (changed && (sizeArrived || now - item->lastNotifiedAt >= kNotifyIntervalMs)) {
-                item->lastNotifiedAt = now;
-                notifyNow = true;
-            }
         }
     }
-    if (notifyNow)
+    if (changed)
         notify(false);
 }
 
@@ -888,33 +759,22 @@ void Downloads::cancel(unsigned id)
 {
     WKDownloadRef target = nullptr;
     bool wasWinHttpTransfer = false;
-    bool wasPaused = false;
     {
         Lock lock(m_lock);
         DownloadItem* item = findIdLocked(id);
-        if (!item)
+        if (!item || item->state != DownloadItem::State::Active)
             return;
-        if (item->state == DownloadItem::State::Paused) {
-            // No worker is running, so there is nothing to signal: settle the
-            // row here and now. The partial file is left on disk, exactly as
-            // it is for a cancelled download.
-            item->state = DownloadItem::State::Cancelled;
-            wasPaused = true;
-        } else if (item->state == DownloadItem::State::Active) {
-            // Two paths: WebKit-managed (item.ref is set) and our own WinHTTP
-            // path (item.ref is null because the worker polls
-            // transferControl()). For WebKit we need WKDownloadCancel; for
-            // WinHTTP we just flag Cancelled and the worker aborts on its
-            // next chunk.
-            if (item->ref)
-                target = item->ref;
-            else
-                wasWinHttpTransfer = true;
 
-            item->state = DownloadItem::State::Cancelled;
-        } else {
-            return;
-        }
+        // Two paths: WebKit-managed (item.ref is set) and our own WinHTTP
+        // path (item.ref is null because the worker reads item.state under
+        // stillActive()). For WebKit we need WKDownloadCancel; for WinHTTP
+        // we just flag Cancelled and the worker aborts on its next chunk.
+        if (item->ref)
+            target = item->ref;
+        else
+            wasWinHttpTransfer = true;
+
+        item->state = DownloadItem::State::Cancelled;
     }
 
     if (target)
@@ -922,8 +782,6 @@ void Downloads::cancel(unsigned id)
     else if (wasWinHttpTransfer)
         log(L"Download cancel marked (WinHTTP worker will stop at the next chunk): id="
             + std::to_wstring(id));
-    else if (wasPaused)
-        log(L"Download cancelled while paused: id=" + std::to_wstring(id));
 
     notify(false);
 }
@@ -937,8 +795,7 @@ void Downloads::remove(unsigned id)
                 continue;
 
             // An active download is cancelled first; it is removed from the
-            // list once WebKit has reported that it ended. A paused one has
-            // no worker left to report, so it can go immediately.
+            // list once WebKit has reported that it ended.
             if (it->state == DownloadItem::State::Active) {
                 cancel(id);
                 return;
@@ -957,13 +814,7 @@ void Downloads::clearFinished()
     {
         Lock lock(m_lock);
         for (auto it = m_items.begin(); it != m_items.end();) {
-            // Only the settled rows. A paused download is still waiting for
-            // the user and must survive "Clear Finished", exactly as an
-            // active one does.
-            const DownloadItem::State state = it->state;
-            if (state == DownloadItem::State::Finished
-                || state == DownloadItem::State::Failed
-                || state == DownloadItem::State::Cancelled) {
+            if (it->state != DownloadItem::State::Active) {
                 it = m_items.erase(it);
                 changed = true;
             } else

@@ -239,9 +239,8 @@ private:
     // resize passes true because the page area really did change shape.
     void resize(bool wholeClient = true);
     void invalidateSidebarColumn();
-    void invalidateContentArea();
     RECT contentArea() const;
-    void paintBuffered(HDC target, const RECT& area, const POINT& origin, const std::function<void(HDC)>& draw);
+    void paintBuffered(HDC target, const RECT& area, const std::function<void(HDC)>& draw);
     // Reused back buffer for paintBuffered. A window-sized bitmap is about
     // eight megabytes; making a fresh one per WM_PAINT was costing more than
     // the drawing did, and the flicker came from blitting an untouched area
@@ -272,34 +271,6 @@ private:
     static std::wstring normalizeInput(const std::wstring& input);
     void navigate(const std::wstring& input);
     static LRESULT CALLBACK addressProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
-
-    // --- address bar suggestions ---
-    // One row of the dropdown that appears under the address field while the
-    // user types, the way Safari offers matching history and bookmarks.
-    struct Suggestion {
-        std::wstring title;   // page title, or the query for a search row
-        std::wstring url;     // always a resolved URL, even for a search row
-        std::wstring host;    // host to badge the row with; empty on a search
-        bool isSearch { false };
-    };
-
-    void createSuggestionsPanel();
-    void rebuildSuggestions(const std::wstring& text);
-    void updateSuggestions();
-    void showSuggestions();
-    void hideSuggestions();
-    int suggestionsHeight() const;
-    int suggestionsMaxScroll() const;
-    void layoutSuggestionsPanel();
-    RECT suggestionRow(int index) const;
-    RECT suggestionNewTab(int index) const;
-    void paintSuggestions(HDC dc, int width, int height);
-    void suggestionsClick(POINT point);
-    void suggestionsMove(POINT point);
-    void suggestionsWheel(int delta);
-    void suggestionsKey(int key);
-    void openSuggestion(int index, bool inNewTab);
-    static LRESULT CALLBACK suggestionsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
     // --- find in page ---
     void createFindControl();
@@ -354,13 +325,8 @@ private:
     void overviewMove(POINT local, int width);
     void paintOverview(HDC dc, int width, int height);
     // The tab grid itself. paintOverview renders this into an offscreen buffer
-    // first, so the cards can be drawn staggered and transformed without GDI+
-    // having to repaint the live surface mid-transform.
-    //
-    // `t` is the same 0..1 spring value paintOverview has: it drives each card's
-    // own progress on a stagger, so `t` is the grid as a whole and every card
-    // reads a delayed slice of it.
-    void paintOverviewContent(HDC dc, int width, int height, double t);
+    // first so the whole grid can fade and scale as one piece.
+    void paintOverviewContent(HDC dc, int width, int height);
 
     // --- sidebar (Bookmarks, Reading List, History) ---
     struct SidebarLayout {
@@ -376,7 +342,7 @@ private:
         // drawn in paintSidebar.
         RECT gearButton { };
     };
-    SidebarLayout sidebarLayout(int width, int height) const;
+    SidebarLayout sidebarLayout(int height) const;
     const std::vector<LibraryEntry>& sidebarEntries() const;
     RECT sidebarRow(const SidebarLayout& layout, size_t index) const;
     RECT sidebarRowClose(const RECT& row) const;
@@ -407,31 +373,9 @@ private:
     HWND m_downloadsPanel { nullptr };
     bool m_downloadsVisible { false };
     bool m_hadDownloads { false };
-
-    // --- address bar suggestions ---
-    HWND m_suggestionsPanel { nullptr };
-    std::vector<Suggestion> m_suggestions;
-    int m_suggestionsSelected { -1 }; // driven by the arrow keys
-    int m_suggestionsHover { -1 };    // driven by the mouse
-    int m_suggestionsScroll { 0 };
-    int m_suggestionsWidth { 0 };     // cached panel width; hit tests need it
-    bool m_suggestionsHoverNewTab { false };
-    bool m_suggestionsVisible { false };
-    // Set once the first EN_CHANGE after focusing has been seen. Focusing the
-    // field seeds it with the current URL, which fires EN_CHANGE by itself;
-    // without this the dropdown would cover the page the moment you click the
-    // field, before the user has typed anything.
-    bool m_suggestionsPrimed { false };
-
     int m_downloadsScroll { 0 };
     int m_downloadsHoverRow { -1 };
-    // The row's right-hand button: Stop while live, Show in folder once
-    // finished, Remove once failed or stopped.
     bool m_downloadsHoverAction { false };
-    // The Pause / Resume button immediately to its left. Separate from the
-    // primary so the two highlight independently - they are different actions
-    // and used to be collapsed into one ambiguous toggle.
-    bool m_downloadsHoverToggle { false };
     bool m_downloadsHoverClear { false };
     bool m_downloadsHoverShowAll { false };
     ULONGLONG m_downloadsHiddenAt { 0 };

@@ -113,101 +113,6 @@ inline Gdiplus::RectF toRectF(const RECT& rect)
     );
 }
 
-// The GDI+ twin of fillSolid, for panels that mix rounded-rect fills with GDI
-// text (see Browser::drawLabel). Use this INSTEAD of fillSolid whenever a
-// Gdiplus::Graphics is already open on the same DC.
-//
-// Mixing GDI and GDI+ on one DC is not supported - GDI+ takes the DC over
-// when a Graphics is constructed from an HDC and restores DC state of its own
-// choosing when it flushes. The observable result here was that DrawTextW
-// silently drew nothing at all: the sidebar's three segment labels came out as
-// an empty pill, with not one anti-aliased glyph pixel anywhere in the control,
-// while "No Bookmarks" a few lines above - same helper, same DC, same frame,
-// same colour for two of the three - rendered perfectly. The only thing
-// between the two was a raw fillSolid call.
-//
-// paintChrome never hit this because every one of its fillSolid calls happens
-// BEFORE the Graphics is constructed. paintSidebar and paintDownloadsPanel both
-// construct theirs first and fill afterwards, which is why the broken labels in
-// each are exactly the ones drawn after the last fillSolid: the sidebar's three
-// segment labels and its "Clear History", the panel's "Downloads" and "Clear".
-//
-// Declared after toRectF/toGdiColor because it uses both.
-inline void fillSolidGdiPlus(Gdiplus::Graphics& g, const RECT& rect, COLORREF color)
-{
-    Gdiplus::SolidBrush brush(toGdiColor(color));
-    g.FillRectangle(&brush, toRectF(rect));
-}
-
-// ---------------------------------------------------------------------------
-// GDI+ text, for text that has to live under a Graphics transform.
-//
-// drawLabel uses GDI's DrawTextW, which draws in DC space and therefore
-// IGNORES any Gdiplus::Transform on the same Graphics. That is fine for static
-// chrome, but the tab overview animates each card with a scale and a rise, and
-// a GDI-drawn title sitting inside a scaled card does not scale with it - the
-// label stays put at full size while the picture around it grows.
-//
-// So the overview's card titles use these instead. The font is reconstructed
-// from the same HFONT drawLabel uses, so the two paths stay visually identical
-// at rest; only the coordinate space differs.
-// ---------------------------------------------------------------------------
-
-inline Gdiplus::Font fontFromHFont(HFONT font)
-{
-    LOGFONTW lf { };
-    if (!GetObjectW(font, sizeof(lf), &lf))
-        return Gdiplus::Font(L"Segoe UI", 12.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-
-    Gdiplus::FontStyle style = lf.lfWeight >= FW_BOLD
-        ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular;
-    if (lf.lfItalic)
-        style |= Gdiplus::FontStyleItalic;
-
-    // lfHeight is a negative character height and a positive cell height;
-    // GDI+ always wants a positive em size in pixels.
-    const int emSize = lf.lfHeight < 0 ? -lf.lfHeight : lf.lfHeight;
-    return Gdiplus::Font(lf.lfFaceName, static_cast<Gdiplus::REAL>(emSize),
-        style, Gdiplus::UnitPixel);
-}
-
-// Draws left-aligned, vertically centred, on one line, ellipsised if it does
-// not fit - i.e. the DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
-// DT_END_ELLIPSIS case that drawLabel handles.
-//
-// The alpha is per-card, so the overview's cascade can fade a title in with the
-// rest of the card it belongs to. Text on a Graphics with a transform cannot be
-// faded any other way: DrawString is the only call here that does not take a
-// second Graphics to draw through, so the colour matrix trick used for the
-// thumbnail bitmap is not available.
-inline void drawLabelGdiPlus(Gdiplus::Graphics& g, HFONT font,
-    const std::wstring& text, const Gdiplus::RectF& rect, COLORREF color,
-    BYTE alpha = 255)
-{
-    Gdiplus::Font f = fontFromHFont(font);
-    Gdiplus::SolidBrush brush(toGdiColor(color, alpha));
-    Gdiplus::StringFormat format;
-    format.SetAlignment(Gdiplus::StringAlignmentNear);
-    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-    format.SetFormatFlags(static_cast<Gdiplus::StringFormatFlags>(
-        Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsNoPrefix));
-    g.DrawString(text.c_str(), -1, &f, rect, &format, &brush);
-}
-
-// Width the text would take with no limit. No trimming and no wrapping, so
-// this is the natural width the caller can compare against its available box.
-inline Gdiplus::SizeF measureLabelGdiPlus(Gdiplus::Graphics& g, HFONT font,
-    const std::wstring& text)
-{
-    Gdiplus::Font f = fontFromHFont(font);
-    Gdiplus::StringFormat format;
-    format.SetTrimming(Gdiplus::StringTrimmingNone);
-    format.SetFormatFlags(static_cast<Gdiplus::StringFormatFlags>(
-        Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsNoPrefix));
-    return g.MeasureString(text.c_str(), -1, &f, Gdiplus::PointF(0.0f, 0.0f), &format);
-}
-
 inline void addRoundedRect(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, Gdiplus::REAL radius)
 {
     if (rect.Width <= 0 || rect.Height <= 0)
@@ -427,42 +332,6 @@ inline void drawCloseIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color
     g.DrawLine(&pen, cx + 3.0f * k, cy - 3.0f * k, cx - 3.0f * k, cy + 3.0f * k);
 }
 
-// Two filled bars, the pause glyph on the downloads row.
-inline void drawPauseIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, float k)
-{
-    const float cx = (rect.left + rect.right) / 2.0f;
-    const float cy = (rect.top + rect.bottom) / 2.0f;
-
-    Gdiplus::SolidBrush brush(toGdiColor(color));
-    const float w = 1.7f * k;
-    const float h = 5.5f * k;
-    const float gap = 1.9f * k;
-    const Gdiplus::RectF left(cx - gap / 2.0f - w, cy - h / 2.0f, w, h);
-    const Gdiplus::RectF right(cx + gap / 2.0f, cy - h / 2.0f, w, h);
-    g.FillRectangle(&brush, left);
-    g.FillRectangle(&brush, right);
-}
-
-// The matching triangle. Filled rather than outlined so it reads at the same
-// 13px the pause bars do.
-inline void drawPlayIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, float k)
-{
-    const float cx = (rect.left + rect.right) / 2.0f;
-    const float cy = (rect.top + rect.bottom) / 2.0f;
-    const float s = 4.8f * k;
-
-    const Gdiplus::PointF points[3] = {
-        Gdiplus::PointF(cx - s * 0.42f, cy),
-        Gdiplus::PointF(cx + s * 0.58f, cy - s),
-        Gdiplus::PointF(cx + s * 0.58f, cy + s),
-    };
-
-    Gdiplus::SolidBrush brush(toGdiColor(color));
-    Gdiplus::GraphicsPath path;
-    path.AddPolygon(points, 3);
-    g.FillPath(&brush, &path);
-}
-
 inline void drawLockIcon(Gdiplus::Graphics& g, float cx, float cy, COLORREF color, float k)
 {
     Gdiplus::Pen pen(toGdiColor(color), 1.3f * k);
@@ -508,17 +377,14 @@ inline COLORREF colorFromHue(int hue)
 }
 
 // Placeholder "favicon": a rounded square with the site's first letter.
-// The alpha covers the letter as well as the tile - the tab overview fades both
-// together, and a hard-coded white glyph left at full strength while the tile
-// under it dissolves reads as a pop-in.
-inline void drawSiteBadge(Gdiplus::Graphics& g, const RECT& rect, wchar_t letter, COLORREF color, float k, BYTE alpha = 255)
+inline void drawSiteBadge(Gdiplus::Graphics& g, const RECT& rect, wchar_t letter, COLORREF color, float k)
 {
-    fillRoundedRect(g, rect, static_cast<int>(3.5f * k), color, alpha);
+    fillRoundedRect(g, rect, static_cast<int>(3.5f * k), color);
 
     wchar_t text[2] = { letter, 0 };
     Gdiplus::FontFamily family(L"Segoe UI");
     Gdiplus::Font font(&family, static_cast<Gdiplus::REAL>(rect.bottom - rect.top) * 0.62f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush brush(Gdiplus::Color(alpha, 255, 255, 255));
+    Gdiplus::SolidBrush brush(Gdiplus::Color(255, 255, 255, 255));
     Gdiplus::StringFormat format;
     format.SetAlignment(Gdiplus::StringAlignmentCenter);
     format.SetLineAlignment(Gdiplus::StringAlignmentCenter);

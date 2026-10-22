@@ -232,11 +232,11 @@ void pumpWatchdog()
                 if (entry.stamp == 0)
                     continue;
                 const int written = std::swprintf(tail + used, std::size(tail) - used,
-                    L"  %6llu ms ago  msg=0x%04X wParam=0x%llX %ls\r\n",
+                    L"  %6llu ms ago  msg=0x%04X wParam=0x%llX %s\r\n",
                     now - entry.stamp,
                     static_cast<unsigned>(entry.message),
                     static_cast<unsigned long long>(entry.wParam),
-                    entry.completed ? L"done" : L"STUCK");
+                    entry.completed ? "done" : "STUCK");
                 // A negative return means the line did not fit or failed to
                 // encode; either way there is nothing useful left to add, and
                 // adding it would run the index off the end of the buffer.
