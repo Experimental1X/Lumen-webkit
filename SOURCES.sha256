@@ -1,0 +1,49 @@
+# SHA-256 of every file in the Lumen zip, in standard sha256sum format, so it
+# can be regenerated or spot-checked with any tool.
+#
+# These hashes are taken over each file's TEXT with line endings normalised to
+# LF - not over the raw bytes. GitHub Desktop checks out with core.autocrlf
+# true and writes CRLF, while git stores LF, so a raw-byte hash would report
+# every single file STALE on a completely correct tree. verify-sources.ps1
+# normalises the same way, so the two always agree no matter how the checkout
+# happened to write the file. A real edit still changes the hash; only the
+# line-ending convention stops mattering.
+#
+# Regenerate on Linux/VM:
+#   find CMakeLists.txt src -type f | sort | xargs -I{} sh -c \
+#     'printf "%s  %s\n" "$(sed "s/\r$//" "{}" | sha256sum | cut -d" " -f1)" "{}"'
+#
+# Regenerate on Windows PowerShell:
+#   Get-ChildItem CMakeLists.txt, src\* -Recurse -File | Sort-Object FullName | % {
+#     $t = [IO.File]::ReadAllText($_.FullName) -replace "`r`n", "`n"
+#     $h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().
+#          ComputeHash([Text.Encoding]::UTF8.GetBytes($t))).Replace('-','').ToLower()
+#     "{0}  {1}" -f $h, $_.FullName.Substring($PWD.Path.Length+1).Replace('\','/')
+#   }
+#
+# Neither this file nor verify-sources.ps1 lists itself: a self-referencing
+# hash cannot converge.
+143d4378859d14a055404f9f6b785d084db8a179b2642bba7ec08501a9db8b9a  CMakeLists.txt
+f7240ba2e825dc6d79f538df50d31c7d7caf3e334b50a4a1badf7203c81f6826  src/browser.cpp
+a78be2c1098835b44925c67f6df05489c95d806280ff681fb1c38e672e53462a  src/browser.h
+fc233db98251a682ffaf4816a10e162c2723dcfc2aade3a37ca693107a87b14d  src/dialogs.cpp
+ada193a45318d57168a1687ebc76de767235c53483bb79105956be91e96e6f84  src/dialogs.h
+6e522b0be98672e68d623880a9de84c54a1cbb0616b74f1c301edbf81212004c  src/download_transfer.cpp
+a28884ec64e6d9b6bb5b99e55a48a0b464715e2cea262c7c02dca037bba4c362  src/download_transfer.h
+74b8e3a71fc74f18ef240168f24ec0c1f1c2359c9a54a7d2cb40ff21b73e854a  src/downloads.cpp
+16b57205947f850dba58b8de8237fd38d814a682ac0ed78255fd6765c64e10a2  src/downloads.h
+427ec7295a808f5928315139380a1512d2ae77ae1cdf765eb5164b4af9508cc0  src/downloads_page.h
+cd4a28a09c1723ba01c8dcf570a671f58822325f65a0cf9f946157ccca830295  src/gfx.h
+da3306cb21a483b23abec9adefaead0201b9079dbdc5e29cae558c12643850ee  src/library.cpp
+b8b6de2b8ec1f0566af9d89f2eea30e720c5158c02c0f4c3e96b5e1e4a334b92  src/library.h
+54a3b8c522f268d5306d5de1df40d367f9e67c46cdf34639552b8954fbe9fb0c  src/main.cpp
+dfca7e6fd1cac62826783dbbaf212b826c75bf375870c21af9f2240acd4075a6  src/settings.cpp
+5375801267afed399453ecd546e75a05edc140496e70e8a147e6abd95e2da811  src/settings.h
+8152406aaba5a88ef6b938fd4dc209966a1dfd4645fadbe6fe7b78d7585a83da  src/settings_page.h
+523d78c25c0351959dc74b8ebb3b9df3d74a9e651c349eb00677acb9a940cb70  src/start_page.h
+9886aad74bff7516f4f2283d4c42432994863adfa09f3112b497f134fcd903cd  src/util.cpp
+9f3c5a94eb0519a159dfa9feda2cd45fdfdb9be90ea696ff392e45e58fe0591b  src/util.h
+c31509cb860e4331f40d48046621ca0276ed5f31d8b634abbd059bb49c106d8a  src/webkit_host.cpp
+e04ef6aa63b0d0aad138ca514776521a4e5e2cf862bba90b6259725d649e6acf  src/webkit_host.h
+1a0c97e20284accfd4b745cac2f2f1a19a8f2374258f1fa82187855da79d04d8  src/webkit_ref.h
+a26438a29d79e5c6713f22ab1cdb6b034588a2a15e7ef0f0cccbab4158baa9b8  src/webkit_util.h

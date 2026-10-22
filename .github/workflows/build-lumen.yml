@@ -21,6 +21,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Fails by filename, in seconds, when the checkout is not exactly the
+      # tree the shipped zip contained. Cheap insurance against a stale-tree
+      # build that looks exactly like a code error.
+      - name: Verify sources match the shipped zip
+        shell: powershell
+        run: ./verify-sources.ps1
+
       - name: Download WebKit SDK
         env:
           GH_TOKEN: ${{ github.token }}
