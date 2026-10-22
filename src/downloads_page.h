@@ -41,6 +41,31 @@ inline std::string escapeHtml(const std::string& s)
 
 } // namespace
 
+// Row action icons as inline SVG rather than Unicode glyphs. The old code
+// spelled the pause symbol as two BLACK RIGHT-POINTING TRIANGLE characters,
+// which is indistinguishable from a fast-forward control - the exact thing it
+// was meant not to look like. Drawing the shapes also means they cannot go
+// missing when a font lacks a codepoint, and they match the icons the panel in
+// the browser chrome draws with GDI+.
+const char* const kIconPause
+    = "<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><rect x=\"4\" y=\"3\" width=\"3\" "
+      "height=\"10\" rx=\"1\"/><rect x=\"9\" y=\"3\" width=\"3\" height=\"10\" rx=\"1\"/></svg>";
+const char* const kIconResume
+    = "<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><polygon points=\"5,3.4 12.6,8 "
+      "5,12.6\"/></svg>";
+const char* const kIconStop
+    = "<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><rect x=\"3.6\" y=\"3.6\" "
+      "width=\"8.8\" height=\"8.8\" rx=\"1.5\"/></svg>";
+const char* const kIconOpen
+    = "<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M6.6 2.8h6.6v6.6h-1.9V5.7L6 "
+      "11 4 4l5.3-6.1H6.6Z\"/></svg>";
+const char* const kIconReveal
+    = "<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M2.6 12 12.2 2.4h1.4v1.4L4 "
+      "13.4H2.6Z\"/><rect x=\"1.9\" y=\"13.3\" width=\"12.2\" height=\"1.4\" rx=\".7\"/></svg>";
+const char* const kIconRemove
+    = "<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M4.1 2.9 8 6.8l3.9-3.9 1.2 "
+      "1.2L9.2 8l3.9 3.9-1.2 1.2L8 9.2l-3.9 3.9-1.2-1.2L6.8 8 2.9 4.1Z\"/></svg>";
+
 // A self-contained HTML page listing every download with live progress, in the
 // same visual style as the start page. The browser pushes an updated HTML
 // snapshot through WebView::loadHtml whenever Downloads::onChanged fires, so
@@ -91,7 +116,8 @@ inline std::string downloadsPageHtml(bool dark)
         ".actions{display:flex;flex-direction:column;gap:6px;min-width:32px}\n"
         ".icon{display:inline-flex;align-items:center;justify-content:center;"
         "width:30px;height:30px;border-radius:6px;color:var(--sub);text-decoration:none;"
-        "background:var(--track);font-size:14px}\n"
+        "background:var(--track)}\n"
+        ".icon svg{width:13px;height:13px;fill:currentColor;display:block}\n"
         ".icon:hover{color:var(--text);background:var(--bg1)}\n"
         ".icon.danger{color:var(--danger)}\n";
 
@@ -163,23 +189,46 @@ inline std::string downloadsPageHtml(bool dark)
             html += "</div>";
 
             const std::string idStr = std::to_string(item.id);
+            // Two separate transfer controls rather than one pause/resume
+            // toggle, so neither icon can be misread: the triangle only ever
+            // appears on a transfer that is genuinely paused and waiting, and
+            // the square is always the same place on every unfinished row.
+            // Each icon is appended with its own += rather than glued into
+            // the markup with `+`, because kIconPause and friends are
+            // `const char*` and "literal" + kIconPause would be pointer
+            // arithmetic on two unrelated addresses, not concatenation.
             html += "<div class=\"actions\">";
             switch (item.state) {
             case DownloadItem::State::Active:
-                if (item.resumable())
-                    html += "<a class=\"icon\" href=\"lumen:pause?id=" + idStr + "\" title=\"Pause\">\xE2\x96\xB6\xE2\x96\xB6</a>";
-                html += "<a class=\"icon danger\" href=\"lumen:cancel?id=" + idStr + "\" title=\"Cancel\">\xC3\x97</a>";
+                if (item.resumable()) {
+                    html += "<a class=\"icon\" href=\"lumen:pause?id=" + idStr + "\" title=\"Pause\">";
+                    html += kIconPause;
+                    html += "</a>";
+                }
+                html += "<a class=\"icon danger\" href=\"lumen:cancel?id=" + idStr + "\" title=\"Stop\">";
+                html += kIconStop;
+                html += "</a>";
                 break;
             case DownloadItem::State::Paused:
-                html += "<a class=\"icon\" href=\"lumen:resume?id=" + idStr + "\" title=\"Resume\">\xE2\x96\xB6</a>";
-                html += "<a class=\"icon danger\" href=\"lumen:cancel?id=" + idStr + "\" title=\"Cancel\">\xC3\x97</a>";
+                html += "<a class=\"icon\" href=\"lumen:resume?id=" + idStr + "\" title=\"Resume\">";
+                html += kIconResume;
+                html += "</a>";
+                html += "<a class=\"icon danger\" href=\"lumen:cancel?id=" + idStr + "\" title=\"Stop\">";
+                html += kIconStop;
+                html += "</a>";
                 break;
             case DownloadItem::State::Finished:
-                html += "<a class=\"icon\" href=\"lumen:open?id=" + idStr + "\" title=\"Open\">\xE2\x96\xB6</a>";
-                html += "<a class=\"icon\" href=\"lumen:reveal?id=" + idStr + "\" title=\"Show in folder\">\xE2\x86\x97</a>";
+                html += "<a class=\"icon\" href=\"lumen:open?id=" + idStr + "\" title=\"Open\">";
+                html += kIconOpen;
+                html += "</a>";
+                html += "<a class=\"icon\" href=\"lumen:reveal?id=" + idStr + "\" title=\"Show in folder\">";
+                html += kIconReveal;
+                html += "</a>";
                 break;
             default:
-                html += "<a class=\"icon danger\" href=\"lumen:remove?id=" + idStr + "\" title=\"Remove\">\xC3\x97</a>";
+                html += "<a class=\"icon danger\" href=\"lumen:remove?id=" + idStr + "\" title=\"Remove\">";
+                html += kIconRemove;
+                html += "</a>";
                 break;
             }
             html += "</div></div>\n";

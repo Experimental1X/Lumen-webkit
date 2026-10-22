@@ -330,10 +330,43 @@ bool Browser::stepAnimations()
         if (m_downloadsPanel && (m_downloadsVisible || m_panelAnim.value > 0.0))
             layoutDownloadsPanel();
         invalidateChrome();
+
+        // The tab overview is drawn into the CONTENT area, which resize(false)
+        // deliberately leaves alone and invalidateChrome never reaches, so
+        // without this the grid never repaints while its own spring is moving.
+        // It painted once - at whatever m_overviewAnim.value happened to be,
+        // which on the way in is still 0, and paintOverview returns early at 0
+        // after filling only the background - and then sat there for the whole
+        // half-second fade. That is the "overview animation is broken" report:
+        // a flat panel where the grid should be.
+        //
+        // Invalidate the whole content area here rather than just the grid's
+        // bounding box because the alpha changes on every tick. It is safe
+        // even though this is normally the path that avoids repainting the
+        // page area and its flash: every tab view is hidden for as long as
+        // the overview is up or fading out (stepAnimations restores them only
+        // once the spring has settled), so there is no WebKit surface
+        // underneath to repaint and nothing to flash.
+        if (m_overview || m_overviewAnim.value > 0.0)
+            invalidateContentArea();
     } else
         ensureAnimTimer();
 
     return moving;
+}
+
+void Browser::invalidateContentArea()
+{
+    if (!m_window)
+        return;
+
+    RECT client { };
+    GetClientRect(m_window, &client);
+
+    const LONG top = chromeHeight();
+    RECT area { 0, top, std::max<LONG>(0, client.right), std::max<LONG>(0, client.bottom) };
+    if (area.bottom > area.top)
+        InvalidateRect(m_window, &area, FALSE);
 }
 
 int Browser::sidebarWidthNow() const
@@ -1419,7 +1452,7 @@ LRESULT CALLBACK Browser::suggestionsProc(HWND window, UINT message, WPARAM wPar
         HDC dc = BeginPaint(window, &paint);
         RECT client { };
         GetClientRect(window, &client);
-        browser->paintBuffered(dc, client, [&](HDC memory) {
+        browser->paintBuffered(dc, client, POINT { 0, 0 }, [&](HDC memory) {
             browser->paintSuggestions(memory, static_cast<int>(client.right),
                 static_cast<int>(client.bottom));
         });
@@ -2129,25 +2162,31 @@ void Browser::onPaint(HDC target)
             fillSolid(target, pageArea, m_theme.page);
     }
 
+    // The overlay and the sidebar both start below the chrome, so both paint
+    // from the content area's top-left no matter how much of them is being
+    // repainted.
+    const POINT contentOrigin { 0, l.totalHeight };
+
     if (overviewUp) {
         if (update.top < content.bottom) {
             RECT area = content;
             IntersectRect(&area, &area, &update);
-            paintBuffered(target, area, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
+            paintBuffered(target, area, contentOrigin, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
         }
     } else if (sidebarWidth > 0 && update.left < sidebarWidth && update.top < content.bottom) {
         const RECT panel { 0, l.totalHeight, sidebarWidth, l.totalHeight + contentHeight };
         RECT area = panel;
         IntersectRect(&area, &area, &update);
-        paintBuffered(target, area, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
+        paintBuffered(target, area, contentOrigin, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
     }
 
-    // The chrome is drawn into an off-screen bitmap to avoid flicker.
+    // The chrome is drawn into an off-screen bitmap to avoid flicker. It owns
+    // the client's top-left, so its origin is (0,0).
     if (update.top < l.totalHeight) {
         const RECT chrome { 0, 0, width, l.totalHeight };
         RECT area = chrome;
         IntersectRect(&area, &area, &update);
-        paintBuffered(target, area, [&](HDC dc) { paintChrome(dc, l); });
+        paintBuffered(target, area, POINT { 0, 0 }, [&](HDC dc) { paintChrome(dc, l); });
     }
 }
 
@@ -2169,7 +2208,8 @@ void Browser::releaseBackBuffer()
     m_backHeight = 0;
 }
 
-void Browser::paintBuffered(HDC target, const RECT& area, const std::function<void(HDC)>& draw)
+void Browser::paintBuffered(HDC target, const RECT& area, const POINT& origin,
+    const std::function<void(HDC)>& draw)
 {
     const int width = area.right - area.left;
     const int height = area.bottom - area.top;
@@ -2205,19 +2245,25 @@ void Browser::paintBuffered(HDC target, const RECT& area, const std::function<vo
     // in the buffer rather than from its corner - otherwise a partial repaint
     // would put the wrong pixels on screen.
     //
-    // The draw callbacks paint in their *own* coordinates, with (0,0) at the
-    // top-left of whatever they own. The chrome starts at the top of the
-    // client so its origin is already (0,0), but the sidebar and the overview
-    // start below the chrome and paint from (0,0) too. The buffer, on the
-    // other hand, shares the client's origin, so for those two the origin has
-    // to be moved onto the area's corner first. Without this the top
-    // chromeHeight() pixels of the sidebar and the overview fall outside the
-    // clip region and are thrown away, and the blit reads rows that were
-    // never drawn - which is what collapsed the tab overview into a thin
-    // strip along the top of an otherwise black window.
+    // The draw callbacks paint their whole panel from their own (0,0): the
+    // chrome from the window's top-left, the sidebar and the overview from
+    // theirs, which sit below the chrome. `origin` is where that (0,0) lands
+    // in device space, and it is the top-left of the PANEL, not of `area`.
+    //
+    // That distinction is the whole reason this takes an explicit origin. If
+    // the viewport is moved onto the damaged slice's corner instead, then
+    // whenever only part of a panel is invalidated - a row hover, a scroll, the
+    // Clear History band appearing - the entire panel is drawn shifted down by
+    // however much of it was skipped, and the part that lands outside `area` is
+    // thrown away by the clip. For the sidebar that put the header and its
+    // segment labels in the middle of the list, or dropped them entirely on a
+    // repaint near the bottom, which is why the labels kept going invisible and
+    // the rows kept bleeding over the header. The buffer is never cleared, so
+    // the stale frame underneath showed through wherever the shift left a gap.
     POINT previousOrigin { };
-    SetViewportOrgEx(m_backDC, area.left, area.top, &previousOrigin);
+    SetViewportOrgEx(m_backDC, origin.x, origin.y, &previousOrigin);
 
+    // Clip regions are device coordinates, so this stays absolute.
     HRGN clip = CreateRectRgnIndirect(&area);
     SelectClipRgn(m_backDC, clip);
     DeleteObject(clip);
@@ -3543,17 +3589,37 @@ RECT downloadsActionRect(const RECT& row, int size, int margin)
     return { row.right - margin - size, top, row.right - margin, top + size };
 }
 
-// The pause / resume button sits immediately left of the trailing action
-// button, and only exists for rows that can actually be paused. Returns an
-// empty rect when there is nothing to click so callers can skip it without a
-// second condition. `gap` comes in from the caller because this is a free
-// function: px() is a Browser member and cannot be reached from here.
-RECT downloadsPauseRect(const RECT& row, int size, int margin, int gap, bool available)
+// The two buttons every download row ends with. `primary` is always the
+// rightmost button and holds whatever ends the row: Stop while the transfer is
+// still live, Show-in-folder once it has finished, Remove once it has failed or
+// been stopped. `toggle` is the Pause / Resume button immediately to its left,
+// and comes back empty when the row has nothing to toggle. Pinning both to a
+// fixed right edge is what stops the row reflowing when the transfer changes
+// state. `gap` comes in from the caller because this is a free function - px()
+// is a Browser member and cannot be reached from here.
+struct RowButtons {
+    RECT primary { };
+    RECT toggle { };
+};
+
+RowButtons rowButtonRects(const RECT& row, int size, int margin, int gap,
+    DownloadItem::State state, bool canToggle)
 {
-    if (!available)
-        return RECT { };
-    const RECT action = downloadsActionRect(row, size, margin);
-    return { action.left - gap - size, action.top, action.left - gap, action.bottom };
+    RowButtons buttons;
+    const RECT right = downloadsActionRect(row, size, margin);
+    buttons.primary = right;
+
+    // A settled row has nothing to pause or resume, so it gets a single button
+    // and does not reserve the slot.
+    const bool live = state == DownloadItem::State::Active
+        || state == DownloadItem::State::Paused;
+    if (live && canToggle) {
+        buttons.toggle.left = right.left - gap - size;
+        buttons.toggle.top = right.top;
+        buttons.toggle.right = right.left - gap;
+        buttons.toggle.bottom = right.bottom;
+    }
+    return buttons;
 }
 
 bool isRiskyFile(const std::wstring& path)
@@ -3626,7 +3692,7 @@ LRESULT CALLBACK Browser::downloadsProc(HWND window, UINT message, WPARAM wParam
         HDC dc = BeginPaint(window, &paint);
         RECT client { };
         GetClientRect(window, &client);
-        browser->paintBuffered(dc, client, [&](HDC memory) {
+        browser->paintBuffered(dc, client, POINT { 0, 0 }, [&](HDC memory) {
             browser->paintDownloadsPanel(memory, static_cast<int>(client.right), static_cast<int>(client.bottom));
         });
         EndPaint(window, &paint);
@@ -3739,7 +3805,7 @@ void Browser::hideDownloadsPanel(bool refocusPage)
     m_downloadsVisible = false;
     m_downloadsHoverRow = -1;
     m_downloadsHoverAction = false;
-    m_downloadsHoverPause = false;
+    m_downloadsHoverToggle = false;
     m_downloadsHoverClear = false;
     m_downloadsHoverShowAll = false;
 
@@ -3849,13 +3915,23 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
         const RECT badgeRect { row.left + px(18), row.top + (rowHeight - badge) / 2, row.left + px(18) + badge, row.top + (rowHeight - badge) / 2 + badge };
         drawSiteBadge(g, badgeRect, badgeLetter(extension), colorFromHue(hueOf(extension)), k * 1.6f);
 
-        const RECT action = downloadsActionRect(row, actionSize, actionMargin);
-        // Pause / resume only where the transfer is one we own. A WKDownload
-        // row has no engine-level pause, so it gets the old single button.
-        const bool canPause = item.resumable();
-        const RECT pauseRect = downloadsPauseRect(row, actionSize, actionMargin, px(8), canPause);
+        // Which two buttons this row ends with. The toggle is Pause while the
+        // transfer is running and Resume only once it is actually paused, so
+        // the play triangle never sits on a row that is already downloading -
+        // which is what made the old single toggle read as a fast-forward
+        // control. A WKDownload row has no engine-level pause, so it gets no
+        // toggle at all; the primary Stop still works on it.
+        const bool paused = item.state == DownloadItem::State::Paused;
+        const RowButtons buttons = rowButtonRects(row, actionSize, actionMargin,
+            px(8), item.state, item.resumable());
         const int textLeft = badgeRect.right + px(12);
-        const int textRight = (canPause ? pauseRect.left : action.left) - px(10);
+        // A settled row has no toggle, so the text runs to the primary button
+        // instead. Testing the rect rather than the state keeps the two in
+        // step even if the layout rules change later.
+        const int textRight
+            = (buttons.toggle.right > buttons.toggle.left ? buttons.toggle.left
+                                                           : buttons.primary.left)
+            - px(10);
 
         const RECT nameRect { textLeft, row.top + px(10), textRight, row.top + px(10) + px(20) };
         drawLabel(dc, g, item.filename, nameRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -3917,26 +3993,37 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
             }
         }
 
-        // Round button: cancel, show in folder, or remove.
-        const bool actionHot = hot && m_downloadsHoverAction;
-        fillRoundedRect(g, action, actionSize / 2, actionHot ? m_theme.glassHover : m_theme.pillHover);
+        // Primary: Stop while the transfer is live, Show in folder once it has
+        // finished, Remove once it failed or was stopped. Stop and Remove are
+        // destructive but not undoable, so they keep the cross rather than
+        // borrowing the square.
+        const bool primaryHot = hot && m_downloadsHoverAction;
+        fillRoundedRect(g, buttons.primary, actionSize / 2,
+            primaryHot ? m_theme.glassHover : m_theme.pillHover);
         if (item.state == DownloadItem::State::Finished)
-            drawMagnifierIcon(g, action, m_theme.text, k);
+            drawMagnifierIcon(g, buttons.primary, m_theme.text, k);
+        else if (item.state == DownloadItem::State::Active || paused)
+            drawStopIcon(g, buttons.primary,
+                primaryHot ? m_theme.text : m_theme.textSecondary, k);
         else
-            drawCloseIcon(g, action, m_theme.text, k);
+            drawCloseIcon(g, buttons.primary, m_theme.text, k);
 
-        // Pause, or play once it is paused. Drawn to the left of the trailing
-        // button so the destructive action stays in the same place on every
-        // row, which is what makes the row muscle-memory work.
-        if (canPause) {
-            const bool pauseHot = hot && m_downloadsHoverPause;
-            const COLORREF tint = pauseHot ? m_theme.text : m_theme.textSecondary;
-            fillRoundedRect(g, pauseRect, actionSize / 2,
-                pauseHot ? m_theme.glassHover : m_theme.pillHover);
-            if (item.state == DownloadItem::State::Paused)
-                drawPlayIcon(g, pauseRect, tint, k);
+        // Toggle: two bars while running, a bare triangle while paused. They
+        // are different shapes rather than the same glyph in two colours, so
+        // the button cannot read as fast-forward at any zoom.
+        if (buttons.toggle.right > buttons.toggle.left) {
+            const bool toggleHot = hot && m_downloadsHoverToggle;
+            // Resume is drawn in the accent because it is the one thing a
+            // paused row is waiting for; Pause stays neutral so the two never
+            // compete for attention.
+            fillRoundedRect(g, buttons.toggle, actionSize / 2,
+                toggleHot ? m_theme.glassHover
+                          : (paused ? m_theme.pillFocused : m_theme.pillHover));
+            const COLORREF icon = paused ? m_theme.accent : m_theme.textSecondary;
+            if (paused)
+                drawPlayIcon(g, buttons.toggle, icon, k);
             else
-                drawPauseIcon(g, pauseRect, tint, k);
+                drawPauseIcon(g, buttons.toggle, icon, k);
         }
     }
 
@@ -4010,24 +4097,24 @@ void Browser::downloadsClick(POINT point)
             continue;
 
         const DownloadItem& item = items[i];
-        const RECT action = downloadsActionRect(row, px(26), px(16));
 
-        // Pause / resume first: it sits left of the action button, and the
-        // two rects never overlap, so the order here only matters for clarity.
-        if (item.resumable()) {
-            const RECT pauseRect = downloadsPauseRect(row, px(26), px(16), px(8), true);
-            if (PtInRect(&pauseRect, point)) {
-                if (item.state == DownloadItem::State::Paused)
-                    Downloads::instance().resume(item.id);
-                else
-                    Downloads::instance().pause(item.id);
-                return;
-            }
+        // Same availability rule the painter uses, so what lights up under the
+        // cursor and what the click actually does can never disagree.
+        const bool paused = item.state == DownloadItem::State::Paused;
+        const RowButtons buttons = rowButtonRects(row, px(26), px(16), px(8),
+            item.state, item.resumable());
+
+        if (buttons.toggle.right > buttons.toggle.left
+            && PtInRect(&buttons.toggle, point)) {
+            if (paused)
+                Downloads::instance().resume(item.id);
+            else
+                Downloads::instance().pause(item.id);
+            return;
         }
 
-        if (PtInRect(&action, point)) {
-            if (item.state == DownloadItem::State::Active
-                || item.state == DownloadItem::State::Paused)
+        if (PtInRect(&buttons.primary, point)) {
+            if (item.state == DownloadItem::State::Active || paused)
                 Downloads::instance().cancel(item.id);
             else if (item.state == DownloadItem::State::Finished)
                 revealDownloadedFile(item.path);
@@ -4055,7 +4142,7 @@ void Browser::downloadsMove(POINT point)
 
     int hoverRow = -1;
     bool hoverAction = false;
-    bool hoverPause = false;
+    bool hoverToggle = false;
     bool hoverClear = false;
     bool hoverShowAll = false;
 
@@ -4074,25 +4161,25 @@ void Browser::downloadsMove(POINT point)
                     continue;
 
                 hoverRow = static_cast<int>(i);
-                const RECT action = downloadsActionRect(row, px(26), px(16));
-                hoverAction = PtInRect(&action, point) != FALSE;
-                if (items[i].resumable()) {
-                    const RECT pauseRect = downloadsPauseRect(row, px(26), px(16), px(8), true);
-                    hoverPause = PtInRect(&pauseRect, point) != FALSE;
-                }
+                const DownloadItem& item = items[i];
+                const RowButtons buttons = rowButtonRects(row, px(26), px(16),
+                    px(8), item.state, item.resumable());
+                hoverAction = PtInRect(&buttons.primary, point) != FALSE;
+                if (buttons.toggle.right > buttons.toggle.left)
+                    hoverToggle = PtInRect(&buttons.toggle, point) != FALSE;
                 break;
             }
         }
     }
 
     if (hoverRow == m_downloadsHoverRow && hoverAction == m_downloadsHoverAction
-        && hoverPause == m_downloadsHoverPause
+        && hoverToggle == m_downloadsHoverToggle
         && hoverClear == m_downloadsHoverClear && hoverShowAll == m_downloadsHoverShowAll)
         return;
 
     m_downloadsHoverRow = hoverRow;
     m_downloadsHoverAction = hoverAction;
-    m_downloadsHoverPause = hoverPause;
+    m_downloadsHoverToggle = hoverToggle;
     m_downloadsHoverClear = hoverClear;
     m_downloadsHoverShowAll = hoverShowAll;
     InvalidateRect(m_downloadsPanel, nullptr, FALSE);
@@ -4128,20 +4215,46 @@ void Browser::revealDownloadedFile(const std::wstring& path)
 
 void Browser::showDownloadsPage()
 {
-    // Open a new tab that lists every download. The browser pushes an
-    // updated HTML snapshot to it whenever Downloads::onChanged fires, so
-    // the page itself does not have to self-reload.
-    auto view = m_host.createView(m_window);
-    if (!view)
+    // Switching to the Downloads tab that is already open, rather than opening
+    // another one. This used to create a fresh WebView on every click, which
+    // is both wrong (Safari brings the existing tab forward, the toolbar button
+    // does the same) and a crash: each click ran another WKViewCreate, and the
+    // one immediately before the recorded crash killed the process outright.
+    // openSettings() has guarded its tab this way since the Settings pane landed;
+    // Downloads was simply never given the same treatment.
+    if (m_downloadsPageTab != static_cast<size_t>(-1)
+        && m_downloadsPageTab < m_tabs.size()) {
+        activateTab(m_downloadsPageTab);
+        // Push a fresh snapshot so the page reflects anything that happened
+        // while another tab was in front, rather than waiting for the next tick.
+        m_downloadsPagePushedAt = GetTickCount64();
+        if (auto* view = m_tabs[m_downloadsPageTab].get())
+            view->loadHtml(downloadsPageHtml(m_theme.dark));
         return;
+    }
+
+    // Breadcrumbs. A crash anywhere in the three steps below used to end with
+    // nothing at all in lumen.log - no watchdog entry, no last line - because
+    // the only log call in this path comes from inside createView, after the
+    // part that actually faults. These say how far it got.
+    log(L"Downloads page: creating tab.");
+    auto view = m_host.createView(m_window);
+    if (!view) {
+        log(L"Downloads page: createView failed.");
+        return;
+    }
 
     WebView* raw = view.get();
     attachCallbacks(raw);
     m_tabs.push_back(std::move(view));
     m_downloadsPageTab = m_tabs.size() - 1;
 
+    log(L"Downloads page: activating tab.");
     activateTab(m_downloadsPageTab);
+    log(L"Downloads page: loading HTML.");
     raw->loadHtml(downloadsPageHtml(m_theme.dark));
+    m_downloadsPagePushedAt = GetTickCount64();
+    log(L"Downloads page: ready.");
     invalidateChrome();
 }
 

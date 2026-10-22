@@ -239,8 +239,9 @@ private:
     // resize passes true because the page area really did change shape.
     void resize(bool wholeClient = true);
     void invalidateSidebarColumn();
+    void invalidateContentArea();
     RECT contentArea() const;
-    void paintBuffered(HDC target, const RECT& area, const std::function<void(HDC)>& draw);
+    void paintBuffered(HDC target, const RECT& area, const POINT& origin, const std::function<void(HDC)>& draw);
     // Reused back buffer for paintBuffered. A window-sized bitmap is about
     // eight megabytes; making a fresh one per WM_PAINT was costing more than
     // the drawing did, and the flicker came from blitting an untouched area
@@ -419,9 +420,13 @@ private:
 
     int m_downloadsScroll { 0 };
     int m_downloadsHoverRow { -1 };
+    // The row's right-hand button: Stop while live, Show in folder once
+    // finished, Remove once failed or stopped.
     bool m_downloadsHoverAction { false };
-    // The pause / resume round button, which only exists on rows we own.
-    bool m_downloadsHoverPause { false };
+    // The Pause / Resume button immediately to its left. Separate from the
+    // primary so the two highlight independently - they are different actions
+    // and used to be collapsed into one ambiguous toggle.
+    bool m_downloadsHoverToggle { false };
     bool m_downloadsHoverClear { false };
     bool m_downloadsHoverShowAll { false };
     ULONGLONG m_downloadsHiddenAt { 0 };
