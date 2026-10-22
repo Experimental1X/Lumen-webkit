@@ -353,6 +353,7 @@ private:
     int overviewMaxScroll(int width, int height) const;
     void showOverview();
     void hideOverview();
+    void setOverview(bool up);
     void captureThumbnail(WebView& view);
     bool overviewClick(POINT local, int width, int height);
     void overviewMove(POINT local, int width);

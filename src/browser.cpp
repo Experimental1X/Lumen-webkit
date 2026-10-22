@@ -321,9 +321,9 @@ bool Browser::stepAnimations()
         ShowWindow(m_find, SW_HIDE);
 
     // The tab overview hides every tab view while it is up, so the page only
-    // comes back once the overlay has finished easing away.
-    if (!m_overview && m_overviewAnim.settled() && m_overviewAnim.value <= 0.0 && m_active < m_tabs.size())
-        m_tabs[m_active]->setVisible(true);
+    // comes back once the overlay has finished easing away. That restore is at
+    // the bottom of this function, where it can happen after the geometry has
+    // been corrected.
 
     if (moving) {
         resize(false);
@@ -351,6 +351,35 @@ bool Browser::stepAnimations()
             invalidateContentArea();
     } else
         ensureAnimTimer();
+
+    // The moment the overview stops owning the page, the views have to be put
+    // back where they belong - and resize() above will not have done it.
+    //
+    // resize() skips the view loop entirely while overviewOwnsThePage is true,
+    // which is right: the views are hidden, nothing on screen can be wrong
+    // about their geometry, and moving a hidden WebKit child is not free. But
+    // that also means every view is still parked at the geometry it had before
+    // the overview opened. If the window was resized, or the sidebar toggled,
+    // in the meantime, those coordinates are now stale, and they stay stale -
+    // because the one tick that brings the spring to rest is not obliged to
+    // report movement, so it need not take the resize(false) branch above.
+    //
+    // That is the "the settings page sometimes shifts to left, when sidebar
+    // opened" report: the sidebar panel, which this window draws itself,
+    // animates in over a page that was never moved out from under it. Settings
+    // is the page that shows it worst, because its two-pane layout is
+    // fixed-width, so the whole left column appears to slide.
+    //
+    // Do the move here rather than trusting the tick, and do it before
+    // restoring the view, so the tab is never shown at a geometry it is about
+    // to be moved away from. This runs once, on the settled tick: the anim
+    // timer is already dead by then (ensureAnimTimer above), and resize() is
+    // a no-op once every view reports the geometry it wants.
+    if (!m_overview && m_overviewAnim.settled() && m_overviewAnim.value <= 0.0
+        && m_active < m_tabs.size()) {
+        resize(false);
+        m_tabs[m_active]->setVisible(true);
+    }
 
     return moving;
 }
@@ -780,7 +809,7 @@ WebView* Browser::active() const
 bool Browser::newTab(const std::wstring& url)
 {
     // Opening a tab leaves the overview; activateTab shows the right view.
-    m_overview = false;
+    setOverview(false);
 
     auto view = m_host.createView(m_window);
     if (!view)
@@ -1953,15 +1982,33 @@ void Browser::onMouseMove(POINT point)
 
 void Browser::onMouseLeave()
 {
+    // Which panel owned the highlight decides what has to be repainted, and
+    // that has to be read before the flags are cleared.
+    const bool hadOverviewHover = m_overviewHoverCard != -1;
+    const bool hadSidebarHover = m_sidebarHoverRow != -1;
+
     clearHover();
 
-    if (m_overviewHoverCard != -1 || m_sidebarHoverRow != -1) {
-        m_overviewHoverCard = -1;
-        m_overviewHoverClose = false;
-        m_sidebarHoverRow = -1;
-        m_sidebarHoverClose = false;
-        InvalidateRect(m_window, nullptr, FALSE);
-    }
+    if (!hadOverviewHover && !hadSidebarHover)
+        return;
+
+    m_overviewHoverCard = -1;
+    m_overviewHoverClose = false;
+    m_sidebarHoverRow = -1;
+    m_sidebarHoverClose = false;
+
+    // Only the panel that just lost a highlight changed. This used to
+    // invalidate the whole client, which is the "the sidebar items sometimes
+    // flickers the whole browser" report: a whole-window invalidate clears the
+    // page fill behind the web view and lays it down again, so every time the
+    // cursor crossed out of a history row the entire browser flashed, page
+    // included. sidebarMove() already scopes its own invalidate to the sidebar
+    // column for exactly this reason - leaving the window was the one path that
+    // had not been converted.
+    if (hadOverviewHover)
+        invalidateContentArea();
+    else
+        invalidateSidebarColumn();
 }
 
 void Browser::onNcMouseMove()
@@ -2858,15 +2905,12 @@ void Browser::showOverview()
     if (WebView* current = active())
         captureThumbnail(*current);
 
-    m_overview = true;
     m_overviewScroll = 0;
-    m_overviewHoverCard = -1;
-    m_overviewHoverClose = false;
+    setOverview(true);
 
     for (auto& tab : m_tabs)
         tab->setVisible(false);
 
-    syncAnimations();
     SetFocus(m_window);
     InvalidateRect(m_window, nullptr, FALSE);
 }
@@ -2876,18 +2920,57 @@ void Browser::hideOverview()
     if (!m_overview)
         return;
 
-    m_overview = false;
-    m_overviewHoverCard = -1;
-    m_overviewHoverClose = false;
-
     // The tab views stay hidden until the overlay has finished easing out, so
     // the page is revealed by the fade instead of snapping in behind it.
     // stepAnimations() is what brings them back.
-    syncAnimations();
+    setOverview(false);
     resize();
     if (auto* view = active())
         view->focus();
     InvalidateRect(m_window, nullptr, FALSE);
+}
+
+void Browser::setOverview(bool up)
+{
+    if (m_overview == up)
+        return;
+
+    m_overview = up;
+    m_overviewHoverCard = -1;
+    m_overviewHoverClose = false;
+
+    // This is the only place m_overview is written, and it is the only place
+    // that has to move the spring.
+    //
+    // syncAnimations() is what copies m_overview into m_overviewAnim.target,
+    // and three entry points used to write the flag and skip it: overviewClick
+    // picking a card, newTab(), and openPageFromWebKit() for target=_blank. A
+    // flag changed without its target leaves the spring aimed at 1 with its
+    // value already at 1, so stepAnimations() sees target == value, reports no
+    // movement and stops the timer - and nothing ever brings it back down. The
+    // overlay then never fades out and onPaint's overviewUp stays true, which
+    // is the state every one of these symptoms was read from:
+    //
+    //   - the grid sits on screen with no way off it. In the 2026-10-22 60fps
+    //     recording it opened at t=113.13s and was still there at t=125.0s, the
+    //     selected tab having already changed in the tab bar behind it. It
+    //     cleared only at t=140.13s, 27 seconds later, when something else
+    //     happened to call syncAnimations() and finally aimed it at zero.
+    //   - picking a tab has no transition at all, because the fade-out that
+    //     the transition is made of never runs.
+    //   - resize() refuses to move any view while m_overviewAnim.value > 0 (see
+    //     overviewOwnsThePage there), so every tab view stays parked at whatever
+    //     geometry it had before the overview opened. Toggle the sidebar
+    //     afterwards and the panel animates in over a page that was never
+    //     moved right - the Settings page, which is fixed-layout, reads as
+    //     having jumped left.
+    //   - and it makes every later paint cost full-window money for nothing:
+    //     with overviewUp true, onPaint repaints the whole content area on
+    //     every mouse move over the sidebar.
+    //
+    // No caller writes m_overview directly any more. If a new one appears,
+    // route it through here.
+    syncAnimations();
 }
 
 std::vector<Browser::OverviewCard> Browser::overviewLayout(int width) const
@@ -2951,9 +3034,10 @@ bool Browser::overviewClick(POINT local, int width, int height)
             return true;
         }
         if (PtInRect(&cards[i].card, local)) {
-            m_overview = false;
-            m_overviewHoverCard = -1;
-            m_overviewHoverClose = false;
+            // Through setOverview, not a bare flag: this is the path that
+            // switches tabs, so it is also the transition out of the overview.
+            // See setOverview for what skipping syncAnimations() costs.
+            setOverview(false);
             activateTab(i);
             InvalidateRect(m_window, nullptr, FALSE);
             return true;
@@ -3634,7 +3718,7 @@ void Browser::attachCallbacks(WebView* view)
 WKPageRef Browser::openPageFromWebKit(WKPageConfigurationRef configuration)
 {
     // A link with target=_blank or window.open: show it as a new tab.
-    m_overview = false;
+    setOverview(false);
 
     auto view = m_host.createView(m_window, configuration);
     if (!view)
