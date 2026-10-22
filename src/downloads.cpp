@@ -589,7 +589,7 @@ void Downloads::startTransfer(std::wstring url)
     startWinhttpTransfer(id, std::move(url));
 }
 
-std::wstring Downloads::destinationFor(unsigned id) const
+std::wstring Downloads::destinationFor(unsigned id)
 {
     Lock lock(m_lock);
     if (DownloadItem* item = findIdLocked(id))
@@ -597,7 +597,7 @@ std::wstring Downloads::destinationFor(unsigned id) const
     return { };
 }
 
-bool Downloads::stillActive(unsigned id) const
+bool Downloads::stillActive(unsigned id)
 {
     Lock lock(m_lock);
     if (DownloadItem* item = findIdLocked(id))

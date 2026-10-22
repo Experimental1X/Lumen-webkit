@@ -2207,9 +2207,17 @@ void Browser::paintOverview(HDC dc, int width, int height)
     // the thread that also has to answer clicks. Keep one and grow it only when
     // the window outgrows it; paintOverviewContent fills the whole surface
     // before it draws anything, so nothing stale can survive.
+    // GetWidth/GetHeight return Gdiplus::INT, which does not compare cleanly
+    // against plain int under /W4 - the compiler flags a signed/unsigned
+    // mismatch on the comparison. Explicit casts through the same width type
+    // make the intent obvious and the warning go away.
+    const int surfaceWidth = m_overviewSurface
+        ? static_cast<int>(m_overviewSurface->GetWidth()) : 0;
+    const int surfaceHeight = m_overviewSurface
+        ? static_cast<int>(m_overviewSurface->GetHeight()) : 0;
     if (!m_overviewSurface
-        || m_overviewSurface->GetWidth() < width
-        || m_overviewSurface->GetHeight() < height) {
+        || surfaceWidth < width
+        || surfaceHeight < height) {
         releaseOverviewSurface();
         m_overviewSurface = new Gdiplus::Bitmap(width, height, PixelFormat32bppPARGB);
         log(L"Overview surface resized.");

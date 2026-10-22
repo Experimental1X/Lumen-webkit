@@ -93,9 +93,13 @@ DWORD statusOf(HINTERNET request)
 {
     DWORD status = 0;
     DWORD size = sizeof(status);
+    // nullptr for the header name, not WINHTTP_HEADER_NAME: that macro is
+    // NULL in this SDK, and with /permissive- the compiler reads the
+    // expansion as a type in this argument position and rejects it
+    // (C2275). nullptr is the same value spelled in a way that compiles.
     if (!WinHttpQueryHeaders(request,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME, &status, &size, WINHTTP_NO_HEADER_INDEX))
+            nullptr, &status, &size, WINHTTP_NO_HEADER_INDEX))
         return 0;
     return status;
 }
@@ -105,7 +109,7 @@ long long contentLengthOf(HINTERNET request)
     wchar_t value[64] { };
     DWORD size = sizeof(value);
     if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH,
-            WINHTTP_HEADER_NAME, value, &size, WINHTTP_NO_HEADER_INDEX))
+            nullptr, value, &size, WINHTTP_NO_HEADER_INDEX))
         return -1;
     return _wtoi64(value);
 }
@@ -114,10 +118,53 @@ std::wstring headerOf(HINTERNET request, DWORD info)
 {
     wchar_t value[2048] { };
     DWORD size = sizeof(value);
-    if (!WinHttpQueryHeaders(request, info, WINHTTP_HEADER_NAME,
+    if (!WinHttpQueryHeaders(request, info, nullptr,
             value, &size, WINHTTP_NO_HEADER_INDEX))
         return { };
-    return std::wstring(value, size / sizeof(wchar_t));
+    if (size > sizeof(value))
+        size = sizeof(value);
+
+    // WinHttpQueryHeaders does not agree with itself about whether the byte
+    // count it reports includes the terminating null, and the two versions of
+    // the header disagree between Windows releases. Build the string, then
+    // strip any trailing nulls: correct either way.
+    std::wstring result(value, size / sizeof(wchar_t));
+    while (!result.empty() && result.back() == L'\0')
+        result.pop_back();
+    return result;
+}
+
+// Resolves a Location header against the URL it came from. Mirrors routinely
+// redirect with a root-relative path ("/next/f9a9...") rather than an absolute
+// URL, and handing that straight back to WinHttpCrackUrl fails - the scheme
+// and host are missing. Only the two forms we actually see are handled:
+// absolute (used as-is) and root-relative (scheme + host prepended).
+std::wstring resolveLocation(const std::wstring& location, const std::wstring& base)
+{
+    if (location.empty())
+        return { };
+    if (location.find(L"://") != std::wstring::npos)
+        return location;
+
+    const size_t scheme = base.find(L"://");
+    if (scheme == std::wstring::npos)
+        return location;
+
+    const size_t hostStart = scheme + 3;
+    size_t hostEnd = base.find_first_of(L"/?#", hostStart);
+    if (hostEnd == std::wstring::npos)
+        hostEnd = base.size();
+
+    std::wstring authority = base.substr(0, hostEnd);
+    if (location[0] == L'/')
+        return authority + location;
+
+    // Path-relative: replace the last path segment of the base.
+    const size_t lastSlash = base.find_last_of(L'/', hostEnd);
+    const std::wstring directory = lastSlash == std::wstring::npos
+        ? authority + L"/"
+        : base.substr(0, lastSlash + 1);
+    return directory + location;
 }
 
 } // namespace
@@ -166,16 +213,22 @@ void runWinhttpTransfer(unsigned id, std::wstring url)
             finalError = L"WinHttpSendRequest failed";
             break;
         }
-        if (!WinHttpReceiveResponse(request.get())) {
+        // Two parameters: the request and a reserved LPVOID, which has been
+        // unused since Windows 2000 and is always NULL. The one-argument
+        // form people remember from the docs does not exist in the header.
+        if (!WinHttpReceiveResponse(request.get(), nullptr)) {
             finalError = L"WinHttpReceiveResponse failed";
             break;
         }
 
         const DWORD status = statusOf(request.get());
         if (status >= 300 && status < 400) {
-            const std::wstring location = headerOf(request.get(), WINHTTP_QUERY_LOCATION);
+            // 304 Not Modified carries no body and no usable Location - treat
+            // it as terminal rather than looping on an empty redirect.
+            const std::wstring location = resolveLocation(
+                headerOf(request.get(), WINHTTP_QUERY_LOCATION), url);
             if (location.empty() || redirect == kMaxRedirects) {
-                finalError = L"redirect with no Location header ("
+                finalError = L"redirect with no usable Location header ("
                            + std::to_wstring(static_cast<int>(status)) + L")";
                 break;
             }

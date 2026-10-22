@@ -64,11 +64,14 @@ public:
     void reportFinish(unsigned id, long long finalTotal);
     void reportFail(unsigned id, std::wstring reason);
     // Returns the destination path for an item the worker is transferring,
-    // or empty if the item disappeared (cancelled and removed).
-    std::wstring destinationFor(unsigned id) const;
+    // or empty if the item disappeared (cancelled and removed). Not const:
+    // it goes through findIdLocked, which hands back a mutable item because
+    // the WebKit callbacks update fields through it. Both are always called
+    // on the non-const singleton.
+    std::wstring destinationFor(unsigned id);
     // Used by the WinHTTP worker between chunks to detect a cancel or
     // removal. Cheap; takes the m_lock briefly.
-    bool stillActive(unsigned id) const;
+    bool stillActive(unsigned id);
 
     // Window the browser pumps Download notifications through. Set once at
     // startup; nullptr falls back to a direct call (used by the
@@ -110,7 +113,11 @@ private:
     // buttons all run on the UI thread, so both sides need this.
     mutable CRITICAL_SECTION m_lock;
 
-    // Both require m_lock to be held by the caller.
+    // Both require m_lock to be held by the caller. Neither is const: they
+    // hand back a mutable DownloadItem* so decideDestination and the
+    // didWriteData/didFinish callbacks can update fields in place. Making
+    // them const would yield const DownloadItem* (m_items is const inside a
+    // const method) and break every one of those writers.
     DownloadItem* findLocked(WKDownloadRef download);
     DownloadItem* findIdLocked(unsigned id);
 
