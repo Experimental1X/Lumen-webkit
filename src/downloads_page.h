@@ -86,6 +86,7 @@ inline std::string downloadsPageHtml(bool dark)
         "text-overflow:ellipsis;white-space:nowrap}\n"
         ".bar{height:4px;background:var(--track);border-radius:2px;margin-top:10px;overflow:hidden}\n"
         ".fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s}\n"
+        ".fill.paused{opacity:.4}\n"
         ".pulse{width:33%;margin:0 auto;opacity:.7}\n"
         ".actions{display:flex;flex-direction:column;gap:6px;min-width:32px}\n"
         ".icon{display:inline-flex;align-items:center;justify-content:center;"
@@ -116,6 +117,14 @@ inline std::string downloadsPageHtml(bool dark)
                 else
                     status = L"Starting…";
                 break;
+            case DownloadItem::State::Paused:
+                if (item.received > 0)
+                    status = formatBytes(item.received) + L" of "
+                        + (item.total > 0 ? formatBytes(item.total) : L"?")
+                        + L" — Paused";
+                else
+                    status = L"Paused";
+                break;
             case DownloadItem::State::Finished:
                 status = formatBytes(item.total > 0 ? item.total : item.received);
                 if (!item.source.empty())
@@ -134,12 +143,17 @@ inline std::string downloadsPageHtml(bool dark)
                 html += "<div class=\"source\">" + escapeHtml(toUtf8(item.source)) + "</div>";
             }
 
-            if (item.state == DownloadItem::State::Active) {
+            if (item.state == DownloadItem::State::Active
+                || item.state == DownloadItem::State::Paused) {
                 html += "<div class=\"bar\">";
                 if (item.total > 0) {
                     const double fraction = std::clamp(static_cast<double>(item.received) / static_cast<double>(item.total), 0.0, 1.0);
                     const int pct = static_cast<int>(fraction * 100);
-                    html += "<div class=\"fill\" style=\"width:" + std::to_string(pct) + "%\"></div>";
+                    // Paused rows keep the bar so the bytes already fetched are
+                    // still visible, dimmed so they do not read as running.
+                    html += "<div class=\"fill"
+                        + std::string(item.state == DownloadItem::State::Paused ? " paused" : "")
+                        + "\" style=\"width:" + std::to_string(pct) + "%\"></div>";
                 } else {
                     html += "<div class=\"fill pulse\"></div>";
                 }
@@ -152,6 +166,12 @@ inline std::string downloadsPageHtml(bool dark)
             html += "<div class=\"actions\">";
             switch (item.state) {
             case DownloadItem::State::Active:
+                if (item.resumable())
+                    html += "<a class=\"icon\" href=\"lumen:pause?id=" + idStr + "\" title=\"Pause\">\xE2\x96\xB6\xE2\x96\xB6</a>";
+                html += "<a class=\"icon danger\" href=\"lumen:cancel?id=" + idStr + "\" title=\"Cancel\">\xC3\x97</a>";
+                break;
+            case DownloadItem::State::Paused:
+                html += "<a class=\"icon\" href=\"lumen:resume?id=" + idStr + "\" title=\"Resume\">\xE2\x96\xB6</a>";
                 html += "<a class=\"icon danger\" href=\"lumen:cancel?id=" + idStr + "\" title=\"Cancel\">\xC3\x97</a>";
                 break;
             case DownloadItem::State::Finished:

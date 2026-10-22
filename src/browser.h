@@ -376,6 +376,8 @@ private:
     int m_downloadsScroll { 0 };
     int m_downloadsHoverRow { -1 };
     bool m_downloadsHoverAction { false };
+    // The pause / resume round button, which only exists on rows we own.
+    bool m_downloadsHoverPause { false };
     bool m_downloadsHoverClear { false };
     bool m_downloadsHoverShowAll { false };
     ULONGLONG m_downloadsHiddenAt { 0 };

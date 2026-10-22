@@ -14,16 +14,45 @@
 namespace lumen {
 
 struct DownloadItem {
-    enum class State { Active, Finished, Failed, Cancelled };
+    enum class State { Active, Paused, Finished, Failed, Cancelled };
 
     unsigned id { 0 };
     WKDownloadRef ref { nullptr }; // retained while the download is active
     std::wstring filename;
     std::wstring path;
     std::wstring source; // site the file came from
+    // Where to re-request from after a pause. Only set on the WinHTTP path,
+    // which is the only one that can resume: WKDownload has no pause or
+    // resume entry point in this SDK, so those rows offer Cancel only.
+    std::wstring url;
     long long received { 0 };
     long long total { 0 }; // 0 when the size is not known
     State state { State::Active };
+
+    // Bumped every time a worker is (re)started for this item. A worker
+    // captures the value it was launched with and stops as soon as the item's
+    // generation no longer matches, which is what stops a paused transfer
+    // that has not yet noticed the pause from colliding with the replacement
+    // worker the resume spawns. Without it the two threads would interleave
+    // WriteFile calls into the same handle position and corrupt the file.
+    unsigned generation { 0 };
+
+    // A row that can be paused and resumed: it came through the WinHTTP path
+    // and we still know its URL. The UI greys the pause button out otherwise.
+    bool resumable() const
+    {
+        return !url.empty() && (state == State::Active || state == State::Paused);
+    }
+};
+
+// What a running transfer should do next. Polled by the WinHTTP worker
+// between chunks, so the UI can pause or cancel without the worker having to
+// wait on a chunk boundary that may never come on a slow connection.
+enum class TransferControl {
+    Continue,
+    Paused,
+    Cancelled,
+    Gone, // the item was removed from the list entirely
 };
 
 // Custom message posted to the browser window when download state changes.
@@ -69,9 +98,20 @@ public:
     // the WebKit callbacks update fields through it. Both are always called
     // on the non-const singleton.
     std::wstring destinationFor(unsigned id);
-    // Used by the WinHTTP worker between chunks to detect a cancel or
-    // removal. Cheap; takes the m_lock briefly.
-    bool stillActive(unsigned id);
+    // What a running WinHTTP worker should do next. Cheap; takes m_lock
+    // briefly and is polled between chunks. `generation` is the value the
+    // caller was launched with: if the item has moved on (resumed, restarted)
+    // the answer is Gone and the worker retires itself.
+    TransferControl transferControl(unsigned id, unsigned generation);
+
+    // Stops an in-flight transfer but keeps the row and the partial file.
+    // Only meaningful for the WinHTTP path; a WKDownload row is refused,
+    // because the engine has no way to stop without cancelling.
+    void pause(unsigned id);
+    // Re-requests the bytes already on disk with a Range header and carries
+    // on appending. The offset comes from the file itself, not from the
+    // item's counter, so a half-written chunk cannot corrupt the request.
+    void resume(unsigned id);
 
     // Window the browser pumps Download notifications through. Set once at
     // startup; nullptr falls back to a direct call (used by the

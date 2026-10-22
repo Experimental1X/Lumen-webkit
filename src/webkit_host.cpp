@@ -190,9 +190,10 @@ constexpr wchar_t kSafariUserAgent[] =
     L"(KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 
 // Internal lumen: URLs power the action buttons in the downloads page
-// (lumen:cancel?id=N, lumen:open?id=N, lumen:reveal?id=N, lumen:remove?id=N,
-// lumen:clear). They never actually load; the navigation is cancelled and
-// the command is dispatched to the Downloads singleton.
+// (lumen:cancel?id=N, lumen:pause?id=N, lumen:resume?id=N, lumen:open?id=N,
+// lumen:reveal?id=N, lumen:remove?id=N, lumen:clear). They never actually
+// load; the navigation is cancelled and the command is dispatched to the
+// Downloads singleton.
 void handleLumenAction(const std::wstring& url)
 {
     if (url.rfind(L"lumen:", 0) != 0)
@@ -226,6 +227,12 @@ void handleLumenAction(const std::wstring& url)
     if (action == L"cancel") {
         const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
         downloads.cancel(id);
+    } else if (action == L"pause") {
+        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
+        downloads.pause(id);
+    } else if (action == L"resume") {
+        const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
+        downloads.resume(id);
     } else if (action == L"remove") {
         const unsigned id = static_cast<unsigned>(std::wcstoul(getParam(L"id").c_str(), nullptr, 10));
         downloads.remove(id);

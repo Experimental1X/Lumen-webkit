@@ -5,6 +5,7 @@
 
 #include <winhttp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cwchar>
 #include <memory>
@@ -169,7 +170,8 @@ std::wstring resolveLocation(const std::wstring& location, const std::wstring& b
 
 } // namespace
 
-void runWinhttpTransfer(unsigned id, std::wstring url)
+void runWinhttpTransfer(unsigned id, std::wstring url, long long resumeFrom,
+    unsigned generation)
 {
     HttpHandle session(WinHttpOpen(kTransferUserAgent,
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -182,6 +184,9 @@ void runWinhttpTransfer(unsigned id, std::wstring url)
     long long total = 0;
     std::wstring finalError;
     bool ok = false;
+    // Where the bytes already on disk end. Starts at resumeFrom and drops to
+    // 0 if the server turns out to ignore our Range header.
+    long long offset = std::max(0LL, resumeFrom);
 
     for (int redirect = 0; redirect <= kMaxRedirects; ++redirect) {
         std::wstring host, path, error;
@@ -205,6 +210,20 @@ void runWinhttpTransfer(unsigned id, std::wstring url)
         if (!request) {
             finalError = L"WinHttpOpenRequest failed";
             break;
+        }
+
+        // Ask for only the bytes we do not already have. This is the whole
+        // resume mechanism: the destination file is opened for append below,
+        // so the server's bytes land straight after what is already there.
+        // WINHTTP_ADDREQ_FLAG_ADD rather than REPLACE, so a redirect target
+        // that sets its own Range is not clobbered.
+        if (offset > 0) {
+            const std::wstring range = L"Range: bytes="
+                + std::to_wstring(offset) + L"-\r\n";
+            if (!WinHttpAddRequestHeaders(request.get(), range.c_str(),
+                    static_cast<DWORD>(range.size()), WINHTTP_ADDREQ_FLAG_ADD)) {
+                log(L"WinHttpAddRequestHeaders failed for id " + std::to_wstring(id));
+            }
         }
 
         // WinHttpOpen installed the user-agent on the session; WinHTTP sends it
@@ -243,9 +262,20 @@ void runWinhttpTransfer(unsigned id, std::wstring url)
             break;
         }
 
+        // 206 means the server honoured the Range and the body covers only
+        // the tail. A plain 200 means it sent the whole file again, so the
+        // partial data has to go or we would concatenate two copies.
+        const bool partial = status == 206;
+        if (offset > 0 && !partial) {
+            log(L"Server ignored the Range header for id " + std::to_wstring(id)
+                + L" (HTTP " + std::to_wstring(static_cast<int>(status))
+                + L"); restarting the file from zero.");
+            offset = 0;
+        }
+
         const long long headerLength = contentLengthOf(request.get());
         if (headerLength > 0)
-            total = headerLength;
+            total = offset + headerLength;
 
         // Tell the panel the total right away so the bar appears at its
         // final width before the first byte lands. reportProgress is the
@@ -258,32 +288,61 @@ void runWinhttpTransfer(unsigned id, std::wstring url)
             finalError = L"destination disappeared while id=" + std::to_wstring(id);
             break;
         }
+        // OPEN_ALWAYS when we are resuming so the bytes already on disk survive;
+        // CREATE_ALWAYS otherwise, which truncates any leftover from a
+        // previous attempt at the same destination.
         FileHandle file(CreateFileW(destination.c_str(), GENERIC_WRITE, 0, nullptr,
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+            offset > 0 ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
         if (!file) {
             finalError = L"cannot open destination for write (id="
                        + std::to_wstring(id) + L")";
             break;
         }
 
-        long long received = 0;
+        // Seek to where the partial data ends. If the server ignored our
+        // Range and sent the whole file, offset is already 0 and this
+        // truncates whatever was there instead of appending to it.
+        LARGE_INTEGER seekTo { };
+        seekTo.QuadPart = offset;
+        if (!SetFilePointerEx(file.get(), seekTo, nullptr, FILE_BEGIN)) {
+            finalError = L"cannot seek the destination (id=" + std::to_wstring(id) + L")";
+            break;
+        }
+        if (offset == 0 && !SetEndOfFile(file.get())) {
+            finalError = L"cannot truncate the destination (id=" + std::to_wstring(id) + L")";
+            break;
+        }
+
+        // Progress counts from zero for this segment; the bytes already on
+        // disk are added in so the panel's bar stays continuous across a
+        // pause instead of snapping back to the start.
+        long long received = offset;
         bool bodyOk = true;
         std::wstring bodyError;
         std::vector<char> buffer(kReadChunk);
 
         while (true) {
-            // Cancellation check between chunks. The UI thread flips
-            // item.state to Cancelled; we pick that up here and bail
-            // before reading more data. Cheaper than writing a parallel
-            // cancel map and lands the same on the wire: stops reading
-            // and stops writing, the file is left as a truncated
-            // artifact of an aborted transfer - same end state as
+            // Pause / cancel check between chunks. The UI thread flips
+            // item.state; we pick that up here and bail before reading more
+            // data. Cheaper than writing a parallel cancel map and lands the
+            // same on the wire: stops reading and stops writing, the file is
+            // left as a truncated artifact - same end state as
             // WKDownloadCancel. We early-return rather than fall through
             // to the reportFail path because that would overwrite the
             // Cancelled state with Failed and the panel would flash a
             // red failed row in place of "Cancelled".
-            if (!Downloads::instance().stillActive(id))
+            switch (Downloads::instance().transferControl(id, generation)) {
+            case TransferControl::Continue:
+                break;
+            case TransferControl::Paused:
+                // Pause is not a terminal state. The row keeps whatever
+                // bytes made it to disk and the user can pick it back up,
+                // so we leave the state alone and just stop.
                 return;
+            default:
+                // Cancelled, removed, or superseded by a newer worker.
+                return;
+            }
 
             DWORD available = 0;
             if (!WinHttpQueryDataAvailable(request.get(), &available)) {
@@ -327,10 +386,14 @@ void runWinhttpTransfer(unsigned id, std::wstring url)
             finalError = bodyError;
             break;
         }
-        if (headerLength > 0 && received < headerLength) {
+        // headerLength is the length of this segment's body, not of the whole
+        // file, so compare it against what this segment actually delivered
+        // (received counts from `offset`). Both numbers are reported as
+        // positions in the finished file, which is what the user sees.
+        if (headerLength > 0 && received - offset < headerLength) {
             finalError = L"connection closed at "
                        + std::to_wstring(received) + L" of "
-                       + std::to_wstring(headerLength) + L" bytes";
+                       + std::to_wstring(offset + headerLength) + L" bytes";
             break;
         }
 
@@ -347,14 +410,15 @@ void runWinhttpTransfer(unsigned id, std::wstring url)
     }
 }
 
-void startWinhttpTransfer(unsigned id, std::wstring url)
+void startWinhttpTransfer(unsigned id, std::wstring url, long long resumeFrom,
+    unsigned generation)
 {
-    std::thread([id, url = std::move(url)] {
+    std::thread([id, url = std::move(url), resumeFrom, generation] {
         // Each transfer lives on its own detached thread; downloads parallel
         // to the UI thread and never runs anything that needs the UI
         // thread to be free. We deliberately do not join or store this
         // thread: it ends naturally when the body drains.
-        runWinhttpTransfer(id, std::move(url));
+        runWinhttpTransfer(id, std::move(url), resumeFrom, generation);
     }).detach();
 }
 

@@ -332,6 +332,42 @@ inline void drawCloseIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color
     g.DrawLine(&pen, cx + 3.0f * k, cy - 3.0f * k, cx - 3.0f * k, cy + 3.0f * k);
 }
 
+// Two filled bars, the pause glyph on the downloads row.
+inline void drawPauseIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, float k)
+{
+    const float cx = (rect.left + rect.right) / 2.0f;
+    const float cy = (rect.top + rect.bottom) / 2.0f;
+
+    Gdiplus::SolidBrush brush(toGdiColor(color));
+    const float w = 1.7f * k;
+    const float h = 5.5f * k;
+    const float gap = 1.9f * k;
+    const Gdiplus::RectF left(cx - gap / 2.0f - w, cy - h / 2.0f, w, h);
+    const Gdiplus::RectF right(cx + gap / 2.0f, cy - h / 2.0f, w, h);
+    g.FillRectangle(&brush, left);
+    g.FillRectangle(&brush, right);
+}
+
+// The matching triangle. Filled rather than outlined so it reads at the same
+// 13px the pause bars do.
+inline void drawPlayIcon(Gdiplus::Graphics& g, const RECT& rect, COLORREF color, float k)
+{
+    const float cx = (rect.left + rect.right) / 2.0f;
+    const float cy = (rect.top + rect.bottom) / 2.0f;
+    const float s = 4.8f * k;
+
+    const Gdiplus::PointF points[3] = {
+        Gdiplus::PointF(cx - s * 0.42f, cy),
+        Gdiplus::PointF(cx + s * 0.58f, cy - s),
+        Gdiplus::PointF(cx + s * 0.58f, cy + s),
+    };
+
+    Gdiplus::SolidBrush brush(toGdiColor(color));
+    Gdiplus::GraphicsPath path;
+    path.AddPolygon(points, 3);
+    g.FillPath(&brush, &path);
+}
+
 inline void drawLockIcon(Gdiplus::Graphics& g, float cx, float cy, COLORREF color, float k)
 {
     Gdiplus::Pen pen(toGdiColor(color), 1.3f * k);

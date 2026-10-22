@@ -1967,6 +1967,13 @@ void Browser::readingListCurrent()
 // Tab overview
 // ---------------------------------------------------------------------------
 
+// PW_RENDERFULLCONTENT arrived in Windows 8.1. Defining it here keeps the
+// build working against an older SDK header that predates it; the value is
+// part of the documented ABI and has never changed.
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+
 void Browser::captureThumbnail(WebView& view)
 {
     HWND window = view.hwnd();
@@ -1985,28 +1992,82 @@ void Browser::captureThumbnail(WebView& view)
     const int thumbWidth = 480;
     const int thumbHeight = std::max(1, sourceHeight * thumbWidth / sourceWidth);
 
-    // Copy what is on screen: the page is composited by the graphics system,
-    // so reading the window's own surface would not work reliably.
     HDC screen = GetDC(nullptr);
     if (!screen)
         return;
 
-    HDC memory = CreateCompatibleDC(screen);
-    HBITMAP bitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
-    HGDIOBJ previous = SelectObject(memory, bitmap);
-    SetStretchBltMode(memory, HALFTONE);
-    SetBrushOrgEx(memory, 0, 0, nullptr);
-    const BOOL copied = StretchBlt(
-        memory, 0, 0, thumbWidth, thumbHeight,
-        screen, rect.left, rect.top, sourceWidth, sourceHeight,
-        SRCCOPY | CAPTUREBLT);
-    SelectObject(memory, previous);
-    DeleteDC(memory);
+    bool copied = false;
+    HBITMAP bitmap = nullptr;
+
+    // Ask the window to render ITSELF, rather than reading the screen.
+    //
+    // This is the whole fix. The old version grabbed pixels off the desktop
+    // with GetDC(nullptr) + StretchBlt, which only ever returns whatever is
+    // composited at those coordinates *right now*. showOverview shows every
+    // tab in one loop, but showing a window does not composite it - that
+    // happens at the next DWM frame, and we never yield to the message pump
+    // inside the loop. So every tab in the loop sampled the same screen
+    // region and every card ended up showing the same page. Confirmed in the
+    // 2026-10-22 recording: opening the overview with Reddit active painted
+    // Reddit on all five cards.
+    //
+    // PrintWindow with PW_RENDERFULLCONTENT is served from DWM's redirection
+    // surface, and that surface is per-window - so each tab reads back its own
+    // last composited content. It renders 1:1, so we print at full size and
+    // scale down afterwards rather than asking a small DC to do the scaling.
+    HDC full = CreateCompatibleDC(screen);
+    HBITMAP fullBitmap = CreateCompatibleBitmap(screen, sourceWidth, sourceHeight);
+    if (full && fullBitmap) {
+        HGDIOBJ oldFull = SelectObject(full, fullBitmap);
+        if (PrintWindow(window, full, PW_RENDERFULLCONTENT)) {
+            HDC small = CreateCompatibleDC(screen);
+            HBITMAP smallBitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
+            if (small && smallBitmap) {
+                HGDIOBJ oldSmall = SelectObject(small, smallBitmap);
+                SetStretchBltMode(small, HALFTONE);
+                SetBrushOrgEx(small, 0, 0, nullptr);
+                copied = StretchBlt(small, 0, 0, thumbWidth, thumbHeight,
+                    full, 0, 0, sourceWidth, sourceHeight, SRCCOPY) != 0;
+                SelectObject(small, oldSmall);
+                if (copied)
+                    bitmap = smallBitmap;
+                else
+                    DeleteObject(smallBitmap);
+                DeleteDC(small);
+            }
+        }
+        SelectObject(full, oldFull);
+        DeleteObject(fullBitmap);
+        DeleteDC(full);
+    }
+
+    // Fallback for a window that will not print (minimised, or a window
+    // without a redirection surface yet). Old behaviour, which is right for
+    // the one tab that really is on screen and merely stale for the rest.
+    if (!copied) {
+        HDC memory = CreateCompatibleDC(screen);
+        HBITMAP screenBitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
+        if (memory && screenBitmap) {
+            HGDIOBJ previous = SelectObject(memory, screenBitmap);
+            SetStretchBltMode(memory, HALFTONE);
+            SetBrushOrgEx(memory, 0, 0, nullptr);
+            copied = StretchBlt(memory, 0, 0, thumbWidth, thumbHeight,
+                screen, rect.left, rect.top, sourceWidth, sourceHeight,
+                SRCCOPY | CAPTUREBLT) != 0;
+            SelectObject(memory, previous);
+            if (copied)
+                bitmap = screenBitmap;
+            else
+                DeleteObject(screenBitmap);
+            DeleteDC(memory);
+        }
+    }
+
     ReleaseDC(nullptr, screen);
 
-    if (copied)
+    if (copied && bitmap)
         view.setThumbnail(bitmap);
-    else
+    else if (bitmap)
         DeleteObject(bitmap);
 }
 
@@ -2027,12 +2088,22 @@ void Browser::showOverview()
     // couple of shades off the overlay background, so those cards vanished:
     // the grid read as empty space with one lone picture floating in it.
     //
-    // Showing a view again puts its last composited content straight back on
-    // screen from DWM's redirection surface, so it can be grabbed immediately.
-    // The whole loop runs inside this one command handler, before any paint,
-    // so none of the intermediate shows are ever seen.
+    // captureThumbnail now asks each window to render itself rather than
+    // sampling the desktop, so the order of this loop no longer decides what
+    // every card ends up showing. The show/capture/hide dance is still needed
+    // though: a window that has never been visible has no redirection surface
+    // for PrintWindow to read, and RedrawWindow with RDW_UPDATENOW is what
+    // pushes a fresh frame into it. It paints synchronously, so by the time
+    // captureThumbnail runs there is real content to grab. The whole loop runs
+    // inside this one command handler, before any paint, so none of the
+    // intermediate shows are ever seen.
     for (auto& tab : m_tabs) {
         tab->setVisible(true);
+        if (HWND window = tab->hwnd()) {
+            RedrawWindow(window, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_FRAME | RDW_ERASE);
+            UpdateWindow(window);
+        }
         captureThumbnail(*tab);
     }
 
@@ -2839,6 +2910,19 @@ RECT downloadsActionRect(const RECT& row, int size, int margin)
     return { row.right - margin - size, top, row.right - margin, top + size };
 }
 
+// The pause / resume button sits immediately left of the trailing action
+// button, and only exists for rows that can actually be paused. Returns an
+// empty rect when there is nothing to click so callers can skip it without a
+// second condition. `gap` comes in from the caller because this is a free
+// function: px() is a Browser member and cannot be reached from here.
+RECT downloadsPauseRect(const RECT& row, int size, int margin, int gap, bool available)
+{
+    if (!available)
+        return RECT { };
+    const RECT action = downloadsActionRect(row, size, margin);
+    return { action.left - gap - size, action.top, action.left - gap, action.bottom };
+}
+
 bool isRiskyFile(const std::wstring& path)
 {
     const size_t dot = path.find_last_of(L'.');
@@ -3022,6 +3106,7 @@ void Browser::hideDownloadsPanel(bool refocusPage)
     m_downloadsVisible = false;
     m_downloadsHoverRow = -1;
     m_downloadsHoverAction = false;
+    m_downloadsHoverPause = false;
     m_downloadsHoverClear = false;
     m_downloadsHoverShowAll = false;
 
@@ -3132,8 +3217,12 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
         drawSiteBadge(g, badgeRect, badgeLetter(extension), colorFromHue(hueOf(extension)), k * 1.6f);
 
         const RECT action = downloadsActionRect(row, actionSize, actionMargin);
+        // Pause / resume only where the transfer is one we own. A WKDownload
+        // row has no engine-level pause, so it gets the old single button.
+        const bool canPause = item.resumable();
+        const RECT pauseRect = downloadsPauseRect(row, actionSize, actionMargin, px(8), canPause);
         const int textLeft = badgeRect.right + px(12);
-        const int textRight = action.left - px(10);
+        const int textRight = (canPause ? pauseRect.left : action.left) - px(10);
 
         const RECT nameRect { textLeft, row.top + px(10), textRight, row.top + px(10) + px(20) };
         drawLabel(dc, g, item.filename, nameRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -3147,6 +3236,14 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
                 status = formatBytes(item.received) + L" \u2014 Downloading";
             else
                 status = L"Starting\u2026";
+            break;
+        case DownloadItem::State::Paused:
+            if (item.received > 0)
+                status = formatBytes(item.received) + L" of "
+                    + (item.total > 0 ? formatBytes(item.total) : L"?")
+                    + L" \u2014 Paused";
+            else
+                status = L"Paused";
             break;
         case DownloadItem::State::Finished:
             status = formatBytes(item.total > 0 ? item.total : item.received);
@@ -3163,7 +3260,8 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
         const RECT statusRect { textLeft, row.top + px(30), textRight, row.top + px(30) + px(18) };
         drawLabel(dc, g, status, statusRect, m_theme.textSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-        if (item.state == DownloadItem::State::Active) {
+        if (item.state == DownloadItem::State::Active
+            || item.state == DownloadItem::State::Paused) {
             const int barTop = row.top + px(52);
             const int barHeight = px(4);
             const RECT track { textLeft, barTop, textRight, barTop + barHeight };
@@ -3171,7 +3269,11 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
             if (item.total > 0) {
                 const double fraction = std::clamp(static_cast<double>(item.received) / static_cast<double>(item.total), 0.0, 1.0);
                 const RECT fill { textLeft, barTop, textLeft + static_cast<LONG>((textRight - textLeft) * fraction), barTop + barHeight };
-                fillRoundedRect(g, fill, barHeight / 2, m_theme.accent);
+                // Paused rows keep their bar so the amount already fetched is
+                // still visible, but dimmed so they do not read as running.
+                fillRoundedRect(g, fill, barHeight / 2, m_theme.accent,
+                    item.state == DownloadItem::State::Paused
+                        ? static_cast<BYTE>(90) : static_cast<BYTE>(255));
             } else {
                 // Total size unknown (chunked transfer, no Content-Length):
                 // draw a centred "pulse" so the row still reads as in-progress.
@@ -3189,6 +3291,20 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
             drawMagnifierIcon(g, action, m_theme.text, k);
         else
             drawCloseIcon(g, action, m_theme.text, k);
+
+        // Pause, or play once it is paused. Drawn to the left of the trailing
+        // button so the destructive action stays in the same place on every
+        // row, which is what makes the row muscle-memory work.
+        if (canPause) {
+            const bool pauseHot = hot && m_downloadsHoverPause;
+            const COLORREF tint = pauseHot ? m_theme.text : m_theme.textSecondary;
+            fillRoundedRect(g, pauseRect, actionSize / 2,
+                pauseHot ? m_theme.glassHover : m_theme.pillHover);
+            if (item.state == DownloadItem::State::Paused)
+                drawPlayIcon(g, pauseRect, tint, k);
+            else
+                drawPauseIcon(g, pauseRect, tint, k);
+        }
     }
 
     // Header over the rows, so rows scrolled past the top are hidden.
@@ -3198,7 +3314,10 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
 
     bool anyFinished = false;
     for (const auto& item : items) {
-        if (item.state != DownloadItem::State::Active)
+        // A paused download is waiting for the user, not settled, so it does
+        // not make "Clear" available.
+        if (item.state != DownloadItem::State::Active
+            && item.state != DownloadItem::State::Paused)
             anyFinished = true;
     }
     const RECT clearRect { width - px(16) - px(64), px(10), width - px(16), header - px(10) };
@@ -3259,8 +3378,23 @@ void Browser::downloadsClick(POINT point)
 
         const DownloadItem& item = items[i];
         const RECT action = downloadsActionRect(row, px(26), px(16));
+
+        // Pause / resume first: it sits left of the action button, and the
+        // two rects never overlap, so the order here only matters for clarity.
+        if (item.resumable()) {
+            const RECT pauseRect = downloadsPauseRect(row, px(26), px(16), px(8), true);
+            if (PtInRect(&pauseRect, point)) {
+                if (item.state == DownloadItem::State::Paused)
+                    Downloads::instance().resume(item.id);
+                else
+                    Downloads::instance().pause(item.id);
+                return;
+            }
+        }
+
         if (PtInRect(&action, point)) {
-            if (item.state == DownloadItem::State::Active)
+            if (item.state == DownloadItem::State::Active
+                || item.state == DownloadItem::State::Paused)
                 Downloads::instance().cancel(item.id);
             else if (item.state == DownloadItem::State::Finished)
                 revealDownloadedFile(item.path);
@@ -3288,6 +3422,7 @@ void Browser::downloadsMove(POINT point)
 
     int hoverRow = -1;
     bool hoverAction = false;
+    bool hoverPause = false;
     bool hoverClear = false;
     bool hoverShowAll = false;
 
@@ -3308,17 +3443,23 @@ void Browser::downloadsMove(POINT point)
                 hoverRow = static_cast<int>(i);
                 const RECT action = downloadsActionRect(row, px(26), px(16));
                 hoverAction = PtInRect(&action, point) != FALSE;
+                if (items[i].resumable()) {
+                    const RECT pauseRect = downloadsPauseRect(row, px(26), px(16), px(8), true);
+                    hoverPause = PtInRect(&pauseRect, point) != FALSE;
+                }
                 break;
             }
         }
     }
 
     if (hoverRow == m_downloadsHoverRow && hoverAction == m_downloadsHoverAction
+        && hoverPause == m_downloadsHoverPause
         && hoverClear == m_downloadsHoverClear && hoverShowAll == m_downloadsHoverShowAll)
         return;
 
     m_downloadsHoverRow = hoverRow;
     m_downloadsHoverAction = hoverAction;
+    m_downloadsHoverPause = hoverPause;
     m_downloadsHoverClear = hoverClear;
     m_downloadsHoverShowAll = hoverShowAll;
     InvalidateRect(m_downloadsPanel, nullptr, FALSE);
