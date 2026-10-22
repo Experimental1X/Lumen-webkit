@@ -1291,7 +1291,11 @@ void Browser::suggestionsClick(POINT point)
         const RECT row = suggestionRow(static_cast<int>(i));
         if (!PtInRect(&row, point))
             continue;
-        const bool inNewTab = PtInRect(&suggestionNewTab(static_cast<int>(i)), point) != FALSE;
+        // Into a named local first: suggestionNewTab returns by value, and & on
+        // a function call result is C2102 ("'&' requires l-value") because a
+        // prvalue has no address to take.
+        const RECT newTab = suggestionNewTab(static_cast<int>(i));
+        const bool inNewTab = PtInRect(&newTab, point) != FALSE;
         openSuggestion(static_cast<int>(i), inNewTab);
         return;
     }
@@ -1308,7 +1312,9 @@ void Browser::suggestionsMove(POINT point)
         if (!PtInRect(&row, point))
             continue;
         hover = static_cast<int>(i);
-        hoverNewTab = PtInRect(&suggestionNewTab(static_cast<int>(i)), point) != FALSE;
+        // Named local, same reason as in suggestionsClick.
+        const RECT newTab = suggestionNewTab(static_cast<int>(i));
+        hoverNewTab = PtInRect(&newTab, point) != FALSE;
         break;
     }
     if (hover == m_suggestionsHover && hoverNewTab == m_suggestionsHoverNewTab)
