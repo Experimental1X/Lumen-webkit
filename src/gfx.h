@@ -224,13 +224,19 @@ inline void drawLabelGdiPlus(Gdiplus::Graphics& g, HFONT font,
 // is no layout width to wrap against, making this the natural single-line width
 // - which is the only number the caller wants. The ellipsis itself is drawLabel-
 // GdiPlus's job, not this one's.
-inline Gdiplus::SizeF measureLabelGdiPlus(Gdiplus::Graphics& g, HFONT font,
+//
+// Returns a bare REAL width, not a SizeF. bounds.GetSize() is declared with an
+// out-parameter in this SDK and takes none by default, so calling it empty is
+// C2660; and SizeF appears nowhere else in this tree, so returning one would be
+// a brand-new API for no gain. bounds.Width is the public REAL member that
+// strokeRoundedRect in this same header already reads and writes.
+inline Gdiplus::REAL measureLabelWidthGdiPlus(Gdiplus::Graphics& g, HFONT font,
     const std::wstring& text)
 {
     Gdiplus::Font f = fontFromHFont(font);
     Gdiplus::RectF bounds;
     g.MeasureString(text.c_str(), -1, &f, Gdiplus::PointF(0.0f, 0.0f), &bounds);
-    return bounds.GetSize();
+    return bounds.Width;
 }
 
 inline void addRoundedRect(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, Gdiplus::REAL radius)

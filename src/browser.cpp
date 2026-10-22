@@ -3133,8 +3133,8 @@ void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
         // inside a card that is still growing.
         const std::wstring title = tabTitle(view);
         const int iconSize = px(14);
-        const Gdiplus::SizeF titleSize = measureLabelGdiPlus(g, m_font, title);
-        const int textWidth = std::min(static_cast<int>(titleSize.Width),
+        const Gdiplus::REAL titleWidth = measureLabelWidthGdiPlus(g, m_font, title);
+        const int textWidth = std::min(static_cast<int>(titleWidth),
             std::max(0, static_cast<int>(card.title.right - card.title.left) - iconSize - px(6)));
         const int groupWidth = iconSize + px(6) + textWidth;
         const int groupLeft = card.title.left + ((card.title.right - card.title.left) - groupWidth) / 2;
