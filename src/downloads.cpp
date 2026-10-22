@@ -700,7 +700,35 @@ void Downloads::resume(unsigned id)
 
 void Downloads::reportProgress(unsigned id, long long received, long long total)
 {
+    // Rate limit, and this is the whole fix for "downloading freezes the
+    // browser".
+    //
+    // The WinHTTP worker calls this after every 64KB chunk it writes and
+    // `changed` is true for every one of them, because `received` really did
+    // move. Each call posted a WM_LUMEN_DOWNLOAD_CHANGED, and on the UI thread
+    // that message runs onDownloadsChanged, which copies the whole item list
+    // out of the critical section, re-lays-out the downloads panel, invalidates
+    // the panel and invalidates the chrome. That is fine at a few messages a
+    // second and catastrophic at a few thousand.
+    //
+    // Measured in the 2026-10-22 recording: a 4GB Kali Linux ISO pulled at
+    // roughly 75MB/s, which is 64KB every 0.8ms, so about 1,200 messages a
+    // second. The window stopped repainting entirely at t=96.1s and stayed
+    // frozen - no chrome repaint at all, only the mouse cursor moving - until
+    // t=149.7s, 53.6 seconds later, at which point the backlog drained and
+    // every queued input flushed at once. Windows itself was alive the whole
+    // time; only Lumen's thread was saturated.
+    //
+    // 100ms is far finer than the eye can follow a progress bar move, so the
+    // bar still looks continuous, and it caps the message rate at 10/s
+    // regardless of line speed. Terminal transitions are not rate limited -
+    // they go through reportFinish and reportFail, which never throttle - so a
+    // download that completes still updates the instant it does.
+    static constexpr unsigned long long kNotifyIntervalMs = 100;
+
     bool changed = false;
+    bool notifyNow = false;
+    const unsigned long long now = GetTickCount64();
     {
         Lock lock(m_lock);
         if (DownloadItem* item = findIdLocked(id)) {
@@ -712,9 +740,17 @@ void Downloads::reportProgress(unsigned id, long long received, long long total)
                 item->total = total;
                 changed = true;
             }
+            // A size we only just learned is worth showing immediately even
+            // inside the interval: without it the bar sits indeterminate until
+            // the next tick, which on a fast transfer may be 100ms of "pulse".
+            const bool sizeArrived = total > 0 && item->lastNotifiedAt == 0;
+            if (changed && (sizeArrived || now - item->lastNotifiedAt >= kNotifyIntervalMs)) {
+                item->lastNotifiedAt = now;
+                notifyNow = true;
+            }
         }
     }
-    if (changed)
+    if (notifyNow)
         notify(false);
 }
 

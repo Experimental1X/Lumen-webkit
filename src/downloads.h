@@ -37,6 +37,11 @@ struct DownloadItem {
     // WriteFile calls into the same handle position and corrupt the file.
     unsigned generation { 0 };
 
+    // GetTickCount64 of the last progress notification actually pushed to the
+    // UI thread, or 0 if none has gone out yet. Read and written under
+    // m_lock. See reportProgress for why this exists.
+    unsigned long long lastNotifiedAt { 0 };
+
     // A row that can be paused and resumed: it came through the WinHTTP path
     // and we still know its URL. The UI greys the pause button out otherwise.
     bool resumable() const

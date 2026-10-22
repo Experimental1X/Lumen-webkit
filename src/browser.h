@@ -354,8 +354,13 @@ private:
     void overviewMove(POINT local, int width);
     void paintOverview(HDC dc, int width, int height);
     // The tab grid itself. paintOverview renders this into an offscreen buffer
-    // first so the whole grid can fade and scale as one piece.
-    void paintOverviewContent(HDC dc, int width, int height);
+    // first, so the cards can be drawn staggered and transformed without GDI+
+    // having to repaint the live surface mid-transform.
+    //
+    // `t` is the same 0..1 spring value paintOverview has: it drives each card's
+    // own progress on a stagger, so `t` is the grid as a whole and every card
+    // reads a delayed slice of it.
+    void paintOverviewContent(HDC dc, int width, int height, double t);
 
     // --- sidebar (Bookmarks, Reading List, History) ---
     struct SidebarLayout {

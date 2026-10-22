@@ -660,11 +660,28 @@ void Browser::resize(bool wholeClient)
         // Measured in the 2026-10-22 recording, the page's left edge tracks the
         // sidebar exactly (131, 253 and 326 px as the spring moved) while its
         // right edge fell 95-97px short of the window's, so the geometry passed
-        // to MoveWindow is right and what is missing is the paint. RDW_ERASE is
-        // deliberately not included: erasing would flash, and all that is wanted
-        // here is for the exposed strip to be repainted rather than erased.
+        // to MoveWindow is right and what is missing is the paint.
+        //
+        // RDW_INVALIDATE ONLY, and that is the correction to the update-21
+        // version of this line. update-21 also passed RDW_UPDATENOW, which asks
+        // for the repaint to happen *now*, synchronously, inside this call. That
+        // turned a cosmetic band into a strobe: forcing a WebKit child to
+        // repaint dozens of times a second means most of those repaints land
+        // before WebKit has produced a new frame, so the child paints its black
+        // class background again. In the 2026-10-22 recording the sidebar toggle
+        // produced 42 black/non-black transitions over 27-47s, with 13.5 of
+        // those 17.7 seconds showing black, and the sidebar itself flipping
+        // between (38,37,40) and (3,3,3). That is the "the sidebar even makes
+        // the page go black for a few seconds" report, and it was a regression
+        // introduced by the fix for the band.
+        //
+        // Invalidating without UPDATENOW only marks the child dirty and lets
+        // WebKit repaint on its own schedule, which it was already doing. The
+        // strip still clears, just a frame or two later, and nothing is forced.
+        // RDW_ERASE stays out for the same reason it did before: erasing is the
+        // flash this whole design avoids.
         if (!wholeClient)
-            RedrawWindow(viewWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+            RedrawWindow(viewWindow, nullptr, nullptr, RDW_INVALIDATE);
     }
 
     // The sidebar and the tab overview are drawn by this window and have to
@@ -2912,10 +2929,18 @@ void Browser::paintOverview(HDC dc, int width, int height)
     fillSolid(dc, RECT { 0, 0, width, height },
         m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
 
-    // The overview eases in and out, so it is drawn offscreen and composited
-    // with an alpha rather than being painted straight onto the chrome. Two
-    // things happen at once: the whole grid fades, and the cards grow from
-    // 94% to full size about the centre of the content area.
+    // The overview eases in and out, so it is drawn offscreen and composited.
+    // The whole grid no longer shares one global fade-and-shrink: that read as
+    // a single 0.55s dissolve rather than as animation, and the report was
+    // "the tab overview basically has no animations".
+    //
+    // Safari instead brings the cards up as a staggered cascade - each arriving
+    // a beat after the last, fading in, growing from 90% and settling - with the
+    // background already sitting behind them. That is what
+    // paintOverviewContent does now, driven by this same spring, so the
+    // composite at the bottom of this function runs at full strength and all
+    // the motion is per card. The background has always been filled opaquely
+    // above, so nothing shows through while the cards arrive.
     const double t = std::clamp(m_overviewAnim.value, 0.0, 1.0);
     if (t <= 0.002)
         return;
@@ -2949,7 +2974,7 @@ void Browser::paintOverview(HDC dc, int width, int height)
         Gdiplus::Graphics scratch(m_overviewSurface);
         scratch.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
         HDC bufferDc = scratch.GetHDC();
-        paintOverviewContent(bufferDc, width, height);
+        paintOverviewContent(bufferDc, width, height, t);
         scratch.ReleaseHDC(bufferDc);
     }
 
@@ -2957,32 +2982,20 @@ void Browser::paintOverview(HDC dc, int width, int height)
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
-    Gdiplus::ImageAttributes attributes;
-    attributes.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
-    // Gdiplus::ColorMatrix is a plain REAL[5][5]; fill it by hand rather than
-    // calling a method that does not exist in this SDK.
-    Gdiplus::ColorMatrix matrix { };
-    matrix.m[0][0] = 1.0f;
-    matrix.m[1][1] = 1.0f;
-    matrix.m[2][2] = 1.0f;
-    matrix.m[3][3] = static_cast<Gdiplus::REAL>(t);
-    matrix.m[4][4] = 1.0f;
-    attributes.SetColorMatrix(&matrix);
-
-    const float scale = 0.94f + 0.06f * static_cast<float>(t);
-
-    Gdiplus::RectF destRect(
-        static_cast<Gdiplus::REAL>(width * (1.0 - scale) * 0.5),
-        static_cast<Gdiplus::REAL>(height * (1.0 - scale) * 0.5),
-        static_cast<Gdiplus::REAL>(width * scale),
-        static_cast<Gdiplus::REAL>(height * scale));
-    g.DrawImage(m_overviewSurface, destRect,
+    // Full strength, 1:1. The fade and the shrink both moved down into
+    // paintOverviewContent, where they run per card on a stagger, so this
+    // composite has nothing left to animate - it just puts the finished grid
+    // onto the page. ImageAttributes and its ColorMatrix went with it; there is
+    // no global alpha left to apply.
+    g.DrawImage(m_overviewSurface,
+        Gdiplus::RectF(0.0f, 0.0f, static_cast<Gdiplus::REAL>(width),
+            static_cast<Gdiplus::REAL>(height)),
         0.0f, 0.0f,
         static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
-        Gdiplus::UnitPixel, &attributes);
+        Gdiplus::UnitPixel);
 }
 
-void Browser::paintOverviewContent(HDC dc, int width, int height)
+void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
 {
     const RECT whole { 0, 0, width, height };
     fillSolid(dc, whole, m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
@@ -2996,60 +3009,144 @@ void Browser::paintOverviewContent(HDC dc, int width, int height)
     const float k = scaleFactor();
     const int radius = px(10);
     const std::vector<OverviewCard> cards = overviewLayout(width);
+    const COLORREF backdrop = m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232);
+
+    // The stagger. Every card starts a beat after the last, so the grid fills
+    // in as a cascade rather than the whole thing dissolving at once - which is
+    // what Safari does, and what the report "the tab overview basically has no
+    // animations" was about. The per-card window shrinks as the grid gets
+    // longer so the LAST card still lands inside the spring, and it is capped
+    // at 8 steps: that is as many cards as fit on a laptop screen, and beyond
+    // it a longer stagger would only stretch the tail out of the animation.
+    const size_t staggerSteps = std::min(cards.empty() ? 0u : static_cast<unsigned>(cards.size() - 1), 7u);
+    constexpr double kStaggerStep = 0.045;
+    const double staggerSpan = kStaggerStep * static_cast<double>(staggerSteps);
+    const double cardWindow = std::max(0.22, 1.0 - staggerSpan);
+
+    // Blends an icon colour toward the flat backdrop. The card's small glyphs -
+    // the site badge, the close X, the start-page mark - take a plain COLORREF
+    // with nowhere to pass an alpha, and every one of them sits on that flat
+    // colour, so mixing by hand is exact rather than a cheat. The thumbnail
+    // bitmap, the fills and the strokes all take a real alpha and get one.
+    auto fade = [backdrop](COLORREF color, double amount) -> COLORREF {
+        const int a = static_cast<int>(std::clamp(amount, 0.0, 1.0) * 255.0 + 0.5);
+        return RGB(
+            GetRValue(backdrop) + (GetRValue(color) - GetRValue(backdrop)) * a / 255,
+            GetGValue(backdrop) + (GetGValue(color) - GetGValue(backdrop)) * a / 255,
+            GetBValue(backdrop) + (GetBValue(color) - GetBValue(backdrop)) * a / 255);
+    };
 
     for (size_t i = 0; i < cards.size(); ++i) {
         const OverviewCard& card = cards[i];
         if (card.card.bottom < 0 || card.card.top > height)
             continue;
 
+        // 0 before this card's beat, 1 once it has fully arrived. Cubic
+        // ease-out, so it decelerates into place instead of stopping dead.
+        const double delay = kStaggerStep * static_cast<double>(std::min(i, static_cast<size_t>(staggerSteps)));
+        const double ct = std::clamp((t - delay) / cardWindow, 0.0, 1.0);
+        if (ct <= 0.0)
+            continue;
+        const double eased = 1.0 - std::pow(1.0 - ct, 3.0);
+
+        const BYTE alpha = static_cast<BYTE>(eased * 255.0 + 0.5);
+        // Skip the transform entirely once the card has landed: at rest it is
+        // the identity, and the resting grid is what gets painted every frame
+        // the overview is simply open, so this is the path that has to stay
+        // cheap.
+        const bool moving = eased < 0.999;
+        if (moving) {
+            // Scale about the card's centre and lift it, as
+            // Translate * Scale * Translate under MatrixOrderAppend - GDI+
+            // multiplies onto the right, so the point is transformed in the
+            // order the calls are made and ends up centred, scaled, and risen.
+            const Gdiplus::REAL cardScale = static_cast<Gdiplus::REAL>(0.90 + 0.10 * eased);
+            const Gdiplus::REAL cx = static_cast<Gdiplus::REAL>((card.card.left + card.card.right) / 2.0);
+            const Gdiplus::REAL cy = static_cast<Gdiplus::REAL>((card.card.top + card.card.bottom) / 2.0);
+            const Gdiplus::REAL rise = static_cast<Gdiplus::REAL>(px(18) * (1.0 - eased));
+            g.Save();
+            g.TranslateTransform(cx, cy + rise, Gdiplus::MatrixOrderAppend);
+            g.ScaleTransform(cardScale, cardScale, Gdiplus::MatrixOrderAppend);
+            g.TranslateTransform(-cx, -cy, Gdiplus::MatrixOrderAppend);
+        }
+
         const WebView& view = *m_tabs[i];
         const bool isActive = i == m_active;
         const bool hot = static_cast<int>(i) == m_overviewHoverCard;
 
         // Picture of the page.
-        fillRoundedRect(g, card.thumb, radius, m_theme.page);
+        fillRoundedRect(g, card.thumb, radius, m_theme.page, alpha);
         if (HBITMAP bitmap = view.thumbnail()) {
             Gdiplus::GraphicsPath path;
             addRoundedRect(path, toRectF(card.thumb), static_cast<Gdiplus::REAL>(radius));
             g.SetClip(&path);
             Gdiplus::Bitmap image(bitmap, nullptr);
-            g.DrawImage(&image, toRectF(card.thumb));
+            if (moving) {
+                // The bitmap is the one thing on a card big enough for a real
+                // alpha, and the route is the same ColorMatrix that used to
+                // fade the whole grid in paintOverview, now applied per card.
+                Gdiplus::ImageAttributes thumbAlpha;
+                thumbAlpha.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+                Gdiplus::ColorMatrix matrix { };
+                matrix.m[0][0] = 1.0f;
+                matrix.m[1][1] = 1.0f;
+                matrix.m[2][2] = 1.0f;
+                matrix.m[3][3] = static_cast<Gdiplus::REAL>(alpha / 255.0);
+                matrix.m[4][4] = 1.0f;
+                thumbAlpha.SetColorMatrix(&matrix);
+                g.DrawImage(&image, toRectF(card.thumb), 0.0f, 0.0f,
+                    static_cast<Gdiplus::REAL>(image.GetWidth()),
+                    static_cast<Gdiplus::REAL>(image.GetHeight()),
+                    Gdiplus::UnitPixel, &thumbAlpha);
+            } else {
+                g.DrawImage(&image, toRectF(card.thumb));
+            }
             g.ResetClip();
         } else if (isStartPage(view.url())) {
-            drawStartPageIcon(g, card.thumb, m_theme.textSecondary, k * 3.0f);
+            drawStartPageIcon(g, card.thumb, fade(m_theme.textSecondary, eased), k * 3.0f);
         }
 
         strokeRoundedRect(
             g, card.thumb, radius,
             isActive ? m_theme.accent : m_theme.tabBorder,
-            isActive ? 3.0f * k : std::max(1.0f, k));
+            isActive ? 3.0f * k : std::max(1.0f, k), alpha);
 
         // Close button, shown on hover (and always for the active tab).
         if (hot || isActive) {
             fillRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2,
-                (hot && m_overviewHoverClose) ? m_theme.glassHover : m_theme.glass);
-            strokeRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2, m_theme.glassBorder, std::max(1.0f, k));
-            drawCloseIcon(g, card.close, m_theme.text, k);
+                (hot && m_overviewHoverClose) ? m_theme.glassHover : m_theme.glass, alpha);
+            strokeRoundedRect(g, card.close, (card.close.bottom - card.close.top) / 2,
+                m_theme.glassBorder, std::max(1.0f, k), alpha);
+            drawCloseIcon(g, card.close, fade(m_theme.text, eased), k);
         }
 
         // Title with the site badge, centered under the picture.
+        //
+        // GDI+ text, not drawLabel: GDI's DrawTextW draws in DC space and would
+        // ignore the transform above, leaving the label pinned at full size
+        // inside a card that is still growing.
         const std::wstring title = tabTitle(view);
         const int iconSize = px(14);
-        const int textWidth = std::min(measureLabel(dc, g, title), std::max(0, static_cast<int>(card.title.right - card.title.left) - iconSize - px(6)));
+        const Gdiplus::SizeF titleSize = measureLabelGdiPlus(g, m_font, title);
+        const int textWidth = std::min(static_cast<int>(titleSize.Width),
+            std::max(0, static_cast<int>(card.title.right - card.title.left) - iconSize - px(6)));
         const int groupWidth = iconSize + px(6) + textWidth;
         const int groupLeft = card.title.left + ((card.title.right - card.title.left) - groupWidth) / 2;
         const int centerY = (card.title.top + card.title.bottom) / 2;
         const RECT iconRect { groupLeft, centerY - iconSize / 2, groupLeft + iconSize, centerY - iconSize / 2 + iconSize };
 
         if (isStartPage(view.url())) {
-            drawStartPageIcon(g, iconRect, m_theme.textSecondary, k);
+            drawStartPageIcon(g, iconRect, fade(m_theme.textSecondary, eased), k);
         } else {
             const std::wstring host = hostOf(view.url());
-            drawSiteBadge(g, iconRect, badgeLetter(host), colorFromHue(hueOf(host)), k);
+            drawSiteBadge(g, iconRect, badgeLetter(host), colorFromHue(hueOf(host)), k, alpha);
         }
 
         const RECT textRect { iconRect.right + px(6), card.title.top, iconRect.right + px(6) + textWidth, card.title.bottom };
-        drawLabel(dc, g, title, textRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        drawLabelGdiPlus(g, m_font, title, toRectF(textRect), m_theme.text, alpha);
+
+        if (moving)
+            g.Restore();
     }
 
     g.Flush(Gdiplus::FlushIntentionSync);
@@ -3355,8 +3452,14 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     }
 
     // Header band with the segmented control.
+    //
+    // fillSolidGdiPlus, not fillSolid: a raw GDI FillRect on a DC that the
+    // Graphics above owns is what stopped these three labels rendering at all.
+    // See fillSolidGdiPlus in gfx.h. The band is still drawn after the rows,
+    // which is the whole point of it - rows scrolled past the top get covered
+    // rather than needing clipping.
     const RECT header { 0, 0, width, s.list.top };
-    fillSolid(dc, header, m_theme.tabBar);
+    fillSolidGdiPlus(g, header, m_theme.tabBar);
 
     fillRoundedRect(g, s.segmented, px(8), m_theme.pill);
     static const wchar_t* const names[3] = { L"Bookmarks", L"Reading List", L"History" };
@@ -3368,23 +3471,13 @@ void Browser::paintSidebar(HDC dc, int width, int height)
             fillRoundedRect(g, inset, px(6), m_theme.glass);
             strokeRoundedRect(g, inset, px(6), m_theme.glassBorder, std::max(1.0f, k));
         }
-        // No DT_END_ELLIPSIS here, and that is the fix.
-        //
-        // These three strings are fixed and short, so there is nothing for an
-        // ellipsis to ever do - but passing it made drawLabel's DrawTextW draw
-        // absolutely nothing, so the segmented control came out as an empty
-        // pill. That is the "the buttons headers of bookmarks, history etc are
-        // invisible" report, and it is verifiable rather than inferred: in the
-        // 2026-10-22 recording the pill, the selected segment's highlight and
-        // border all render, and the gear and the "No Bookmarks" line below
-        // both render, while the three segment rects contain six flat
-        // background shades and not one pixel of glyph.
-        //
-        // "No Bookmarks" - the message right above, drawn by the same helper on
-        // the same DC in the same frame - is the control case. Its flags differ
-        // from these only by not carrying DT_END_ELLIPSIS, and it draws. The
-        // flush is belt and braces: it pushes the pill and the highlight out
-        // before any glyph lands on top of them.
+        // Nothing clever here, and update-21's theory about DT_END_ELLIPSIS was
+        // wrong. The flags are now the plain centred set, shared with the
+        // working "No Bookmarks" call above, but the labels still did not
+        // render - measured across 55 seconds of the 2026-10-22 recording, the
+        // pill's peak brightness was 94 in every single frame the sidebar was
+        // open, with zero pixels above 110, while "No Bookmarks" reached 196.
+        // The real cause was the GDI FillRect above; see fillSolidGdiPlus.
         g.Flush(Gdiplus::FlushIntentionSync);
         drawLabel(dc, g, names[i], s.segments[i], selected ? m_theme.text : m_theme.textSecondary,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -3393,7 +3486,7 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     // Footer with "Clear History" on the History tab.
     if (m_sidebarMode == 2) {
         const RECT footer { 0, s.list.bottom, width, height };
-        fillSolid(dc, footer, m_theme.tabBar);
+        fillSolidGdiPlus(g, footer, m_theme.tabBar);
         fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
         drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     }
@@ -3408,7 +3501,7 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         drawGearIcon(g, gearInset, RGB(255, 255, 255), m_theme.accent, k * 0.78f);
     }
 
-    fillSolid(dc, RECT { width - 1, 0, width, height }, m_theme.separator);
+    fillSolidGdiPlus(g, RECT { width - 1, 0, width, height }, m_theme.separator);
     g.Flush(Gdiplus::FlushIntentionSync);
 }
 
@@ -4044,7 +4137,11 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
     }
 
     // Header over the rows, so rows scrolled past the top are hidden.
-    fillSolid(dc, RECT { 0, 0, width, header }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    //
+    // fillSolidGdiPlus rather than fillSolid, for the same reason as the
+    // sidebar's header band: a raw GDI FillRect after the Graphics took the DC
+    // is what made DrawTextW silently draw nothing. See fillSolidGdiPlus.
+    fillSolidGdiPlus(g, RECT { 0, 0, width, header }, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
     const RECT titleRect { px(18), 0, width / 2, header };
     drawLabel(dc, g, L"Downloads", titleRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
@@ -4062,15 +4159,15 @@ void Browser::paintDownloadsPanel(HDC dc, int width, int height)
     drawLabel(dc, g, L"Clear", clearRect, anyFinished ? m_theme.accent : m_theme.textDisabled,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-    fillSolid(dc, RECT { 0, header - 1, width, header }, m_theme.separator);
+    fillSolidGdiPlus(g, RECT { 0, header - 1, width, header }, m_theme.separator);
     strokeRoundedRect(g, RECT { 0, 0, width, height }, px(14), m_theme.glassBorder, std::max(1.0f, k));
 
     // Footer with the "Show in Page" link, painted last so it covers any
     // row that has scrolled past the bottom edge.
     const int footer = px(kDownloadsFooter);
     const RECT footerRect { 0, height - footer, width, height };
-    fillSolid(dc, footerRect, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
-    fillSolid(dc, RECT { 0, height - footer, width, height - footer + 1 }, m_theme.separator);
+    fillSolidGdiPlus(g, footerRect, m_theme.dark ? RGB(40, 40, 43) : RGB(250, 250, 252));
+    fillSolidGdiPlus(g, RECT { 0, height - footer, width, height - footer + 1 }, m_theme.separator);
 
     const RECT showAllRect { px(16), height - footer + px(6), width - px(16), height - px(6) };
     if (m_downloadsHoverShowAll)
