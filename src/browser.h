@@ -199,6 +199,10 @@ private:
     void ensureAnimTimer();
     // Current width of the sidebar, in pixels, mid-transition included.
     int sidebarWidthNow() const;
+    // Width the sidebar is heading for. resize() places the web view with this
+    // rather than with sidebarWidthNow(), so a toggle moves the page once
+    // instead of once per animation tick - see resize().
+    int sidebarSettledWidth() const;
 
     Spring m_sidebarAnim;
     Spring m_panelAnim;

@@ -128,18 +128,27 @@ inline Gdiplus::RectF toRectF(const RECT& rect)
 //
 // Mixing GDI and GDI+ on one DC is not supported - GDI+ takes the DC over
 // when a Graphics is constructed from an HDC and restores DC state of its own
-// choosing when it flushes. The observable result here was that DrawTextW
-// silently drew nothing at all: the sidebar's three segment labels came out as
-// an empty pill, with not one anti-aliased glyph pixel anywhere in the control,
-// while "No Bookmarks" a few lines above - same helper, same DC, same frame,
-// same colour for two of the three - rendered perfectly. The only thing
-// between the two was a raw fillSolid call.
+// choosing when it flushes. The observable result is that DrawTextW silently
+// draws nothing at all: the sidebar's three segment labels come out as an empty
+// pill, with not one anti-aliased glyph pixel anywhere in the control, while
+// "No Bookmarks" a few lines above - same helper, same DC, same frame, same
+// colour for two of the three - renders perfectly.
 //
-// paintChrome never hit this because every one of its fillSolid calls happens
-// BEFORE the Graphics is constructed. paintSidebar and paintDownloadsPanel both
-// construct theirs first and fill afterwards, which is why the broken labels in
-// each are exactly the ones drawn after the last fillSolid: the sidebar's three
-// segment labels and its "Clear History", the panel's "Downloads" and "Clear".
+// What decides which labels survive is simply what was drawn last on that DC.
+// The first version of this fix believed the culprit had to be a raw GDI
+// FillRect, swapped the sidebar's three fillSolid calls for this one, and the
+// labels stayed invisible - see the 2026-10-22 screen recording, where the
+// sidebar's pill still measures a peak brightness of 94 against "No Bookmarks"
+// at 196, on a build that already had fillSolidGdiPlus. Between "No Bookmarks"
+// and the segment names sit fillRoundedRect and strokeRoundedRect, which are
+// GDI+ draws, and they kill DrawTextW just the same.
+//
+// So the real rule is stronger than "do not mix the two": once a panel opens a
+// Gdiplus::Graphics it must never hand that DC to GDI again. paintSidebar and
+// paintDownloadsPanel now draw all of their text with drawLabelGdiPlus for
+// exactly that reason. paintChrome never had the problem because its fills all
+// happen before its Graphics is constructed and its labels are drawn with
+// drawLabelGdiPlus already.
 //
 // Declared after toRectF/toGdiColor because it uses both.
 inline void fillSolidGdiPlus(Gdiplus::Graphics& g, const RECT& rect, COLORREF color)
@@ -193,16 +202,23 @@ inline Gdiplus::Font fontFromHFont(HFONT font)
 // faded any other way: DrawString is the only call here that does not take a
 // second Graphics to draw through, so the colour matrix trick used for the
 // thumbnail bitmap is not available.
+// Horizontal alignment is a parameter rather than baked in as Near because the
+// sidebar's segment names and its empty-state message are centred, and they
+// used to be the ones drawLabel could not draw at all - see the note on
+// fillSolidGdiPlus below. Keeping one GDI+ text entry point for the whole
+// sidebar is the point: drawLabel uses GDI, and mixing GDI with a live
+// Gdiplus::Graphics on the same DC silently drops the text.
 inline void drawLabelGdiPlus(Gdiplus::Graphics& g, HFONT font,
     const std::wstring& text, const Gdiplus::RectF& rect, COLORREF color,
-    BYTE alpha = 255)
+    BYTE alpha = 255,
+    Gdiplus::StringAlignment horizontal = Gdiplus::StringAlignmentNear)
 {
     Gdiplus::Font f = fontFromHFont(font);
     Gdiplus::SolidBrush brush(toGdiColor(color, alpha));
     Gdiplus::StringFormat format;
     // Same three setters drawSiteBadge already uses at the bottom of this file -
     // that call is proven to compile, so there is no new GDI+ surface here.
-    format.SetAlignment(Gdiplus::StringAlignmentNear);
+    format.SetAlignment(horizontal);
     format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
     format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
     format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);

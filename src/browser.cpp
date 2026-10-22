@@ -376,6 +376,15 @@ int Browser::sidebarWidthNow() const
     return m_sidebarAnim.target > 0.0 ? px(kSidebarWidth) : 0;
 }
 
+int Browser::sidebarSettledWidth() const
+{
+    // Where the sidebar is going, not where it is. Identical to
+    // sidebarWidthNow() at rest, which is every time anything reads it for
+    // painting - only resize() uses this one, and only so that a toggle moves
+    // the page exactly once. See the comment there.
+    return m_sidebarAnim.target > 0.0 ? px(kSidebarWidth) : 0;
+}
+
 void Browser::reapTabs()
 {
     // Release tabs that have been closed for a while, long after the message
@@ -443,9 +452,17 @@ void Browser::invalidateSidebarColumn()
     // Invalidating only that column is what keeps a sidebar animation from
     // flashing - a whole-window invalidate also repaints the page area behind
     // the web view, whose background fill gets cleared and refilled every tick.
-    const int width = sidebarWidthNow();
+    int width = sidebarWidthNow();
     if (width <= 0)
         return;
+
+    // While the sidebar is opening its backdrop is painted out to the settled
+    // width rather than the animated one (see paintSidebar), so the column has
+    // to be invalidated that far as well. Without this the strip between the
+    // panel's moving right edge and the web view's left edge keeps whatever the
+    // page fill last put there until some later tick happens to reach it.
+    if (m_sidebarAnim.target > 0.0 && m_sidebarAnim.value < m_sidebarAnim.target)
+        width = std::max(width, sidebarSettledWidth());
 
     RECT client { };
     GetClientRect(m_window, &client);
@@ -626,7 +643,26 @@ void Browser::resize(bool wholeClient)
     placeAddressBar(l);
     placeFindEdit(l);
 
-    const int viewLeft = sidebarWidthNow();
+    // The page goes to the sidebar's SETTLED width, not its animated one.
+    //
+    // This is the whole of "the sidebar even makes the page go black for a few
+    // seconds". The sidebar spring is 0.55s and stepAnimations() calls
+    // resize(false) on every tick, so the view used to be moved to a different
+    // width each time - three or four times across a toggle, because a tick
+    // that has just moved a WebKit viewport lands 150-250ms later. Every one of
+    // those moves makes WebKit re-lay-out and re-raster the entire page, and
+    // until that finishes the child window shows its class background, which
+    // is black. So the page was black for very nearly the whole animation, and
+    // black again on every subsequent toggle: measured across the 2026-10-22
+    // recording at 5fps, 14 black samples spanning t=75.4s to t=83.4s, mean
+    // luminance 3.0. That is the child's black, not ours - m_theme.page is
+    // RGB(30,30,32), which measures 30.
+    //
+    // Placing the view at the target instead means its geometry changes once,
+    // on the toggle, and never again while the spring is running. The panel
+    // then wipes in or out over a page that is already where it is going to
+    // end up, which is what the sidebar does in most browsers anyway.
+    const int viewLeft = sidebarSettledWidth();
     const int viewWidth = std::max<int>(0, static_cast<int>(client.right) - viewLeft);
     const int viewHeight = std::max<int>(0, static_cast<int>(client.bottom - l.totalHeight));
 
@@ -662,26 +698,36 @@ void Browser::resize(bool wholeClient)
         // right edge fell 95-97px short of the window's, so the geometry passed
         // to MoveWindow is right and what is missing is the paint.
         //
-        // RDW_INVALIDATE ONLY, and that is the correction to the update-21
-        // version of this line. update-21 also passed RDW_UPDATENOW, which asks
-        // for the repaint to happen *now*, synchronously, inside this call. That
-        // turned a cosmetic band into a strobe: forcing a WebKit child to
-        // repaint dozens of times a second means most of those repaints land
-        // before WebKit has produced a new frame, so the child paints its black
-        // class background again. In the 2026-10-22 recording the sidebar toggle
-        // produced 42 black/non-black transitions over 27-47s, with 13.5 of
-        // those 17.7 seconds showing black, and the sidebar itself flipping
-        // between (38,37,40) and (3,3,3). That is the "the sidebar even makes
-        // the page go black for a few seconds" report, and it was a regression
-        // introduced by the fix for the band.
+        // RDW_INVALIDATE ONLY. update-21 also passed RDW_UPDATENOW, which asks
+        // for the repaint to happen *now*, synchronously, inside this call.
+        // Forcing a WebKit child to repaint dozens of times a second means most
+        // of those repaints land before WebKit has produced a new frame, so
+        // the child paints its black class background again. RDW_ERASE stays
+        // out for the same reason: erasing is the flash this whole design
+        // avoids.
         //
-        // Invalidating without UPDATENOW only marks the child dirty and lets
-        // WebKit repaint on its own schedule, which it was already doing. The
-        // strip still clears, just a frame or two later, and nothing is forced.
-        // RDW_ERASE stays out for the same reason it did before: erasing is the
-        // flash this whole design avoids.
+        // The repeated-move half of that same black is gone for a different
+        // reason, up at viewLeft: the view is placed at the sidebar's settled
+        // width, so this block runs once per toggle rather than once per tick.
+        // What is left is a single reflow, and its strip clears on the next
+        // frame WebKit produces rather than being forced.
         if (!wholeClient)
             RedrawWindow(viewWindow, nullptr, nullptr, RDW_INVALIDATE);
+
+        // ...and the strip this window now owns on the right of the view.
+        //
+        // When the sidebar opens the view narrows by its width, and the band
+        // from the view's new right edge out to where its old one was stops
+        // belonging to anybody. MoveWindow's bRepaint=TRUE does ask for that to
+        // be repainted, but it asks the child's parent at a moment of Windows'
+        // choosing, and the original report - "that black side on right when
+        // switching it on/off" - is what it looks like when that ask is not
+        // serviced. One explicit invalidate costs nothing and settles it.
+        const LONG exposedRight = static_cast<LONG>(viewLeft + viewWidth);
+        if (exposedRight < current.right) {
+            RECT exposed { 0, l.totalHeight, exposedRight, current.right };
+            InvalidateRect(m_window, &exposed, FALSE);
+        }
     }
 
     // The sidebar and the tab overview are drawn by this window and have to
@@ -3404,8 +3450,26 @@ void Browser::sidebarMove(POINT local, int height)
 
 void Browser::paintSidebar(HDC dc, int width, int height)
 {
-    const RECT whole { 0, 0, width, height };
-    fillSolid(dc, whole, m_theme.tabBar);
+    // The backdrop runs to the sidebar's settled width while it is still
+    // opening, not to its animated one. resize() has already put the web view
+    // at that settled width (see viewLeft there), so the strip between the
+    // panel's moving right edge and the page's left edge would otherwise show
+    // the page fill for the whole open animation - a 320px grey bar against a
+    // white page in the light theme, four grey levels off the panel in the dark
+    // one. Only the panel's contents animate now; its background is already
+    // there.
+    //
+    // Guarded on the spring travelling toward a non-zero target so the close,
+    // where the panel is shrinking, still wipes away rather than hanging on at
+    // full width until the last frame.
+    //
+    // fillSolid, not fillSolidGdiPlus, because this runs BEFORE the Graphics
+    // below is constructed - which is the one place on this DC where GDI is
+    // still safe.
+    int backdrop = width;
+    if (m_sidebarAnim.target > 0.0 && m_sidebarAnim.value < m_sidebarAnim.target)
+        backdrop = std::max(width, sidebarSettledWidth());
+    fillSolid(dc, RECT { 0, 0, backdrop, height }, m_theme.tabBar);
 
     Gdiplus::Graphics g(dc);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -3440,8 +3504,11 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         const std::wstring title = entries[i].title.empty() ? host : entries[i].title;
         const RECT titleRect { textLeft, row.top + px(5), textRight, row.top + px(5) + px(19) };
         const RECT hostRect { textLeft, row.top + px(5) + px(19), textRight, row.top + px(5) + px(19) + px(17) };
-        drawLabel(dc, g, title, titleRect, m_theme.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        drawLabel(dc, g, host, hostRect, m_theme.textSecondary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        // drawLabelGdiPlus, not drawLabel: this panel opened a Gdiplus::Graphics
+        // on the DC six lines ago and must not hand it back to GDI. Every
+        // label below is GDI+ for the same reason.
+        drawLabelGdiPlus(g, m_font, title, toRectF(titleRect), m_theme.text);
+        drawLabelGdiPlus(g, m_font, host, toRectF(hostRect), m_theme.textSecondary);
 
         if (hot) {
             const RECT closeRect = sidebarRowClose(row);
@@ -3454,16 +3521,17 @@ void Browser::paintSidebar(HDC dc, int width, int height)
     if (entries.empty()) {
         static const wchar_t* const messages[3] = { L"No Bookmarks", L"No Reading List Items", L"No History" };
         RECT message { 0, s.list.top, width, s.list.top + px(60) };
-        drawLabel(dc, g, messages[m_sidebarMode], message, m_theme.textSecondary, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        drawLabelGdiPlus(g, m_font, messages[m_sidebarMode], toRectF(message),
+            m_theme.textSecondary, 255, Gdiplus::StringAlignmentCenter);
     }
 
     // Header band with the segmented control.
     //
-    // fillSolidGdiPlus, not fillSolid: a raw GDI FillRect on a DC that the
-    // Graphics above owns is what stopped these three labels rendering at all.
-    // See fillSolidGdiPlus in gfx.h. The band is still drawn after the rows,
-    // which is the whole point of it - rows scrolled past the top get covered
-    // rather than needing clipping.
+    // The band is still drawn after the rows, which is the whole point of it -
+    // rows scrolled past the top get covered rather than needing clipping.
+    // fillSolidGdiPlus rather than fillSolid because a GDI+ Graphics is already
+    // open on this DC; see the note on it in gfx.h for why that matters, and
+    // for why these labels are GDI+ now rather than only this fill.
     const RECT header { 0, 0, width, s.list.top };
     fillSolidGdiPlus(g, header, m_theme.tabBar);
 
@@ -3477,16 +3545,16 @@ void Browser::paintSidebar(HDC dc, int width, int height)
             fillRoundedRect(g, inset, px(6), m_theme.glass);
             strokeRoundedRect(g, inset, px(6), m_theme.glassBorder, std::max(1.0f, k));
         }
-        // Nothing clever here, and update-21's theory about DT_END_ELLIPSIS was
-        // wrong. The flags are now the plain centred set, shared with the
-        // working "No Bookmarks" call above, but the labels still did not
-        // render - measured across 55 seconds of the 2026-10-22 recording, the
-        // pill's peak brightness was 94 in every single frame the sidebar was
-        // open, with zero pixels above 110, while "No Bookmarks" reached 196.
-        // The real cause was the GDI FillRect above; see fillSolidGdiPlus.
-        g.Flush(Gdiplus::FlushIntentionSync);
-        drawLabel(dc, g, names[i], s.segments[i], selected ? m_theme.text : m_theme.textSecondary,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        // GDI+, and that is the fix rather than another flag to try. These three
+        // labels are the ones that never rendered, and the 2026-10-22 recording
+        // still shows it: the pill measures a peak brightness of 94 with zero
+        // pixels above 110, against "No Bookmarks" at 196, on a build that
+        // already had fillSolidGdiPlus. So it was never the GDI FillRect in the
+        // band above either - fillRoundedRect and strokeRoundedRect, two lines
+        // further up, are GDI+ draws and they kill DrawTextW the same way.
+        // See the note on fillSolidGdiPlus in gfx.h.
+        drawLabelGdiPlus(g, m_font, names[i], toRectF(s.segments[i]),
+            selected ? m_theme.text : m_theme.textSecondary, 255, Gdiplus::StringAlignmentCenter);
     }
 
     // Footer with "Clear History" on the History tab.
@@ -3494,7 +3562,8 @@ void Browser::paintSidebar(HDC dc, int width, int height)
         const RECT footer { 0, s.list.bottom, width, height };
         fillSolidGdiPlus(g, footer, m_theme.tabBar);
         fillRoundedRect(g, s.clearButton, px(8), m_theme.pill);
-        drawLabel(dc, g, L"Clear History", s.clearButton, m_theme.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        drawLabelGdiPlus(g, m_font, L"Clear History", toRectF(s.clearButton),
+            m_theme.text, 255, Gdiplus::StringAlignmentCenter);
     }
 
     // Settings gear in the bottom-left corner, always visible. Filled with the
