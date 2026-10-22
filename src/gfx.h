@@ -209,16 +209,28 @@ inline void drawLabelGdiPlus(Gdiplus::Graphics& g, HFONT font,
     g.DrawString(text.c_str(), -1, &f, rect, &format, &brush);
 }
 
-// Width the text would take with no limit. No trimming and no wrapping, so
-// this is the natural width the caller can compare against its available box.
+// Width the text would take with no limit, so the caller can compare it against
+// its available box.
+//
+// There is deliberately no StringFormat here, and that is forced rather than
+// stylistic. DrawString takes one - see drawLabelGdiPlus - but this SDK's
+// Graphics::MeasureString has no overload that accepts a StringFormat next to a
+// PointF, so the five-argument call that reads the most naturally is C2665. The
+// two functions do not have to offer the same overload set.
+//
+// The form used below is the one the compiler itself printed when it rejected
+// the other, so it is known to exist rather than merely documented. The PointF
+// variant is chosen over the layout-rect variant because with an origin there
+// is no layout width to wrap against, making this the natural single-line width
+// - which is the only number the caller wants. The ellipsis itself is drawLabel-
+// GdiPlus's job, not this one's.
 inline Gdiplus::SizeF measureLabelGdiPlus(Gdiplus::Graphics& g, HFONT font,
     const std::wstring& text)
 {
     Gdiplus::Font f = fontFromHFont(font);
-    Gdiplus::StringFormat format;
-    format.SetTrimming(Gdiplus::StringTrimmingNone);
-    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    return g.MeasureString(text.c_str(), -1, &f, Gdiplus::PointF(0.0f, 0.0f), &format);
+    Gdiplus::RectF bounds;
+    g.MeasureString(text.c_str(), -1, &f, Gdiplus::PointF(0.0f, 0.0f), &bounds);
+    return bounds.GetSize();
 }
 
 inline void addRoundedRect(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, Gdiplus::REAL radius)

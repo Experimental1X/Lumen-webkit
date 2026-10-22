@@ -3055,9 +3055,11 @@ void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
         // the overview is simply open, so this is the path that has to stay
         // cheap.
         const bool moving = eased < 0.999;
-        // GDI+'s Save/Restore is NOT the GDI pair: Restore takes the
-        // GraphicsState Save handed out, it takes no argument. Passing nothing
-        // is C2660.
+        // GDI+'s Save/Restore is not the GDI pair, and it is wrong in opposite
+        // directions from what instinct suggests. Save takes NO argument and
+        // hands the state back as its return value; Restore takes that state as
+        // its one argument. So `g.Save(st)` is C2660 and `g.Restore()` is also
+        // C2660 - two mistakes that look like the same mistake and are not.
         Gdiplus::GraphicsState cardState;
         if (moving) {
             // Scale about the card's centre and lift it, as
@@ -3068,7 +3070,7 @@ void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
             const Gdiplus::REAL cx = static_cast<Gdiplus::REAL>((card.card.left + card.card.right) / 2.0);
             const Gdiplus::REAL cy = static_cast<Gdiplus::REAL>((card.card.top + card.card.bottom) / 2.0);
             const Gdiplus::REAL rise = static_cast<Gdiplus::REAL>(px(18) * (1.0 - eased));
-            g.Save(cardState);
+            cardState = g.Save();
             g.TranslateTransform(cx, cy + rise, Gdiplus::MatrixOrderAppend);
             g.ScaleTransform(cardScale, cardScale, Gdiplus::MatrixOrderAppend);
             g.TranslateTransform(-cx, -cy, Gdiplus::MatrixOrderAppend);
