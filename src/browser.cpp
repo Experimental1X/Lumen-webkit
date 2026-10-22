@@ -51,6 +51,47 @@ bool isStartPage(const std::wstring& url)
     return url.empty() || url == L"about:blank";
 }
 
+// Is what the user typed a destination, or a phrase to search for? Exactly one
+// definition of that, shared by normalizeInput (which navigates) and the
+// suggestions builder (which has to decide whether to offer a search row). If
+// these ever lived separately they would drift, and the dropdown would offer
+// "Search for github.com" while Enter navigated to the site.
+struct AddressShape {
+    bool hasScheme { false };
+    bool localHost { false };
+    bool bareHost { false };
+    bool isAddress() const { return hasScheme || localHost || bareHost; }
+};
+
+AddressShape classifyAddress(const std::wstring& text)
+{
+    AddressShape shape;
+    shape.hasScheme = text.find(L"://") != std::wstring::npos
+        || text.rfind(L"about:", 0) == 0
+        || text.rfind(L"file:", 0) == 0;
+    shape.localHost = text.rfind(L"localhost", 0) == 0 || text.rfind(L"127.0.0.1", 0) == 0;
+    shape.bareHost = !shape.hasScheme
+        && text.find_first_of(L" \t") == std::wstring::npos
+        && (text.rfind(L"www.", 0) == 0 || text.find(L'.') != std::wstring::npos);
+    return shape;
+}
+
+// ASCII-only case folding. Deliberately not towlower: that drags in <cwctype>
+// and its locale behaviour for no benefit, since every string compared here is
+// a URL, a host or an English query.
+std::wstring folded(const std::wstring& value)
+{
+    std::wstring result;
+    result.reserve(value.size());
+    for (wchar_t ch : value) {
+        if (ch >= L'A' && ch <= L'Z')
+            result += static_cast<wchar_t>(ch - L'A' + L'a');
+        else
+            result += ch;
+    }
+    return result;
+}
+
 // "https://www.example.com/path?x" becomes "example.com".
 std::wstring hostOf(const std::wstring& url)
 {
@@ -127,6 +168,7 @@ bool Browser::create(HWND window, std::wstring& error)
 
     createAddressControl();
     createFindControl();
+    createSuggestionsPanel();
     createDownloadsPanel();
 
     // Nothing is mid-transition at startup: every spring starts parked at the
@@ -755,12 +797,44 @@ LRESULT CALLBACK Browser::addressProc(HWND window, UINT message, WPARAM wParam, 
         break;
 
     case WM_KEYDOWN:
+        // Everything below is only reachable while the edit has focus, because
+        // the field is a real EDIT child and this subclass sees its keys first.
+        // onKeyDown on the main window never sees any of it.
         if (wParam == VK_RETURN) {
-            browser->commitAddress();
+            // Enter opens the highlighted row when there is one, and otherwise
+            // navigates to whatever was typed. That is what makes the arrow keys
+            // useful rather than decorative.
+            if (browser->m_suggestionsVisible && browser->m_suggestionsSelected >= 0)
+                browser->openSuggestion(browser->m_suggestionsSelected, false);
+            else
+                browser->commitAddress();
             return 0;
         }
         if (wParam == VK_ESCAPE) {
+            // First Escape closes the dropdown and leaves the field alone, like
+            // Safari; a second one leaves the field.
+            if (browser->m_suggestionsVisible) {
+                browser->hideSuggestions();
+                return 0;
+            }
             browser->cancelAddressEdit();
+            return 0;
+        }
+        // Only swallow the arrows while the dropdown is up. With no dropdown
+        // they have to keep moving the caret, which is what the user expects
+        // from a single-line edit.
+        if ((wParam == VK_DOWN || wParam == VK_UP) && browser->m_suggestionsVisible) {
+            browser->suggestionsKey(static_cast<int>(wParam));
+            return 0;
+        }
+        break;
+
+    case WM_MOUSEWHEEL:
+        // WM_MOUSEWHEEL is delivered to the focused window, and the focused
+        // window is this edit - the dropdown is WS_EX_NOACTIVATE and never
+        // takes focus. Without this the list could not be scrolled at all.
+        if (browser->m_suggestionsVisible) {
+            browser->suggestionsWheel(GET_WHEEL_DELTA_WPARAM(wParam));
             return 0;
         }
         break;
@@ -795,6 +869,10 @@ void Browser::beginAddressEdit()
         std::wstring url;
         if (auto* view = active(); view && !isStartPage(view->url()))
             url = view->url();
+        // SetWindowText fires EN_CHANGE. Arm the guard first so seeding the
+        // field does not immediately raise a dropdown over the page the user
+        // was just looking at; the first keystroke is what should open it.
+        m_suggestionsPrimed = false;
         SetWindowTextW(m_address, url.c_str());
 
         placeAddressBar(layout());
@@ -808,6 +886,7 @@ void Browser::beginAddressEdit()
 
 void Browser::endAddressEdit()
 {
+    hideSuggestions();
     if (!m_editing)
         return;
 
@@ -838,6 +917,550 @@ void Browser::cancelAddressEdit()
     endAddressEdit();
 }
 
+// ---------------------------------------------------------------------------
+// Address bar suggestions
+//
+// The dropdown Safari raises under the address field while you type: matching
+// history and bookmarks, a search row when the text is a phrase, arrow-key
+// navigation, Enter to open, Escape to dismiss.
+//
+// Two structural facts drive the whole design:
+//
+//  1. The address field is a real EDIT child window. Keyboard events land in
+//     its subclass proc, not in Browser::onKeyDown, so that is where the arrow
+//     and Enter handling had to go.
+//
+//  2. The dropdown has to float above the WebKit view, and a child window of
+//     the main window cannot reliably do that - the same reason the downloads
+//     panel is an owned popup. So this is one too, with WS_EX_NOACTIVATE so
+//     that clicking a row does not pull focus out of the field and kill the
+//     editing session mid-keystroke.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kSuggestionsRow = 46;
+constexpr int kSuggestionsPad = 6;
+constexpr int kSuggestionsInset = 4;
+constexpr int kSuggestionsMaxVisible = 7;
+constexpr int kSuggestionsRadius = 12;
+constexpr int kSuggestionsMaxResults = 24;
+
+// Higher is better. Host and title matches outrank URL matches because that is
+// what the user is usually remembering, and a prefix match outranks a substring
+// one because it is nearly always the more specific intent. Zero means no match.
+//
+// Takes plain strings rather than Browser::Suggestion on purpose: this is a
+// free function, and Suggestion is private to Browser, so it could not be named
+// from here even spelled Browser::Suggestion.
+int scoreEntry(const std::wstring& host, const std::wstring& title,
+    const std::wstring& url, const std::wstring& needle)
+{
+    const std::wstring hostFolded = folded(host);
+    const std::wstring titleFolded = folded(title);
+    const std::wstring urlFolded = folded(url);
+
+    int score = 0;
+    if (!hostFolded.empty() && hostFolded.rfind(needle, 0) == 0)
+        score = 100;
+    else if (urlFolded.rfind(needle, 0) == 0)
+        score = 95;
+    else if (!titleFolded.empty() && titleFolded.rfind(needle, 0) == 0)
+        score = 90;
+    else if (hostFolded.find(needle) != std::wstring::npos)
+        score = 70;
+    else if (!titleFolded.empty() && titleFolded.find(needle) != std::wstring::npos)
+        score = 65;
+    else if (urlFolded.find(needle) != std::wstring::npos)
+        score = 60;
+
+    if (score == 0)
+        return 0;
+
+    // Prefer the tighter match: "example.com" over "example.com/a/very/long/
+    // path/that/also/contains/the/words". Capped so a long URL can never
+    // outrank a genuinely better match on the strength of being short.
+    const int lengthPenalty = static_cast<int>(std::min<size_t>(url.size() / 4, 20));
+    return score - lengthPenalty;
+}
+
+} // namespace
+
+void Browser::createSuggestionsPanel()
+{
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW windowClass { };
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = &Browser::suggestionsProc;
+        windowClass.hInstance = GetModuleHandleW(nullptr);
+        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.hbrBackground = nullptr;
+        windowClass.lpszClassName = L"LumenSuggestions";
+        RegisterClassExW(&windowClass);
+        registered = true;
+    }
+
+    // WS_EX_NOACTIVATE is the important flag: the field keeps focus and keeps
+    // receiving keystrokes while the dropdown is up and being clicked.
+    m_suggestionsPanel = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"LumenSuggestions", L"",
+        WS_POPUP,
+        0, 0, 10, 10,
+        m_window, nullptr, GetModuleHandleW(nullptr), this);
+}
+
+void Browser::rebuildSuggestions(const std::wstring& text)
+{
+    // Local rather than file-local: it holds a Suggestion, which is private to
+    // Browser and so cannot be named from outside the class.
+    struct Ranked {
+        int score { 0 };
+        size_t order { 0 };
+        std::wstring url;
+        Suggestion suggestion;
+    };
+
+    m_suggestions.clear();
+    m_suggestionsSelected = -1;
+    m_suggestionsHover = -1;
+    m_suggestionsScroll = 0;
+
+    std::wstring query = text;
+    while (!query.empty() && (query.front() == L' ' || query.front() == L'\t'))
+        query.erase(query.begin());
+    while (!query.empty() && (query.back() == L' ' || query.back() == L'\t'))
+        query.pop_back();
+
+    if (query.empty())
+        return;
+
+    const std::wstring needle = folded(query);
+    std::vector<Ranked> ranked;
+    size_t order = 0;
+
+    // Bookmarks first: they are the ones the user deliberately kept, and Safari
+    // puts them ahead of raw history.
+    for (const auto& entry : m_library.bookmarks()) {
+        if (entry.url.empty())
+            continue;
+        Suggestion suggestion;
+        suggestion.host = hostOf(entry.url);
+        suggestion.title = entry.title.empty() ? suggestion.host : entry.title;
+        suggestion.url = entry.url;
+        const int score = scoreEntry(suggestion.host, suggestion.title, suggestion.url, needle);
+        if (score > 0)
+            ranked.push_back(Ranked { score, order++, entry.url, suggestion });
+    }
+
+    // Then history, which is already newest-first. The order index doubles as
+    // that recency, and it breaks ties between otherwise equal matches.
+    for (const auto& entry : m_library.history()) {
+        if (entry.url.empty())
+            continue;
+        Suggestion suggestion;
+        suggestion.host = hostOf(entry.url);
+        suggestion.title = entry.title.empty() ? suggestion.host : entry.title;
+        suggestion.url = entry.url;
+        const int score = scoreEntry(suggestion.host, suggestion.title, suggestion.url, needle);
+        if (score > 0)
+            ranked.push_back(Ranked { score, order++, entry.url, suggestion });
+    }
+
+    std::stable_sort(ranked.begin(), ranked.end(), [](const Ranked& a, const Ranked& b) {
+        if (a.score != b.score)
+            return a.score > b.score;
+        return a.order < b.order;
+    });
+
+    // Dedupe by URL: a bookmarked page is almost always in history too, and
+    // showing it twice reads as a bug.
+    for (const auto& candidate : ranked) {
+        const bool duplicate = std::any_of(m_suggestions.begin(), m_suggestions.end(),
+            [&](const Suggestion& existing) { return existing.url == candidate.url; });
+        if (duplicate)
+            continue;
+        m_suggestions.push_back(candidate.suggestion);
+        if (static_cast<int>(m_suggestions.size()) >= kSuggestionsMaxResults)
+            break;
+    }
+
+    // The search row goes on top, but only when the text really is a phrase.
+    // Offering "Search for github.com" above a github.com history row would be
+    // nonsense, and classifyAddress is the same test normalizeInput uses, so
+    // the row can never contradict what Enter would do.
+    if (!classifyAddress(query).isAddress()) {
+        Suggestion search;
+        search.title = query;
+        search.url = L"https://www.google.com/search?q=" + percentEncode(query);
+        search.isSearch = true;
+        m_suggestions.insert(m_suggestions.begin(), search);
+    }
+}
+
+void Browser::updateSuggestions()
+{
+    if (!m_suggestionsPanel || !m_address)
+        return;
+
+    // The seeding SetWindowText in beginAddressEdit is not the user typing.
+    if (!m_suggestionsPrimed) {
+        m_suggestionsPrimed = true;
+        return;
+    }
+
+    const int length = GetWindowTextLengthW(m_address);
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(m_address, text.data(), length + 1);
+    text.resize(static_cast<size_t>(length));
+
+    rebuildSuggestions(text);
+
+    if (m_suggestions.empty()) {
+        hideSuggestions();
+        return;
+    }
+    showSuggestions();
+}
+
+void Browser::showSuggestions()
+{
+    if (!m_suggestionsPanel || m_suggestions.empty())
+        return;
+    m_suggestionsVisible = true;
+    layoutSuggestionsPanel();
+    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
+}
+
+void Browser::hideSuggestions()
+{
+    m_suggestionsSelected = -1;
+    m_suggestionsHover = -1;
+    m_suggestionsHoverNewTab = false;
+    m_suggestionsScroll = 0;
+    if (!m_suggestionsVisible)
+        return;
+    m_suggestionsVisible = false;
+    if (m_suggestionsPanel)
+        ShowWindow(m_suggestionsPanel, SW_HIDE);
+}
+
+int Browser::suggestionsHeight() const
+{
+    const int rows = static_cast<int>(m_suggestions.size());
+    const int content = px(kSuggestionsPad * 2) + rows * px(kSuggestionsRow);
+    return std::min(content, px(kSuggestionsPad * 2) + px(kSuggestionsMaxVisible) * px(kSuggestionsRow));
+}
+
+int Browser::suggestionsMaxScroll() const
+{
+    return std::max(0, px(kSuggestionsPad * 2)
+        + static_cast<int>(m_suggestions.size()) * px(kSuggestionsRow)
+        - suggestionsHeight());
+}
+
+void Browser::layoutSuggestionsPanel()
+{
+    if (!m_suggestionsPanel)
+        return;
+
+    const ChromeLayout l = layout();
+    RECT client { };
+    GetClientRect(m_window, &client);
+
+    // As wide as the field it belongs to, which is what Safari does and what
+    // makes the dropdown read as attached to the address bar.
+    const int width = std::max(px(220), static_cast<int>(l.pill.right - l.pill.left));
+    const int height = suggestionsHeight();
+    const int gap = px(4);
+
+    const int x = std::clamp(static_cast<int>(l.pill.left), 0,
+        std::max(0, static_cast<int>(client.right) - width));
+    const int y = static_cast<int>(l.pill.bottom) + gap;
+
+    m_suggestionsWidth = width;
+    m_suggestionsScroll = std::clamp(m_suggestionsScroll, 0, suggestionsMaxScroll());
+
+    POINT origin { x, y };
+    ClientToScreen(m_window, &origin);
+    SetWindowPos(m_suggestionsPanel, HWND_TOP, origin.x, origin.y, width, height,
+        SWP_SHOWWINDOW | SWP_NOACTIVATE);
+
+    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
+        px(kSuggestionsRadius), px(kSuggestionsRadius));
+    SetWindowRgn(m_suggestionsPanel, region, TRUE);
+}
+
+RECT Browser::suggestionRow(int index) const
+{
+    const int pad = px(kSuggestionsPad);
+    const int inset = px(kSuggestionsInset);
+    const int rowHeight = px(kSuggestionsRow);
+    const int top = pad + index * rowHeight - m_suggestionsScroll;
+    return RECT { inset, top, m_suggestionsWidth - inset, top + rowHeight };
+}
+
+RECT Browser::suggestionNewTab(int index) const
+{
+    const RECT row = suggestionRow(index);
+    const int size = px(22);
+    return RECT { row.right - px(10) - size, row.top + (row.bottom - row.top - size) / 2,
+        row.right - px(10), row.top + (row.bottom - row.top + size) / 2 };
+}
+
+void Browser::paintSuggestions(HDC dc, int width, int height)
+{
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+    const float k = scaleFactor();
+
+    // Opaque, deliberately. paintBuffered clips to the damaged slice and never
+    // clears the buffer, so any alpha here would blend against the *previous*
+    // paint - which, on a hover change, is the old row highlight. At 246 that
+    // is a 4% ghost that shimmers as the pointer moves down the list.
+    const RECT card { 0, 0, width, height };
+    fillRoundedRect(g, card, px(kSuggestionsRadius),
+        m_theme.dark ? RGB(40, 40, 43) : RGB(253, 253, 255));
+    strokeRoundedRect(g, RECT { 0, 0, width - 1, height - 1 }, px(kSuggestionsRadius),
+        m_theme.dark ? RGB(62, 62, 66) : RGB(0, 0, 0), 1.0f,
+        m_theme.dark ? 200 : 20);
+
+    for (size_t i = 0; i < m_suggestions.size(); ++i) {
+        const RECT row = suggestionRow(static_cast<int>(i));
+        if (row.bottom < 0 || row.top > height)
+            continue;
+
+        const bool selected = static_cast<int>(i) == m_suggestionsSelected;
+        const bool hot = static_cast<int>(i) == m_suggestionsHover;
+        if (selected)
+            fillRoundedRect(g, row, px(8), m_theme.accent, 240);
+        else if (hot)
+            fillRoundedRect(g, row, px(8), m_theme.pill);
+
+        const COLORREF primary = selected ? RGB(255, 255, 255) : m_theme.text;
+        const COLORREF secondary = selected ? RGB(226, 230, 240) : m_theme.textSecondary;
+
+        const int badge = px(22);
+        const int badgeTop = row.top + (row.bottom - row.top - badge) / 2;
+        const RECT badgeRect { row.left + px(10), badgeTop, row.left + px(10) + badge, badgeTop + badge };
+        if (m_suggestions[i].isSearch) {
+            // A magnifier on an accent disc, rather than a site badge.
+            fillRoundedRect(g, badgeRect, badge / 2,
+                selected ? RGB(255, 255, 255) : m_theme.accent, selected ? 70 : 34);
+            drawMagnifierIcon(g, badgeRect, selected ? RGB(255, 255, 255) : m_theme.accent, k);
+        } else {
+            // Keeps its own hue even on the selected row: drawSiteBadge paints
+            // the letter in white, so a white badge would make it invisible.
+            drawSiteBadge(g, badgeRect, badgeLetter(m_suggestions[i].host),
+                colorFromHue(hueOf(m_suggestions[i].host)), k);
+        }
+
+        const int textLeft = badgeRect.right + px(10);
+        const int textRight = row.right - px(40);
+        const int mid = row.top + (row.bottom - row.top) / 2;
+        if (m_suggestions[i].isSearch) {
+            // One centred line: there is no URL worth showing for a search.
+            const RECT label { textLeft, row.top, textRight, row.bottom };
+            drawLabel(dc, g, L"Search for \"" + m_suggestions[i].title + L"\"", label,
+                primary, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        } else {
+            const RECT titleRect { textLeft, mid - px(19), textRight, mid + px(1) };
+            const RECT urlRect { textLeft, mid + px(1), textRight, mid + px(19) };
+            drawLabel(dc, g, m_suggestions[i].title, titleRect, primary,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            drawLabel(dc, g, m_suggestions[i].url, urlRect, secondary,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+
+        // Open in a new tab, on the hovered or keyboard-selected row only, so
+        // the list stays quiet until you aim at a row.
+        if (selected || hot) {
+            const RECT target = suggestionNewTab(static_cast<int>(i));
+            const bool targetHot = hot && m_suggestionsHoverNewTab;
+            if (targetHot)
+                fillRoundedRect(g, target, (target.right - target.left) / 2, RGB(255, 255, 255), 46);
+            drawPlusIcon(g, target, selected ? RGB(255, 255, 255) : m_theme.textSecondary, k);
+        }
+    }
+}
+
+void Browser::suggestionsClick(POINT point)
+{
+    for (size_t i = 0; i < m_suggestions.size(); ++i) {
+        const RECT row = suggestionRow(static_cast<int>(i));
+        if (!PtInRect(&row, point))
+            continue;
+        const bool inNewTab = PtInRect(&suggestionNewTab(static_cast<int>(i)), point) != FALSE;
+        openSuggestion(static_cast<int>(i), inNewTab);
+        return;
+    }
+    // A click on the card but not on a row just dismisses, like Safari.
+    hideSuggestions();
+}
+
+void Browser::suggestionsMove(POINT point)
+{
+    int hover = -1;
+    bool hoverNewTab = false;
+    for (size_t i = 0; i < m_suggestions.size(); ++i) {
+        const RECT row = suggestionRow(static_cast<int>(i));
+        if (!PtInRect(&row, point))
+            continue;
+        hover = static_cast<int>(i);
+        hoverNewTab = PtInRect(&suggestionNewTab(static_cast<int>(i)), point) != FALSE;
+        break;
+    }
+    if (hover == m_suggestionsHover && hoverNewTab == m_suggestionsHoverNewTab)
+        return;
+    m_suggestionsHover = hover;
+    m_suggestionsHoverNewTab = hoverNewTab;
+    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
+}
+
+void Browser::suggestionsWheel(int delta)
+{
+    const int maxScroll = suggestionsMaxScroll();
+    if (maxScroll <= 0)
+        return;
+    const int step = delta / WHEEL_DELTA;
+    if (step == 0)
+        return;
+    const int next = std::clamp(m_suggestionsScroll - step * px(kSuggestionsRow), 0, maxScroll);
+    if (next == m_suggestionsScroll)
+        return;
+    m_suggestionsScroll = next;
+    // Move the highlight with the viewport, or the keyboard would drive a row
+    // that has scrolled out of sight.
+    const int firstVisible = m_suggestionsScroll / px(kSuggestionsRow);
+    const int lastVisible = (m_suggestionsScroll + suggestionsHeight()) / px(kSuggestionsRow);
+    if (m_suggestionsSelected >= 0
+        && (m_suggestionsSelected < firstVisible || m_suggestionsSelected > lastVisible)) {
+        m_suggestionsSelected = std::clamp(m_suggestionsSelected, firstVisible, lastVisible);
+    }
+    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
+}
+
+void Browser::suggestionsKey(int key)
+{
+    if (m_suggestions.empty())
+        return;
+    const int count = static_cast<int>(m_suggestions.size());
+    const int rowHeight = px(kSuggestionsRow);
+
+    int next = m_suggestionsSelected;
+    if (key == VK_DOWN)
+        next = m_suggestionsSelected < 0 ? 0 : (m_suggestionsSelected + 1) % count;
+    else if (key == VK_UP)
+        next = m_suggestionsSelected < 0 ? count - 1
+            : (m_suggestionsSelected == 0 ? count - 1 : m_suggestionsSelected - 1);
+    else
+        return;
+    m_suggestionsSelected = next;
+
+    // Keep the highlighted row inside the viewport.
+    const int top = px(kSuggestionsPad) + next * rowHeight - m_suggestionsScroll;
+    const int bottom = top + rowHeight;
+    const int visible = suggestionsHeight();
+    if (top < px(kSuggestionsPad))
+        m_suggestionsScroll = std::max(0, m_suggestionsScroll - (px(kSuggestionsPad) - top));
+    else if (bottom > visible - px(kSuggestionsPad))
+        m_suggestionsScroll = std::min(suggestionsMaxScroll(),
+            m_suggestionsScroll + (bottom - (visible - px(kSuggestionsPad))));
+    m_suggestionsScroll = std::clamp(m_suggestionsScroll, 0, suggestionsMaxScroll());
+
+    InvalidateRect(m_suggestionsPanel, nullptr, FALSE);
+}
+
+void Browser::openSuggestion(int index, bool inNewTab)
+{
+    if (index < 0 || index >= static_cast<int>(m_suggestions.size()))
+        return;
+    const Suggestion suggestion = m_suggestions[index];
+    const std::wstring url = suggestion.url;
+
+    hideSuggestions();
+    if (auto* view = active())
+        view->focus();
+    endAddressEdit();
+
+    if (url.empty())
+        return;
+    if (inNewTab)
+        newTab(url);
+    else
+        navigate(url);
+}
+
+LRESULT CALLBACK Browser::suggestionsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    auto* browser = reinterpret_cast<Browser*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!browser)
+        return DefWindowProcW(window, message, wParam, lParam);
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT paint { };
+        HDC dc = BeginPaint(window, &paint);
+        RECT client { };
+        GetClientRect(window, &client);
+        browser->paintBuffered(dc, client, [&](HDC memory) {
+            browser->paintSuggestions(memory, static_cast<int>(client.right),
+                static_cast<int>(client.bottom));
+        });
+        EndPaint(window, &paint);
+        return 0;
+    }
+
+    // A WS_EX_NOACTIVATE window still asks whether to activate on click. Answer
+    // no, so the click is delivered here without the field losing focus.
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_LBUTTONDOWN:
+        browser->suggestionsClick(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+        return 0;
+
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT track { sizeof(track), TME_LEAVE, window, 0 };
+        TrackMouseEvent(&track);
+        browser->suggestionsMove(POINT { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        browser->suggestionsMove(POINT { -1, -1 });
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        browser->suggestionsWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+        return 0;
+
+    // The field owns the keyboard, so these never arrive. Kept for safety: a
+    // stray key should dismiss rather than be swallowed forever.
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            browser->hideSuggestions();
+            return 0;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
 std::wstring Browser::normalizeInput(const std::wstring& input)
 {
     std::wstring cleaned = input;
@@ -849,19 +1472,13 @@ std::wstring Browser::normalizeInput(const std::wstring& input)
     if (cleaned.empty())
         return { };
 
-    const bool hasScheme = cleaned.find(L"://") != std::wstring::npos
-        || cleaned.rfind(L"about:", 0) == 0
-        || cleaned.rfind(L"file:", 0) == 0;
-    const bool localHost = cleaned.rfind(L"localhost", 0) == 0 || cleaned.rfind(L"127.0.0.1", 0) == 0;
-    const bool bareHost = !hasScheme
-        && cleaned.find_first_of(L" \t") == std::wstring::npos
-        && (cleaned.rfind(L"www.", 0) == 0 || cleaned.find(L'.') != std::wstring::npos);
+    const AddressShape shape = classifyAddress(cleaned);
 
-    if (hasScheme)
+    if (shape.hasScheme)
         return cleaned;
-    if (localHost)
+    if (shape.localHost)
         return L"http://" + cleaned;
-    if (bareHost)
+    if (shape.bareHost)
         return L"https://" + cleaned;
     return L"https://www.google.com/search?q=" + percentEncode(cleaned);
 }
@@ -2014,26 +2631,29 @@ void Browser::captureThumbnail(WebView& view)
     // PrintWindow with PW_RENDERFULLCONTENT is served from DWM's redirection
     // surface, and that surface is per-window - so each tab reads back its own
     // last composited content. It renders 1:1, so we print at full size and
-    // scale down afterwards rather than asking a small DC to do the scaling.
+    // scale down afterwards rather than asking a scaled DC to do the scaling.
     HDC full = CreateCompatibleDC(screen);
     HBITMAP fullBitmap = CreateCompatibleBitmap(screen, sourceWidth, sourceHeight);
     if (full && fullBitmap) {
         HGDIOBJ oldFull = SelectObject(full, fullBitmap);
         if (PrintWindow(window, full, PW_RENDERFULLCONTENT)) {
-            HDC small = CreateCompatibleDC(screen);
-            HBITMAP smallBitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
-            if (small && smallBitmap) {
-                HGDIOBJ oldSmall = SelectObject(small, smallBitmap);
-                SetStretchBltMode(small, HALFTONE);
-                SetBrushOrgEx(small, 0, 0, nullptr);
-                copied = StretchBlt(small, 0, 0, thumbWidth, thumbHeight,
+            // Not named `small`: windef.h declares `typedef char small, *psmall`,
+            // so the preprocessor rewrites the declaration into "HDC char" and
+            // the build fails with C2628 plus a cascade of nonsense after it.
+            HDC scaled = CreateCompatibleDC(screen);
+            HBITMAP scaledBitmap = CreateCompatibleBitmap(screen, thumbWidth, thumbHeight);
+            if (scaled && scaledBitmap) {
+                HGDIOBJ oldScaled = SelectObject(scaled, scaledBitmap);
+                SetStretchBltMode(scaled, HALFTONE);
+                SetBrushOrgEx(scaled, 0, 0, nullptr);
+                copied = StretchBlt(scaled, 0, 0, thumbWidth, thumbHeight,
                     full, 0, 0, sourceWidth, sourceHeight, SRCCOPY) != 0;
-                SelectObject(small, oldSmall);
+                SelectObject(scaled, oldScaled);
                 if (copied)
-                    bitmap = smallBitmap;
+                    bitmap = scaledBitmap;
                 else
-                    DeleteObject(smallBitmap);
-                DeleteDC(small);
+                    DeleteObject(scaledBitmap);
+                DeleteDC(scaled);
             }
         }
         SelectObject(full, oldFull);
@@ -2770,8 +3390,15 @@ void Browser::closeTabForView(WebView* view)
 
 void Browser::onControlNotify(HWND control, UINT code)
 {
-    if (control == m_find && code == EN_CHANGE)
+    if (control == m_find && code == EN_CHANGE) {
         runFind(false, true);
+        return;
+    }
+    // The address field has no ID-driven command of its own worth routing
+    // through onCommand; EN_CHANGE is the signal that the query changed, which
+    // is also what rebuilds the suggestions.
+    if (control == m_address && code == EN_CHANGE && m_editing)
+        updateSuggestions();
 }
 
 void Browser::createFindControl()

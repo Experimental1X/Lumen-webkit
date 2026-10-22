@@ -272,6 +272,34 @@ private:
     void navigate(const std::wstring& input);
     static LRESULT CALLBACK addressProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
+    // --- address bar suggestions ---
+    // One row of the dropdown that appears under the address field while the
+    // user types, the way Safari offers matching history and bookmarks.
+    struct Suggestion {
+        std::wstring title;   // page title, or the query for a search row
+        std::wstring url;     // always a resolved URL, even for a search row
+        std::wstring host;    // host to badge the row with; empty on a search
+        bool isSearch { false };
+    };
+
+    void createSuggestionsPanel();
+    void rebuildSuggestions(const std::wstring& text);
+    void updateSuggestions();
+    void showSuggestions();
+    void hideSuggestions();
+    int suggestionsHeight() const;
+    int suggestionsMaxScroll() const;
+    void layoutSuggestionsPanel();
+    RECT suggestionRow(int index) const;
+    RECT suggestionNewTab(int index) const;
+    void paintSuggestions(HDC dc, int width, int height);
+    void suggestionsClick(POINT point);
+    void suggestionsMove(POINT point);
+    void suggestionsWheel(int delta);
+    void suggestionsKey(int key);
+    void openSuggestion(int index, bool inNewTab);
+    static LRESULT CALLBACK suggestionsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+
     // --- find in page ---
     void createFindControl();
     void placeFindEdit(const ChromeLayout& l) const;
@@ -373,6 +401,22 @@ private:
     HWND m_downloadsPanel { nullptr };
     bool m_downloadsVisible { false };
     bool m_hadDownloads { false };
+
+    // --- address bar suggestions ---
+    HWND m_suggestionsPanel { nullptr };
+    std::vector<Suggestion> m_suggestions;
+    int m_suggestionsSelected { -1 }; // driven by the arrow keys
+    int m_suggestionsHover { -1 };    // driven by the mouse
+    int m_suggestionsScroll { 0 };
+    int m_suggestionsWidth { 0 };     // cached panel width; hit tests need it
+    bool m_suggestionsHoverNewTab { false };
+    bool m_suggestionsVisible { false };
+    // Set once the first EN_CHANGE after focusing has been seen. Focusing the
+    // field seeds it with the current URL, which fires EN_CHANGE by itself;
+    // without this the dropdown would cover the page the moment you click the
+    // field, before the user has typed anything.
+    bool m_suggestionsPrimed { false };
+
     int m_downloadsScroll { 0 };
     int m_downloadsHoverRow { -1 };
     bool m_downloadsHoverAction { false };
