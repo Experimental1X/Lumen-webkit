@@ -370,15 +370,25 @@ bool Browser::stepAnimations()
     // is the page that shows it worst, because its two-pane layout is
     // fixed-width, so the whole left column appears to slide.
     //
-    // Do the move here rather than trusting the tick, and do it before
-    // restoring the view, so the tab is never shown at a geometry it is about
-    // to be moved away from. This runs once, on the settled tick: the anim
-    // timer is already dead by then (ensureAnimTimer above), and resize() is
-    // a no-op once every view reports the geometry it wants.
-    if (!m_overview && m_overviewAnim.settled() && m_overviewAnim.value <= 0.0
-        && m_active < m_tabs.size()) {
-        resize(false);
+    // Do the move here rather than trusting the tick, and do it AFTER showing
+    // the view rather than before, so that the child is on screen when it is
+    // moved. resize() now refuses to move a hidden WebKit child at all, so the
+    // old order - resize() then setVisible() - would move nothing and leave the
+    // view parked at pre-overview geometry, which is the settings-left-shift
+    // report all over again. Showing first costs nothing: nothing pumps
+    // messages inside this function, so the paint that ShowWindow asks for
+    // cannot happen until this tick has finished and resize() has moved it.
+    //
+    // This runs once per overview visit. The condition alone would not say that:
+    // Spring::step snaps value to target, so m_overviewAnim.settled() stays true
+    // for the rest of the session, and while any other spring is in flight this
+    // function runs every tick - re-showing the page and re-running resize()
+    // over and over. m_pageRestorePending is what makes it a one-shot.
+    if (m_pageRestorePending && !m_overview && m_overviewAnim.settled()
+        && m_overviewAnim.value <= 0.0 && m_active < m_tabs.size()) {
+        m_pageRestorePending = false;
         m_tabs[m_active]->setVisible(true);
+        resize(false);
     }
 
     return moving;
@@ -714,6 +724,27 @@ void Browser::resize(bool wholeClient)
         for (const auto& tab : m_tabs) {
             HWND viewWindow = tab->hwnd();
             if (!viewWindow)
+                continue;
+
+            // Never move a WebKit child that is not on screen.
+            //
+            // overviewOwnsThePage above already keeps the loop out of the way
+            // while the overview is up, but that guard is about the overview.
+            // The window between the overview closing and stepAnimations()
+            // putting the active view back is exactly a window where the views
+            // are hidden and overviewOwnsThePage has already gone false, so
+            // this loop used to run over all of them - a dozen MoveWindow calls
+            // on hidden children on the very tick that restores the page.
+            //
+            // Repositioning a hidden WebKit child is not safe: it can come back
+            // visible, and when it does it is on top of the view that was
+            // supposed to own the content area, painting its own black with
+            // nothing behind it and nothing queued to repaint. That is a
+            // permanently black page, which is what the recording shows.
+            //
+            // The active view is shown before it is moved instead - see
+            // stepAnimations() - so nothing here ever has to move a hidden one.
+            if (!IsWindowVisible(viewWindow))
                 continue;
 
             // Moving the view already repaints it and invalidates the strip it
@@ -2910,6 +2941,10 @@ void Browser::showOverview()
 
     for (auto& tab : m_tabs)
         tab->setVisible(false);
+
+    // Every view is off screen now, so the one that owns the page when the
+    // overview goes away has to be put back by stepAnimations().
+    m_pageRestorePending = true;
 
     SetFocus(m_window);
     InvalidateRect(m_window, nullptr, FALSE);

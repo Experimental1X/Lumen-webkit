@@ -485,6 +485,10 @@ private:
     int m_overviewScroll { 0 };
     int m_overviewHoverCard { -1 };
     bool m_overviewHoverClose { false };
+    // Set by showOverview(), which hides every tab view, and cleared by the
+    // one-shot in stepAnimations() that puts the active one back. Without it
+    // that restore would re-run on every tick of every later animation.
+    bool m_pageRestorePending { false };
 
     bool m_sidebarVisible { false };
     int m_sidebarMode { 0 };

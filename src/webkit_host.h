@@ -51,6 +51,9 @@ public:
     void loadHtml(const std::string& utf8Html);
     void setVisible(bool visible);
     void focus();
+    // What setVisible() last applied. WebKit re-does the whole attach when told
+    // to, so it must only be told on an actual change.
+    bool m_visible { false };
     void setBackingScale(double scale);
     double zoom() const;
     void setZoom(double factor);

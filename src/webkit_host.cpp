@@ -373,6 +373,32 @@ void WebView::setVisible(bool visible)
     if (!m_view)
         return;
 
+    // Idempotent on purpose, and this is the fix for "the page goes completely
+    // black after the tab overview".
+    //
+    // WKViewSetIsInWindow is not a no-op when the flag is already what it was
+    // asked to be. It re-attaches the view to its window, WebKit drops the
+    // frame it had, and the child goes back to clearing white and then to its
+    // black class background until a new frame arrives. Measured in the
+    // 2026-10-22 recording, that cycle is visible on screen: at t=77.80 the
+    // whole content area is RGB(255,255,255) for one frame, RGB(4,4,4) for the
+    // next, and normal again on the third - and the only thing happening there
+    // is the tab overview closing.
+    //
+    // Nothing needed to repeat this. activateTab() calls it for every tab on
+    // every switch, and stepAnimations() called it for the active one on every
+    // tick once the overview spring had settled - which, because Spring::step
+    // snaps value to target, is a condition that stays true for the rest of the
+    // session. So the attach-then-drop was running several times a second for
+    // as long as any other spring was in flight, and the page spent a good part
+    // of that time showing a background it had not drawn. Once in a while the
+    // next frame never came, and the page stayed black until something else
+    // forced a repaint - the longest measured outage was 7.4 s.
+    if (visible == m_visible)
+        return;
+
+    m_visible = visible;
+
     WKViewSetIsInWindow(m_view.get(), visible);
     if (HWND window = hwnd())
         ShowWindow(window, visible ? SW_SHOW : SW_HIDE);
