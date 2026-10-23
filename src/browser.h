@@ -245,7 +245,8 @@ private:
     void invalidateSidebarColumn();
     void invalidateContentArea();
     RECT contentArea() const;
-    void paintBuffered(HDC target, const RECT& area, const POINT& origin, const std::function<void(HDC)>& draw);
+    void paintBuffered(HDC target, const RECT& area, const POINT& origin, const std::function<void(HDC)>& draw,
+        const RECT* extent = nullptr);
     // Reused back buffer for paintBuffered. A window-sized bitmap is about
     // eight megabytes; making a fresh one per WM_PAINT was costing more than
     // the drawing did, and the flicker came from blitting an untouched area

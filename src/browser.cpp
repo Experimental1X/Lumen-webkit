@@ -2373,8 +2373,26 @@ void Browser::onPaint(HDC target)
         if (update.top < content.bottom)
             paintBuffered(target, content, contentOrigin, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
     } else if (sidebarWidth > 0 && update.left < sidebarWidth && update.top < content.bottom) {
+        // Clip to the update region here, unlike the overview above. The two
+        // panels are the same shape and want opposite things. The overview's
+        // alpha changes across the entire area on every frame of its spring, so
+        // narrowing it buys nothing and a partial composite would leave the page
+        // fill underneath showing through. The sidebar changes only where the
+        // cursor is, and sidebarMove now invalidates just the rows whose
+        // highlight moved, so repainting the whole panel for it was the GDI+
+        // redraw of the backdrop, every site badge, every label and the
+        // segmented control, once per row the cursor crossed.
+        //
+        // Clipping is safe because paintBuffered takes the panel's origin
+        // separately from the area it clips to - that is what it was fixed to
+        // do. The `extent` argument keeps the shared back buffer sized for the
+        // whole panel, since the draw callback still paints all of it.
         const RECT panel { 0, l.totalHeight, sidebarWidth, l.totalHeight + contentHeight };
-        paintBuffered(target, panel, contentOrigin, [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); });
+        RECT area = panel;
+        IntersectRect(&area, &area, &update);
+        if (area.right > area.left && area.bottom > area.top)
+            paintBuffered(target, area, contentOrigin,
+                [&](HDC dc) { paintSidebar(dc, sidebarWidth, contentHeight); }, &panel);
     }
 
     // The chrome is drawn into an off-screen bitmap to avoid flicker. It owns
@@ -2406,7 +2424,7 @@ void Browser::releaseBackBuffer()
 }
 
 void Browser::paintBuffered(HDC target, const RECT& area, const POINT& origin,
-    const std::function<void(HDC)>& draw)
+    const std::function<void(HDC)>& draw, const RECT* extent)
 {
     const int width = area.right - area.left;
     const int height = area.bottom - area.top;
@@ -2417,8 +2435,18 @@ void Browser::paintBuffered(HDC target, const RECT& area, const POINT& origin,
     // edge of the area even when only a corner of it is being painted.
     // area.right and area.bottom are LONG, so the zero has to be LONG as well -
     // std::max cannot deduce a single type across the two.
-    const LONG neededWidth = std::max<LONG>(area.right, 0);
-    const LONG neededHeight = std::max<LONG>(area.bottom, 0);
+    //
+    // `extent` is the whole panel `area` was cut from, and it matters whenever
+    // the caller has narrowed the area. The draw callback always paints the
+    // ENTIRE panel from its own (0,0) - the clip only decides which part of it
+    // lands in the buffer - so sizing the buffer from a clipped area would let
+    // the callback draw off the end of a bitmap that is smaller than the panel.
+    // The buffer is only ever grown, so a full-panel paint already in the
+    // session would have covered it, but "already happened to" is not a size
+    // guarantee and the first paint of a fresh window can be a partial one.
+    const RECT& full = extent ? *extent : area;
+    const LONG neededWidth = std::max<LONG>(full.right, 0);
+    const LONG neededHeight = std::max<LONG>(full.bottom, 0);
 
     // Drawing the chrome into a throwaway bitmap and blitting the result was
     // costing more than the chrome itself: a window-sized bitmap is around
@@ -3587,20 +3615,58 @@ void Browser::sidebarMove(POINT local, int height)
     if (hoverRow == m_sidebarHoverRow && hoverClose == m_sidebarHoverClose)
         return;
 
-    // The previous hover row needs to lose its highlight, the new row needs
-    // to gain one. The actual updated band is at most two row-high slices of
-    // the list plus the footer; repainting the whole window clears the page
-    // area behind the WebView and produces a flicker every time the cursor
-    // crosses a row, so we invalidate the sidebar bounds only.
-    int heightPx = 0;
-    {
+    // Only the two rows that actually changed: the one losing its highlight and
+    // the one gaining it.
+    //
+    // This used to invalidate the whole column, and the comment under it used to
+    // describe that as "the sidebar bounds only" - which is true of the window
+    // but not of the panel. It meant every single row crossing redrew the whole
+    // panel: the backdrop, ten site badges, twenty GDI+ labels, the header band,
+    // and the segmented control with a rounded fill and a rounded stroke on each
+    // of its three segments. Sweeping the cursor down the history list crosses a
+    // row most frames, so that was a full-panel redraw and a full-panel blit
+    // every frame, and the panel visibly stuttered. Moving slowly crosses fewer
+    // rows a second and it all but disappears - which is exactly how it was
+    // reported: negligible, but only visible once the cursor is quick.
+    //
+    // Measured in the 2026-10-22 45fps recording across the 38.7s window where
+    // the sidebar sits open on History: 1712 localised flashes, about 590 of
+    // them inside t=146-162s, spread evenly over all 31 vertical bands of the
+    // panel rather than concentrated on the rows that moved. A highlight
+    // hopping from one row to the next would light up two bands. Lighting up
+    // all of them is the whole panel being redrawn.
+    const int chromeH = chromeHeight();
+
+    // sidebarRow() answers in panel coordinates, and the panel's top-left on the
+    // client is (0, chromeH) - the same origin onPaint hands paintBuffered.
+    RECT oldBand { };
+    RECT newBand { };
+    const auto clientRow = [&](int index, RECT& out) {
+        if (index < 0 || static_cast<size_t>(index) >= sidebarEntries().size())
+            return false;
+        const RECT row = sidebarRow(s, static_cast<size_t>(index));
+        out = RECT { row.left, row.top + chromeH, row.right, row.bottom + chromeH };
+        // A couple of logical pixels of slack, for the antialiased edge of the
+        // rounded highlight sitting on the row's boundary. Overlap onto a
+        // neighbouring row is harmless - that row simply gets redrawn.
+        InflateRect(&out, px(2), px(2));
+        return true;
+    };
+
+    const bool haveOld = clientRow(m_sidebarHoverRow, oldBand);
+    const bool haveNew = clientRow(hoverRow, newBand);
+    if (haveOld && haveNew) {
+        InvalidateRect(m_window, &oldBand, FALSE);
+        InvalidateRect(m_window, &newBand, FALSE);
+    } else {
+        // The list changed shape underneath us - a mode switch, a clear, a
+        // scroll, or the highlight leaving the list entirely. Fall back to the
+        // whole column, which is what this always did.
         RECT client { };
         GetClientRect(m_window, &client);
-        heightPx = std::max(0, static_cast<int>(client.bottom));
+        RECT sidebarArea { 0, chromeH, s.width, std::max(0, static_cast<int>(client.bottom)) };
+        InvalidateRect(m_window, &sidebarArea, FALSE);
     }
-    const int chromeH = chromeHeight();
-    RECT sidebarArea { 0, chromeH, s.width, heightPx };
-    InvalidateRect(m_window, &sidebarArea, FALSE);
 
     m_sidebarHoverRow = hoverRow;
     m_sidebarHoverClose = hoverClose;
