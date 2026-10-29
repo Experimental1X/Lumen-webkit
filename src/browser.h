@@ -300,7 +300,11 @@ private:
     bool ensureOverviewSurface(int width, int height);
     HDC m_overviewDC { nullptr };
     HBITMAP m_overviewBitmap { nullptr };
-    HBITMAP m_overviewPrevious { nullptr };
+    // HGDIOBJ, not HBITMAP. SelectObject returns HGDIOBJ, which is void*, and
+    // void* does not convert implicitly to HBITMAP - that is error C2440, and
+    // it is what the first CI build of this file failed on. m_backPrevious has
+    // always been HGDIOBJ for the same reason.
+    HGDIOBJ m_overviewPrevious { nullptr };
     void* m_overviewBits { nullptr };
     LONG m_overviewWidth { 0 };
     LONG m_overviewHeight { 0 };
