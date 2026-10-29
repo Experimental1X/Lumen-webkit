@@ -211,13 +211,119 @@ void Browser::onTimer(UINT_PTR id)
         reapTabs();
     else if (id == kProgressTimer)
         Downloads::instance().refreshFromDisk();
-    else if (id == kAnimTimer)
-        stepAnimations();
 }
 
 // ---------------------------------------------------------------------------
 // Motion
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// One frame of the animation clock. The display is 60 Hz, so this is the
+// shortest time two consecutive frames can be apart.
+constexpr double kFrameInterval = 1.0 / 60.0;
+
+// How long the message pump is allowed to sleep when nothing is animating.
+// A transition wakes it up by posting a message, so this only has to be long
+// enough to keep the CPU idle between user actions.
+constexpr DWORD kIdleWaitMs = 50;
+
+// How long the pump waits when a frame is on its way to the screen. The paint
+// arrives as a message, so this is only the fallback for the case where the
+// paint is somehow not coming.
+constexpr DWORD kFrameWaitMs = 16;
+
+// The clock the springs run on.
+//
+// GetTickCount64 is not usable for this. It advances once per system timer
+// interrupt, which on a default Windows install is 15.625 ms apart, so dt could
+// only ever be 0, 15.6, 31.2, 46.9 ... no matter how fast the frames actually
+// arrived. The spring itself is time-correct, but its input is a staircase,
+// and a staircase is what reads as judder.
+//
+// Measured in the 2026-10-23 recording (60 fps, 96 s, 22 visits to the tab
+// overview): the overview's own 0.55 s open produced five distinct painted
+// frames, and each one was held on screen for 100-160 ms. The recorder was
+// capturing at 60 Hz the whole time - the frames in between were identical,
+// not missing. So the browser was repainting about six times a second, and
+// the reason was not that the frames were slow to arrive but that the clock
+// they were timed against only ticked nine times a second.
+//
+// QueryPerformanceCounter is the same monotonic clock at nanosecond
+// resolution, and both of its calls are plain reads of user-mode shared data.
+double highResolutionNow()
+{
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    if (frequency.QuadPart <= 0)
+        return 0.0;
+    return static_cast<double>(counter.QuadPart) / static_cast<double>(frequency.QuadPart);
+}
+
+} // namespace
+
+bool Browser::animating() const
+{
+    return !m_sidebarAnim.settled() || !m_panelAnim.settled()
+        || !m_overviewAnim.settled() || !m_findAnim.settled()
+        || !m_addressAnim.settled() || !m_pressAnim.settled();
+}
+
+void Browser::idleTick()
+{
+    // The pump calls this once its message queue has run dry. Nothing else in
+    // the program needs to be told the time has passed at this rate.
+    if (!animating())
+        return;
+
+    const double now = highResolutionNow();
+
+    // A frame has been asked for and has not been drawn yet. Stepping the
+    // springs again now would move the WebKit child a second time for a frame
+    // that has not been seen, and moving it repeatedly is what makes it come
+    // back from the overview black.
+    //
+    // The escape hatch matters: if the paint never arrives - the window was
+    // minimised, or something covered it - the animation must not wait for it
+    // forever. After a fifth of a second it goes ahead anyway.
+    if (m_framePending) {
+        if (now - m_framePendingSince < 0.2)
+            return;
+        m_framePending = false;
+    }
+
+    if (now < m_nextFrameTime)
+        return;
+
+    stepAnimations();
+}
+
+DWORD Browser::millisecondsUntilNextFrame() const
+{
+    // Nothing is animating: sleep until something wakes the pump. syncAnimations
+    // posts a message when it aims a spring, so a transition never has to wait
+    // for this timeout to expire.
+    if (!animating())
+        return kIdleWaitMs;
+
+    // A frame is on its way to the screen. The paint arrives as a message, so
+    // the wait returns the moment it is posted; this timeout is only the
+    // fallback for a paint that never comes.
+    if (m_framePending)
+        return kFrameWaitMs;
+
+    const double now = highResolutionNow();
+    const double remaining = m_nextFrameTime - now;
+    // Never a zero-length wait: the pump would spin. One millisecond is
+    // short enough to be "now" and long enough not to be a busy loop.
+    if (remaining <= 0.0)
+        return 1;
+    if (remaining * 1000.0 > kIdleWaitMs)
+        return kIdleWaitMs;
+    return static_cast<DWORD>(std::ceil(remaining * 1000.0));
+}
 
 bool Browser::Spring::step(double dt, double response, double damping)
 {
@@ -267,40 +373,46 @@ bool Browser::Spring::step(double dt, double response, double damping)
 
 void Browser::syncAnimations()
 {
+    // Was anything moving before the targets were re-aimed? If not, and now
+    // something is, this is the start of a transition and the clock has to be
+    // reset. Without that reset the first tick would measure its dt from the
+    // last tick of whatever happened minutes ago, and Spring::step clamps dt to
+    // half a second - so every transition would complete in one frame and
+    // look like a jump rather than a slide.
+    const bool wasAnimating = animating();
+
     m_sidebarAnim.target = sidebarVisibleNow() ? static_cast<double>(px(kSidebarWidth)) : 0.0;
     m_panelAnim.target = m_downloadsVisible ? 1.0 : 0.0;
     m_overviewAnim.target = m_overview ? 1.0 : 0.0;
     m_findAnim.target = m_findVisible ? 1.0 : 0.0;
     m_addressAnim.target = m_editing ? 1.0 : 0.0;
     m_pressAnim.target = m_pressTarget >= 0 ? 1.0 : 0.0;
-    ensureAnimTimer();
-}
 
-void Browser::ensureAnimTimer()
-{
-    if (!m_window)
-        return;
-
-    const bool busy = !m_sidebarAnim.settled() || !m_panelAnim.settled()
-        || !m_overviewAnim.settled() || !m_findAnim.settled()
-        || !m_addressAnim.settled() || !m_pressAnim.settled();
-
-    if (busy)
-        SetTimer(m_window, kAnimTimer, 16, nullptr);
-    else {
-        KillTimer(m_window, kAnimTimer);
-        m_lastAnimTick = 0;
+    if (!wasAnimating && animating()) {
+        m_lastAnimTime = -1.0;
+        m_nextFrameTime = 0.0;
+        m_framePending = false;
     }
+
+    // Wake the pump up. It sleeps for a long time when nothing is animating,
+    // and a transition that has just been aimed should start on the next frame
+    // rather than up to a poll interval later. WM_NULL is the message for
+    // "nothing in particular"; the window procedure passes it to
+    // DefWindowProcW, which does nothing with it.
+    if (m_window && animating())
+        PostMessageW(m_window, WM_NULL, 0, 0);
 }
 
 bool Browser::stepAnimations()
 {
-    const ULONGLONG now = GetTickCount64();
-    if (m_lastAnimTick == 0)
-        m_lastAnimTick = now;
-
-    const double dt = static_cast<double>(now - m_lastAnimTick) / 1000.0;
-    m_lastAnimTick = now;
+    const double now = highResolutionNow();
+    // The first tick has nothing to measure against, so it invents a plausible
+    // frame time rather than measuring a gap that includes however long the
+    // browser was sitting still before the transition was asked for.
+    double dt = m_lastAnimTime >= 0.0 ? now - m_lastAnimTime : 1.0 / 60.0;
+    m_lastAnimTime = now;
+    if (dt < 0.0)
+        dt = 0.0;
 
     bool moving = false;
     moving |= m_sidebarAnim.step(dt, kLayoutResponse, kLayoutDamping);
@@ -349,8 +461,16 @@ bool Browser::stepAnimations()
         // underneath to repaint and nothing to flash.
         if (m_overview || m_overviewAnim.value > 0.0)
             invalidateContentArea();
-    } else
-        ensureAnimTimer();
+    }
+
+    if (moving) {
+        // A frame has been asked for. The pump must not step the springs again
+        // until it has been drawn - see idleTick() - and the next one is due
+        // one frame interval from now.
+        m_framePending = true;
+        m_framePendingSince = now;
+        m_nextFrameTime = now + kFrameInterval;
+    }
 
     // The moment the overview stops owning the page, the views have to be put
     // back where they belong - and resize() above will not have done it.
@@ -384,14 +504,61 @@ bool Browser::stepAnimations()
     // for the rest of the session, and while any other spring is in flight this
     // function runs every tick - re-showing the page and re-running resize()
     // over and over. m_pageRestorePending is what makes it a one-shot.
-    if (m_pageRestorePending && !m_overview && m_overviewAnim.settled()
-        && m_overviewAnim.value <= 0.0 && m_active < m_tabs.size()) {
-        m_pageRestorePending = false;
-        m_tabs[m_active]->setVisible(true);
-        resize(false);
-    }
+    restorePageIfPending();
+
+    // The tab-select transition is over once the card has reached the page.
+    //
+    // It has to be cleared here rather than when the click happened: the
+    // selection rides on the overview's own closing spring, so the flag is
+    // still set the whole time the overview is fading out, and if it survived
+    // into the next visit the opening would play the previous selection
+    // backwards - a card growing out of the grid every time the overview came
+    // up.
+    if (m_selectIndex >= 0 && !m_overview && m_overviewAnim.value <= 0.0)
+        m_selectIndex = -1;
 
     return moving;
+}
+
+void Browser::restorePageIfPending()
+{
+    // The overview hides every tab view while it is up, so the page only comes
+    // back once the overlay has finished easing away.
+    //
+    // This is a function of its own rather than a block in stepAnimations(),
+    // because stepAnimations() only runs while something is animating. There
+    // is one path where the overview closes with its spring still at rest: the
+    // overview opens and closes inside the same batch of messages, before the
+    // pump has had a chance to tick - a fast double press of the shortcut, or
+    // a click that lands in the same drain as the key that opened it. The
+    // spring's target goes back to 0, it never moves, nothing is animating,
+    // and the page stays hidden for the rest of the session: a black content
+    // area with no way back.
+    //
+    // setOverview() calls this for exactly that case.
+    if (!m_pageRestorePending || m_overview)
+        return;
+
+    if (!m_overviewAnim.settled() || m_overviewAnim.value > 0.0)
+        return;
+
+    if (m_active >= m_tabs.size())
+        return;
+
+    m_pageRestorePending = false;
+
+    // Show before moving, never the other way round: resize() refuses to move
+    // a WebKit child that is not on screen, so moving first would leave the
+    // view parked at the geometry it had before the overview opened.
+    m_tabs[m_active]->setVisible(true);
+    resize(false);
+
+    // The view was hidden for the whole time the overview was up, so SetFocus
+    // on it would have failed - a hidden window cannot take the keyboard. Now
+    // that it is on screen it can, which matters for the page's own key
+    // handling and for the browser's shortcuts.
+    if (!m_editing)
+        m_tabs[m_active]->focus();
 }
 
 void Browser::invalidateContentArea()
@@ -537,12 +704,28 @@ void Browser::updateFont()
 
     HFONT previous = m_font;
     m_font = font;
+    // Every cached measurement was taken with the old font.
+    m_labelWidths.clear();
     if (m_address)
         SendMessageW(m_address, WM_SETFONT, reinterpret_cast<WPARAM>(m_font), TRUE);
     if (m_find)
         SendMessageW(m_find, WM_SETFONT, reinterpret_cast<WPARAM>(m_font), TRUE);
     if (previous)
         DeleteObject(previous);
+}
+
+Gdiplus::REAL Browser::cachedLabelWidth(Gdiplus::Graphics& g, const std::wstring& text)
+{
+    // A GDI+ text layout per card per frame: eleven of them, sixty times a
+    // second, to answer a question that only changes when the font or the
+    // title does. updateFont() empties the cache when the font changes.
+    auto found = m_labelWidths.find(text);
+    if (found != m_labelWidths.end())
+        return found->second;
+
+    const Gdiplus::REAL width = measureLabelWidthGdiPlus(g, m_font, text);
+    m_labelWidths.emplace(text, width);
+    return width;
 }
 
 // ---------------------------------------------------------------------------
@@ -917,8 +1100,27 @@ void Browser::activateTab(size_t index)
     }
 
     m_active = index;
+
+    // While the tab-select transition is running, the page view has to stay
+    // hidden.
+    //
+    // This is the whole reason the tab-select animation was never seen. The
+    // card that grows out of the grid is drawn by this window, into this
+    // window's own content area - and a child window always paints on top of
+    // its parent's painting. So the moment the view is shown, it covers the
+    // card completely, and what the user gets instead of the animation is the
+    // page appearing and then going black while WebKit rebuilds the view.
+    //
+    // Measured in the 2026-10-23 recording: the grid is on screen at t=90.52,
+    // the page is on screen at t=90.77 - while the card is still supposed to
+    // be growing into the content area - and the content area is black from
+    // t=91.03 to t=92.10. The card was never visible at all.
+    //
+    // The view comes back at the end of the transition instead, which is what
+    // stepAnimations() does with m_pageRestorePending.
+    const bool selecting = m_selectIndex >= 0;
     for (size_t i = 0; i < m_tabs.size(); ++i)
-        m_tabs[i]->setVisible(!m_overview && i == index);
+        m_tabs[i]->setVisible(!m_overview && !selecting && i == index);
 
     resize();
     updateWindowTitle();
@@ -2311,7 +2513,7 @@ LRESULT Browser::onCtlColorEdit(HDC dc, HWND control)
 // Painting
 // ---------------------------------------------------------------------------
 
-void Browser::onPaint(HDC target)
+void Browser::onPaint(HDC target, const RECT& requested)
 {
     RECT client { };
     GetClientRect(m_window, &client);
@@ -2326,11 +2528,22 @@ void Browser::onPaint(HDC target)
     // twenty pixels instead of clearing and redrawing a hundred and eighty
     // square centimetres of chrome - which is both the lag and, because the
     // page fill gets rebuilt from scratch, the flicker.
+    //
+    // The region has to come from the paint structure, not from GetUpdateRect.
+    // BeginPaint has already emptied the window's update region by the time
+    // the window procedure runs, so GetUpdateRect reports "nothing to do"
+    // here - and the fallback was to repaint the entire window, on every
+    // single paint, for every frame of an animation. The paint structure
+    // carries the same rectangle and is authoritative.
     RECT update { };
-    if (!GetUpdateRect(m_window, &update, FALSE))
-        update = client;
-    else
+    if (GetUpdateRect(m_window, &update, FALSE)) {
         IntersectRect(&update, &update, &client);
+    } else if (requested.right > requested.left && requested.bottom > requested.top) {
+        update = requested;
+        IntersectRect(&update, &update, &client);
+    } else {
+        update = client;
+    }
 
     const bool overviewUp = m_overview || m_overviewAnim.value > 0.0;
     const int sidebarWidth = sidebarWidthNow();
@@ -2350,7 +2563,7 @@ void Browser::onPaint(HDC target)
     // 35 frames each way at roughly 3Hz - the scroll rate - so the composite was
     // being lost on some paints and not on others, and every paint that lost it
     // showed the bare fill underneath. That is the flicker.
-    if (!overviewUp && update.top < content.bottom) {
+    if (!overviewUp && update.bottom > content.top && update.top < content.bottom) {
         RECT pageArea { std::max<LONG>(update.left, 0), content.top,
             std::min<LONG>(update.right, width), content.bottom };
         if (pageArea.right > pageArea.left && pageArea.bottom > pageArea.top)
@@ -2363,16 +2576,24 @@ void Browser::onPaint(HDC target)
     const POINT contentOrigin { 0, l.totalHeight };
 
     if (overviewUp) {
-        // The whole content area, never content-interior-update. Both panels are
-        // opaque and both are composited out of a buffer in a single BitBlt, so
-        // honouring the update region cannot make either of them cheaper - it can
-        // only make them wrong, because an update region that clipped the
-        // composite left whatever was underneath showing through. paintBuffered
-        // still confines its own drawing to the rectangle it is handed, so this
-        // asks for the full area rather than removing any clipping.
-        if (update.top < content.bottom)
-            paintBuffered(target, content, contentOrigin, [&](HDC dc) { paintOverview(dc, width, contentHeight); });
-    } else if (sidebarWidth > 0 && update.left < sidebarWidth && update.top < content.bottom) {
+        // The whole content area, never content-interior-update. The overview is
+        // opaque and is composited out of a finished surface in a single BitBlt,
+        // so honouring the update region cannot make it cheaper - it can only
+        // make it wrong, because an update region that clipped the composite
+        // left whatever was underneath showing through.
+        //
+        // It also goes straight to the window rather than through the shared
+        // back buffer. The buffer exists for panels that are repainted in
+        // part; the overview is repainted in full, so the buffer was a second
+        // copy of the whole content area on every frame of the animation.
+        //
+        // The overlap test has to be an overlap and not "does the update region
+        // start above the bottom of the content area": the chrome sits above the
+        // content area, so a toolbar hover would otherwise repaint the whole
+        // overview every time the pointer moved.
+        if (update.bottom > content.top && update.top < content.bottom)
+            paintOverview(target, width, contentHeight, contentOrigin);
+    } else if (sidebarWidth > 0) {
         // Clip to the update region here, unlike the overview above. The two
         // panels are the same shape and want opposite things. The overview's
         // alpha changes across the entire area on every frame of its spring, so
@@ -2397,12 +2618,25 @@ void Browser::onPaint(HDC target)
 
     // The chrome is drawn into an off-screen bitmap to avoid flicker. It owns
     // the client's top-left, so its origin is (0,0).
+    //
+    // The chrome's own rectangle goes along as the extent: the draw callback
+    // paints the WHOLE chrome, so the buffer has to be big enough for all of
+    // it even when only a corner is being repainted. Without that the buffer
+    // would be the size of the damaged slice, the chrome would be drawn off
+    // the end of it, and the part of the chrome outside the slice would be
+    // missing from the screen.
     if (update.top < l.totalHeight) {
         const RECT chrome { 0, 0, width, l.totalHeight };
         RECT area = chrome;
         IntersectRect(&area, &area, &update);
-        paintBuffered(target, area, POINT { 0, 0 }, [&](HDC dc) { paintChrome(dc, l); });
+        if (area.right > area.left && area.bottom > area.top)
+            paintBuffered(target, area, POINT { 0, 0 }, [&](HDC dc) { paintChrome(dc, l); }, &chrome);
     }
+
+    // The frame the animation asked for has been drawn, so the springs may be
+    // stepped again. Until this point they are held still, which is what keeps
+    // a single visible frame from moving the WebKit child several times over.
+    m_framePending = false;
 }
 
 void Browser::releaseBackBuffer()
@@ -2965,6 +3199,10 @@ void Browser::showOverview()
         captureThumbnail(*current);
 
     m_overviewScroll = 0;
+    // No selection is in flight while the overview is coming up. The previous
+    // one is cleared on the tick that lands it, but that is not guaranteed to
+    // have run yet.
+    m_selectIndex = -1;
     setOverview(true);
 
     for (auto& tab : m_tabs)
@@ -2983,13 +3221,20 @@ void Browser::hideOverview()
     if (!m_overview)
         return;
 
+    // Dismissed rather than selected, so there is no card to grow out of the
+    // grid. Leaving the selection set would play the last one backwards the
+    // next time the overview opened.
+    m_selectIndex = -1;
+
     // The tab views stay hidden until the overlay has finished easing out, so
     // the page is revealed by the fade instead of snapping in behind it.
     // stepAnimations() is what brings them back.
+    //
+    // The keyboard goes with them. SetFocus on a hidden window does nothing,
+    // so asking for it here would be a no-op - restorePageIfPending() focuses
+    // the view once it is back on screen.
     setOverview(false);
     resize();
-    if (auto* view = active())
-        view->focus();
     InvalidateRect(m_window, nullptr, FALSE);
 }
 
@@ -3034,6 +3279,11 @@ void Browser::setOverview(bool up)
     // No caller writes m_overview directly any more. If a new one appears,
     // route it through here.
     syncAnimations();
+
+    // Closing the overview when its spring never moved leaves nothing to
+    // animate, so stepAnimations() would never run and the page would stay
+    // hidden for good. Restore it here instead.
+    restorePageIfPending();
 }
 
 std::vector<Browser::OverviewCard> Browser::overviewLayout(int width) const
@@ -3097,6 +3347,20 @@ bool Browser::overviewClick(POINT local, int width, int height)
             return true;
         }
         if (PtInRect(&cards[i].card, local)) {
+            // The card that was clicked grows out of the grid into the window
+            // on the way out. That is Safari's tab-select transition, and
+            // without it the overview simply disappears and the page is
+            // abruptly there - which is what "there is no tab select
+            // animation" was describing.
+            //
+            // The transition rides on the overview's own closing spring, so
+            // the grid is still on screen while the card grows, and the card
+            // ends up exactly covering the content area. The live page is
+            // behind it by then, which also hides the one-frame gap WebKit
+            // leaves when a view is re-attached after the overview hid it.
+            m_selectIndex = static_cast<int>(i);
+            m_selectFrom = cards[i].thumb;
+
             // Through setOverview, not a bare flag: this is the path that
             // switches tabs, so it is also the transition out of the overview.
             // See setOverview for what skipping syncAnimations() costs.
@@ -3136,30 +3400,68 @@ void Browser::overviewMove(POINT local, int width)
 
 void Browser::releaseOverviewSurface()
 {
-    delete m_overviewSurface;
-    m_overviewSurface = nullptr;
+    if (m_overviewDC) {
+        if (m_overviewPrevious)
+            SelectObject(m_overviewDC, m_overviewPrevious);
+        DeleteDC(m_overviewDC);
+    }
+    if (m_overviewBitmap)
+        DeleteObject(m_overviewBitmap);
+    m_overviewDC = nullptr;
+    m_overviewPrevious = nullptr;
+    m_overviewBitmap = nullptr;
+    m_overviewBits = nullptr;
+    m_overviewWidth = 0;
+    m_overviewHeight = 0;
 }
 
-void Browser::paintOverview(HDC dc, int width, int height)
+bool Browser::ensureOverviewSurface(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return false;
+
+    if (m_overviewDC && m_overviewWidth >= width && m_overviewHeight >= height)
+        return true;
+
+    releaseOverviewSurface();
+
+    BITMAPINFO info { };
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = static_cast<LONG>(width);
+    // A negative height makes it a top-down DIB, so row zero is the top row and
+    // the coordinates GDI+ is handed need no vertical flip.
+    info.bmiHeader.biHeight = -static_cast<LONG>(height);
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    m_overviewDC = CreateCompatibleDC(nullptr);
+    if (!m_overviewDC)
+        return false;
+
+    m_overviewBitmap = CreateDIBSection(m_overviewDC, &info, DIB_RGB_COLORS,
+        &m_overviewBits, nullptr, 0);
+    if (!m_overviewBitmap) {
+        DeleteDC(m_overviewDC);
+        m_overviewDC = nullptr;
+        return false;
+    }
+
+    m_overviewPrevious = SelectObject(m_overviewDC, m_overviewBitmap);
+    m_overviewWidth = static_cast<LONG>(width);
+    m_overviewHeight = static_cast<LONG>(height);
+    return true;
+}
+
+COLORREF Browser::overviewBackdrop() const
+{
+    return m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232);
+}
+
+void Browser::paintOverview(HDC dc, int width, int height, const POINT& destination)
 {
     if (width <= 0 || height <= 0)
         return;
-
-    // The overlay's background goes down first, before the early-out below and
-    // before anything is composited onto it. Every tab view is hidden the
-    // instant the overview opens, so the buffer's previous contents are all
-    // that is left behind the overlay - and the buffer is never cleared, so
-    // that is usually the window's untouched black. Filling first means the
-    // half-second fade runs against the overlay's own colour instead of
-    // opening a black hole and then filling it in.
-    //
-    // It also clears the previous animation frame, which matters because the
-    // composite below is translucent until the last moment: without this, each
-    // tick blended onto the tick before it and the grid ended up as a stack of
-    // half-transparent copies a pixel or two apart - a doubled card border and
-    // the tab title printed twice.
-    fillSolid(dc, RECT { 0, 0, width, height },
-        m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
 
     // The overview eases in and out, so it is drawn offscreen and composited.
     // The whole grid no longer shares one global fade-and-shrink: that read as
@@ -3169,79 +3471,143 @@ void Browser::paintOverview(HDC dc, int width, int height)
     // Safari instead brings the cards up as a staggered cascade - each arriving
     // a beat after the last, fading in, growing from 90% and settling - with the
     // background already sitting behind them. That is what
-    // paintOverviewContent does now, driven by this same spring, so the
-    // composite at the bottom of this function runs at full strength and all
-    // the motion is per card. The background has always been filled opaquely
-    // above, so nothing shows through while the cards arrive.
+    // paintOverviewContent does now, driven by this same spring.
     const double t = std::clamp(m_overviewAnim.value, 0.0, 1.0);
-    if (t <= 0.002)
+
+    // The tab-select transition rides on the overview's closing spring: the card
+    // that was clicked grows out of the grid into the whole content area while
+    // the grid dims behind it. `close` is how far through that transition we
+    // are - zero at rest, one at the moment the card has become the page.
+    const double close = std::clamp(1.0 - m_overviewAnim.value, 0.0, 1.0);
+    const bool selecting = m_selectIndex >= 0 && close > 0.0;
+
+    // Nothing to draw: the overview is closed and no card is growing. The
+    // content area is left alone - the page is about to be put back over it.
+    if (t <= 0.002 && !selecting)
         return;
 
-    // Compositing needs a scratch surface the size of the content area, and a
-    // 1920-wide one at four bytes a pixel is about seven megabytes. Building
-    // one per paint threw away that much memory a dozen times a second for the
-    // whole time the grid was animating, which is a lot of allocator churn on
-    // the thread that also has to answer clicks. Keep one and grow it only when
-    // the window outgrows it; paintOverviewContent fills the whole surface
-    // before it draws anything, so nothing stale can survive.
-    // GetWidth/GetHeight return Gdiplus::INT, which does not compare cleanly
-    // against plain int under /W4 - the compiler flags a signed/unsigned
-    // mismatch on the comparison. Explicit casts through the same width type
-    // make the intent obvious and the warning go away.
-    const int surfaceWidth = m_overviewSurface
-        ? static_cast<int>(m_overviewSurface->GetWidth()) : 0;
-    const int surfaceHeight = m_overviewSurface
-        ? static_cast<int>(m_overviewSurface->GetHeight()) : 0;
-    if (!m_overviewSurface
-        || surfaceWidth < width
-        || surfaceHeight < height) {
-        releaseOverviewSurface();
-        m_overviewSurface = new Gdiplus::Bitmap(width, height, PixelFormat32bppPARGB);
-        log(L"Overview surface resized.");
-    }
-    if (!m_overviewSurface)
+    if (!ensureOverviewSurface(width, height))
         return;
 
     {
-        Gdiplus::Graphics scratch(m_overviewSurface);
-        scratch.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-        HDC bufferDc = scratch.GetHDC();
-        paintOverviewContent(bufferDc, width, height, t);
-        scratch.ReleaseHDC(bufferDc);
+        Gdiplus::Graphics g(m_overviewDC);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+        // The grid goes down first and fills the whole surface, so the copy to
+        // the window is opaque and every frame starts from a clean surface.
+        // Without that, each tick blended onto the tick before it and the grid
+        // ended up as a stack of half-transparent copies a pixel or two apart -
+        // a doubled card border and the tab title printed twice.
+        paintOverviewContent(g, width, height, t);
+
+        if (selecting) {
+            // Safari pushes the grid it is leaving behind out of the way and
+            // grows the chosen card into the window over the top of it.
+            const BYTE veil = static_cast<BYTE>(
+                std::clamp(0.80 * close, 0.0, 1.0) * 255.0 + 0.5);
+            Gdiplus::SolidBrush veilBrush(toGdiColor(overviewBackdrop(), veil));
+            g.FillRectangle(&veilBrush, 0.0f, 0.0f,
+                static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height));
+            paintSelectingCard(g, width, height, close);
+        }
+
+        g.Flush(Gdiplus::FlushIntentionSync);
     }
 
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-
-    // Full strength, 1:1. The fade and the shrink both moved down into
-    // paintOverviewContent, where they run per card on a stagger, so this
-    // composite has nothing left to animate - it just puts the finished grid
-    // onto the page. ImageAttributes and its ColorMatrix went with it; there is
-    // no global alpha left to apply.
-    g.DrawImage(m_overviewSurface,
-        Gdiplus::RectF(0.0f, 0.0f, static_cast<Gdiplus::REAL>(width),
-            static_cast<Gdiplus::REAL>(height)),
-        0.0f, 0.0f,
-        static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height),
-        Gdiplus::UnitPixel);
+    // One to one and opaque, so a plain copy.
+    //
+    // This used to be a DrawImage with InterpolationModeHighQualityBicubic
+    // across the entire content area, which resampled 1.3 million pixels
+    // through a bicubic filter in order to move them zero pixels. paintOverview
+    // Content fills the surface opaquely before it draws anything, so there is
+    // no alpha for a resample to have to carry.
+    //
+    // It goes straight to the window rather than through the shared back
+    // buffer. The overview is opaque and is repainted in full every frame, so
+    // the buffer bought nothing and cost a second copy of the whole content
+    // area on every frame of the animation - at 1920x700 that is 1.3 million
+    // pixels, sixty times a second, for a picture that was already finished.
+    BitBlt(dc, destination.x, destination.y, width, height, m_overviewDC, 0, 0, SRCCOPY);
 }
 
-void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
+void Browser::paintSelectingCard(Gdiplus::Graphics& g, int width, int height, double progress)
 {
-    const RECT whole { 0, 0, width, height };
-    fillSolid(dc, whole, m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232));
+    if (m_selectIndex < 0 || static_cast<size_t>(m_selectIndex) >= m_tabs.size())
+        return;
 
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    // Cubic ease-out, so it decelerates into the page instead of arriving at a
+    // dead stop. Same curve the cards use when the overview opens.
+    const double e = 1.0 - std::pow(1.0 - std::clamp(progress, 0.0, 1.0), 3.0);
+
+    const Gdiplus::REAL fromLeft = static_cast<Gdiplus::REAL>(m_selectFrom.left);
+    const Gdiplus::REAL fromTop = static_cast<Gdiplus::REAL>(m_selectFrom.top);
+    const Gdiplus::REAL fromRight = static_cast<Gdiplus::REAL>(m_selectFrom.right);
+    const Gdiplus::REAL fromBottom = static_cast<Gdiplus::REAL>(m_selectFrom.bottom);
+
+    const Gdiplus::REAL left = fromLeft + (0.0f - fromLeft) * static_cast<Gdiplus::REAL>(e);
+    const Gdiplus::REAL top = fromTop + (0.0f - fromTop) * static_cast<Gdiplus::REAL>(e);
+    const Gdiplus::REAL right = fromRight
+        + (static_cast<Gdiplus::REAL>(width) - fromRight) * static_cast<Gdiplus::REAL>(e);
+    const Gdiplus::REAL bottom = fromBottom
+        + (static_cast<Gdiplus::REAL>(height) - fromBottom) * static_cast<Gdiplus::REAL>(e);
+
+    const Gdiplus::RectF dest(left, top, right - left, bottom - top);
+    if (dest.Width <= 0.0f || dest.Height <= 0.0f)
+        return;
+
+    HBITMAP bitmap = m_tabs[static_cast<size_t>(m_selectIndex)]->thumbnail();
+    if (!bitmap)
+        return;
+
+    // The card's rounded corners straighten out as it grows into the page.
+    const Gdiplus::REAL radius = static_cast<Gdiplus::REAL>(px(10))
+        * static_cast<Gdiplus::REAL>(1.0 - e);
+
+    Gdiplus::GraphicsPath path;
+    addRoundedRect(path, dest, radius);
+
+    // Fade it in over the live page it is becoming. By the time this reaches
+    // full strength the WebKit view behind it is at exactly this rectangle, so
+    // the last frame of the transition and the first frame of the page are the
+    // same pixels - which is also what covers the one-frame gap WebKit leaves
+    // behind when a view is re-attached after the overview hid it.
+    const BYTE alpha = static_cast<BYTE>(std::clamp(e, 0.0, 1.0) * 255.0 + 0.5);
+
+    Gdiplus::Bitmap image(bitmap, nullptr);
+    Gdiplus::ImageAttributes attributes;
+    attributes.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+    Gdiplus::ColorMatrix matrix { };
+    matrix.m[0][0] = 1.0f;
+    matrix.m[1][1] = 1.0f;
+    matrix.m[2][2] = 1.0f;
+    matrix.m[3][3] = static_cast<Gdiplus::REAL>(alpha / 255.0);
+    matrix.m[4][4] = 1.0f;
+    attributes.SetColorMatrix(&matrix);
+
+    g.SetClip(&path);
+    g.DrawImage(&image, dest, 0.0f, 0.0f,
+        static_cast<Gdiplus::REAL>(image.GetWidth()),
+        static_cast<Gdiplus::REAL>(image.GetHeight()),
+        Gdiplus::UnitPixel, &attributes);
+    g.ResetClip();
+}
+
+void Browser::paintOverviewContent(Gdiplus::Graphics& g, int width, int height, double t)
+{
+    // The grid is drawn into the scratch surface, which has to be opaque from
+    // the very first pixel: the surface is copied to the screen with a straight
+    // blit, and a transparent pixel would come out as whatever was underneath.
+    Gdiplus::SolidBrush backdropBrush(toGdiColor(overviewBackdrop()));
+    g.FillRectangle(&backdropBrush, 0.0f, 0.0f,
+        static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height));
 
     const float k = scaleFactor();
     const int radius = px(10);
     const std::vector<OverviewCard> cards = overviewLayout(width);
-    const COLORREF backdrop = m_theme.dark ? RGB(22, 22, 24) : RGB(226, 226, 232);
+    const COLORREF backdrop = overviewBackdrop();
 
     // The stagger. Every card starts a beat after the last, so the grid fills
     // in as a cascade rather than the whole thing dissolving at once - which is
@@ -3365,7 +3731,7 @@ void Browser::paintOverviewContent(HDC dc, int width, int height, double t)
         // inside a card that is still growing.
         const std::wstring title = tabTitle(view);
         const int iconSize = px(14);
-        const Gdiplus::REAL titleWidth = measureLabelWidthGdiPlus(g, m_font, title);
+        const Gdiplus::REAL titleWidth = cachedLabelWidth(g, title);
         const int textWidth = std::min(static_cast<int>(titleWidth),
             std::max(0, static_cast<int>(card.title.right - card.title.left) - iconSize - px(6)));
         const int groupWidth = iconSize + px(6) + textWidth;

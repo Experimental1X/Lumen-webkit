@@ -51,8 +51,10 @@ public:
     void loadHtml(const std::string& utf8Html);
     void setVisible(bool visible);
     void focus();
-    // What setVisible() last applied. WebKit re-does the whole attach when told
-    // to, so it must only be told on an actual change.
+    // What setVisible() last applied. Kept so a redundant call does not
+    // re-show a window that is already up. It says nothing about the view
+    // being attached: the view is attached once, when it is created, and is
+    // never detached again - see setVisible() in webkit_host.cpp.
     bool m_visible { false };
     void setBackingScale(double scale);
     double zoom() const;

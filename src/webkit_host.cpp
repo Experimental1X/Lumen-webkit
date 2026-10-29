@@ -399,9 +399,62 @@ void WebView::setVisible(bool visible)
 
     m_visible = visible;
 
-    WKViewSetIsInWindow(m_view.get(), visible);
-    if (HWND window = hwnd())
-        ShowWindow(window, visible ? SW_SHOW : SW_HIDE);
+    // ShowWindow only. NEVER WKViewSetIsInWindow here, not even to hide.
+    //
+    // This is the whole fix for the black page, and it is worth being precise
+    // about why, because the obvious alternative - keep the detach and find a
+    // way to ask WebKit for a new frame afterwards - cannot work.
+    //
+    // WKViewSetIsInWindow(view, false) does not pause the view, it takes it
+    // out of the window: the child window and the layer tree behind it are
+    // destroyed, and WKViewSetIsInWindow(view, true) builds new ones. The new
+    // child has nothing to show until WebKit has laid the page out and
+    // rendered it, so it sits on its black class background (RGB 4,4,4) for
+    // the length of that render.
+    //
+    // Measured in the 2026-10-23 recording (60 fps, 134 s, 25 visits to the
+    // tab overview): every single overview close is followed by a run of
+    // completely black content frames, and the run is 13 frames (0.29 s) after
+    // one close, 15 frames after another, 22 frames after another, and 98
+    // frames (2.2 s) after the last one - which is where the recording ends,
+    // so it never came back at all. The colour is RGB(3,3,3) at every one of
+    // them, which is the child's class background and not our fill: our page
+    // colour is RGB(30,30,32).
+    //
+    // Hiding the child window instead leaves the view, its layer tree and its
+    // last rendered frame alone. Windows does not deliver WM_PAINT to a hidden
+    // window, so nothing is rendered while the overview is up - the resource
+    // cost of a hidden tab stays what it was - and when the window is shown
+    // again the layer tree is still there and paints the page straight away.
+    //
+    // The one thing that is given up is the guarantee that a detached view
+    // stops compositing. WebKit composites into the layer tree on its own
+    // schedule and only hands the result to the window when the window asks
+    // for a paint, so a hidden window is not composited either way; only a
+    // page that is actively animating keeps its own timers running.
+    HWND window = hwnd();
+    if (!window)
+        return;
+
+    ShowWindow(window, visible ? SW_SHOW : SW_HIDE);
+
+    if (!visible)
+        return;
+
+    // Paint it now rather than on the next turn of the message pump.
+    //
+    // Showing a window queues a WM_PAINT for it, and that message is only
+    // delivered the next time the queue is drained. When the view comes back
+    // from the overview that is a whole frame later, and the frame in between
+    // shows the window's own background - a black flash, one frame of it,
+    // right where the eye is. UpdateWindow sends the WM_PAINT immediately, so
+    // the page is already there when this call returns.
+    //
+    // This is only safe because the view is never detached any more: with the
+    // layer tree intact, the paint WebKit does in response is the page. When
+    // the view was detached, the same call produced the black background
+    // instead, which is why update-21 gave up on forcing repaints.
+    UpdateWindow(window);
 }
 
 void WebView::focus()

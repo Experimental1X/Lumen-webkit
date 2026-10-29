@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lumen {
@@ -127,7 +128,10 @@ public:
 
     // Window message entry points.
     void onSize();
-    void onPaint(HDC target);
+    // `requested` is the paint structure's rectangle - the area the system
+    // says is stale. It is passed in because BeginPaint has already emptied
+    // the window's update region by the time this runs.
+    void onPaint(HDC target, const RECT& requested);
     void onMouseMove(POINT point);
     void onMouseLeave();
     void onNcMouseMove();
@@ -158,6 +162,14 @@ public:
     int chromeHeight() const;
     bool trackingMouse() const { return m_trackingMouse; }
     void setTrackingMouse(bool value) { m_trackingMouse = value; }
+
+    // The animation clock. The message pump in main.cpp owns the frame rate:
+    // it asks how long to sleep, sleeps, drains the queue, and then calls
+    // idleTick() once the queue has run dry. Nothing in the program runs on a
+    // WM_TIMER any more - see the note on highResolutionNow() in browser.cpp
+    // for why a timer could not carry a 60 Hz animation.
+    DWORD millisecondsUntilNextFrame() const;
+    void idleTick();
 
 private:
     // --- motion ---
@@ -196,7 +208,10 @@ private:
     // while at least one is still travelling.
     bool stepAnimations();
     void syncAnimations();
-    void ensureAnimTimer();
+    // True while any spring is still in flight. The pump uses it to decide
+    // whether to wake up often or back off, so it has to be cheap and it has
+    // to be true the instant syncAnimations() aims something.
+    bool animating() const;
     // Current width of the sidebar, in pixels, mid-transition included.
     int sidebarWidthNow() const;
     // Width the sidebar is heading for. resize() places the web view with this
@@ -209,7 +224,23 @@ private:
     Spring m_overviewAnim;
     Spring m_findAnim;
     Spring m_addressAnim;
-    ULONGLONG m_lastAnimTick { 0 };
+    // Wall clock for the springs, in seconds on the QueryPerformanceCounter
+    // epoch. Negative means "no tick yet", which is what tells the first tick
+    // to invent a plausible dt instead of measuring one.
+    double m_lastAnimTime { -1.0 };
+    // When the next animation frame is due, on the same clock.
+    double m_nextFrameTime { 0.0 };
+    // Set when a tick has asked for a repaint and cleared when the repaint has
+    // actually happened. It stops the springs being advanced again while the
+    // frame they asked for is still waiting to be drawn - which would move the
+    // WebKit child several times for one visible frame, and moving it is what
+    // makes it come back black.
+    bool m_framePending { false };
+    // When the pending frame was asked for, on the same clock. If the paint it
+    // asked for never arrives - a minimised window, a covered window - the
+    // animation must not be allowed to wait for it forever, so this is the
+    // escape hatch.
+    double m_framePendingSince { 0.0 };
     // Index of the toolbar button currently held down, and how far into the
     // press it is. -1 when nothing is pressed.
     int m_pressTarget { -1 };
@@ -257,14 +288,30 @@ private:
     LONG m_backWidth { 0 };
     LONG m_backHeight { 0 };
     void releaseBackBuffer();
-    // Scratch surface for the overview's alpha composite. Compositing needs a
-    // bitmap the size of the content area; allocating one inside every paint
-    // meant roughly seven megabytes a tick, a dozen times a second while the
-    // grid eases in and out.
-    Gdiplus::Bitmap* m_overviewSurface { nullptr };
+    // Scratch surface the overview is drawn into before it goes on screen.
+    //
+    // A plain 32bpp DIB section rather than a Gdiplus::Bitmap: GDI+ has to be
+    // given an HDC to draw into, and the only way to get one out of a Bitmap is
+    // GetHDC/ReleaseHDC around every frame, which converts the bitmap on the
+    // way in and back on the way out. Handing Gdiplus::Graphics a memory DC it
+    // already owns is the fast path, and at 1920x700 sixty times a second the
+    // difference is the whole frame budget.
     void releaseOverviewSurface();
+    bool ensureOverviewSurface(int width, int height);
+    HDC m_overviewDC { nullptr };
+    HBITMAP m_overviewBitmap { nullptr };
+    HBITMAP m_overviewPrevious { nullptr };
+    void* m_overviewBits { nullptr };
+    LONG m_overviewWidth { 0 };
+    LONG m_overviewHeight { 0 };
     void drawLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text, RECT rect, COLORREF color, UINT flags) const;
     int measureLabel(HDC dc, Gdiplus::Graphics& g, const std::wstring& text) const;
+    // measureLabelWidthGdiPlus is a full GDI+ text layout, and the overview asks
+    // for one per card per frame - eleven of them, sixty times a second, to
+    // answer a question that only changes when the font or the title does.
+    // updateFont() empties this.
+    Gdiplus::REAL cachedLabelWidth(Gdiplus::Graphics& g, const std::wstring& text);
+    std::unordered_map<std::wstring, Gdiplus::REAL> m_labelWidths;
 
     // --- address field ---
     void createAddressControl();
@@ -355,18 +402,30 @@ private:
     void showOverview();
     void hideOverview();
     void setOverview(bool up);
+    // Puts the page view back on screen once the overview has finished
+    // easing away. A one-shot, guarded by m_pageRestorePending.
+    void restorePageIfPending();
     void captureThumbnail(WebView& view);
     bool overviewClick(POINT local, int width, int height);
     void overviewMove(POINT local, int width);
-    void paintOverview(HDC dc, int width, int height);
-    // The tab grid itself. paintOverview renders this into an offscreen buffer
-    // first, so the cards can be drawn staggered and transformed without GDI+
-    // having to repaint the live surface mid-transform.
+    // The tab overview. Drawn into its own scratch surface and handed to the
+    // window in one copy, straight to `destination` - the content area's
+    // top-left in client coordinates.
+    void paintOverview(HDC dc, int width, int height, const POINT& destination);
+    COLORREF overviewBackdrop() const;
+    // The tab grid itself, drawn straight into the scratch surface so the cards
+    // can be drawn staggered and transformed without GDI+ having to repaint the
+    // live surface mid-transform.
     //
     // `t` is the same 0..1 spring value paintOverview has: it drives each card's
     // own progress on a stagger, so `t` is the grid as a whole and every card
     // reads a delayed slice of it.
-    void paintOverviewContent(HDC dc, int width, int height, double t);
+    void paintOverviewContent(Gdiplus::Graphics& g, int width, int height, double t);
+    // Safari's tab-select transition: the card that was clicked grows from its
+    // slot in the grid into the whole content area while the grid dims behind
+    // it. Without it the overview simply disappears and the page is abruptly
+    // there, which is what "there is no tab select animation" was describing.
+    void paintSelectingCard(Gdiplus::Graphics& g, int width, int height, double progress);
 
     // --- sidebar (Bookmarks, Reading List, History) ---
     struct SidebarLayout {
@@ -475,9 +534,6 @@ private:
     // stuck on it. Polling covers every active transfer regardless of which
     // path wrote the file.
     static constexpr UINT_PTR kProgressTimer = 2;
-    // Drives the chrome animations at roughly 60 Hz, and is only running while
-    // a spring is actually in flight.
-    static constexpr UINT_PTR kAnimTimer = 3;
     std::vector<ClosedTab> m_closedTabs;
     void reapTabs();
     size_t m_active { 0 };
@@ -490,6 +546,12 @@ private:
     // one-shot in stepAnimations() that puts the active one back. Without it
     // that restore would re-run on every tick of every later animation.
     bool m_pageRestorePending { false };
+    // Which card the tab-select transition is expanding, and the rect it is
+    // growing out of. -1 when no selection is in flight. Cleared on the tick
+    // that lands the transition - it must not survive into the next overview
+    // visit, or the opening would play the previous selection backwards.
+    int m_selectIndex { -1 };
+    RECT m_selectFrom { };
 
     bool m_sidebarVisible { false };
     int m_sidebarMode { 0 };

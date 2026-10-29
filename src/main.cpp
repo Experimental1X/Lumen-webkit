@@ -19,6 +19,13 @@
 #include <string>
 #include <thread>
 
+// Windows 10 1803 added high-resolution waitable timers. The SDK defines this
+// behind a _WIN32_WINNT guard, so spell it out here rather than depend on
+// which SDK the build machine happens to have.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 namespace {
 
 // Writes where a crash happened to lumen.log (module and offset), so a crash
@@ -369,7 +376,7 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         PAINTSTRUCT paint { };
         HDC dc = BeginPaint(window, &paint);
         if (browser)
-            browser->onPaint(dc);
+            browser->onPaint(dc, paint.rcPaint);
         EndPaint(window, &paint);
         return 0;
     }
@@ -563,19 +570,102 @@ int run(HINSTANCE instance, int showCommand)
     SetTimer(window, kPumpTimer, 1000, nullptr);
     std::thread watchdog(pumpWatchdog);
 
+    // The message pump.
+    //
+    // This used to be a plain GetMessageW loop with the animations driven by
+    // a WM_TIMER. Both halves of that were wrong for a 60 Hz animation.
+    //
+    // WM_TIMER is the lowest-priority message in the queue. Timer expiries
+    // that pile up during a slow paint are delivered back to back, so the
+    // first one advances the springs by the whole gap and the next two or
+    // three advance them by nothing at all: one real frame followed by two or
+    // three identical repaints. That reads as judder, and it is the judder
+    // the screen recording shows - the overview's half-second open produced
+    // five distinct painted frames, each held on screen for 100-160 ms.
+    //
+    // And the clock the springs ran on was GetTickCount64, which only advances
+    // once per system timer interrupt - 15.625 ms apart on a default install -
+    // so dt could only ever be a staircase of 0, 15.6, 31.2, 46.9 ms however
+    // fast the frames actually arrived.
+    //
+    // So the pump now owns the frame rate. It asks the browser how long to
+    // sleep, sleeps for that long or until a message arrives, drains the
+    // queue, and then calls idleTick() once the queue has run dry. The
+    // browser measures its own dt with QueryPerformanceCounter, and it holds
+    // the springs still until the frame they asked for has actually been
+    // painted, so one visible frame is one step of the springs.
     MSG message { };
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        pumpRecord(message.message, message.wParam, message.lParam, false);
+    bool quitting = false;
 
-        if (accelerators && TranslateAcceleratorW(window, accelerators, &message)) {
-            pumpRecord(message.message, message.wParam, message.lParam, true);
-            continue;
+    // A high-resolution waitable timer is what makes the frame pacing exact.
+    //
+    // The obvious way to sleep is to hand a timeout to a wait, but a Windows
+    // timeout is quantised to the system timer tick - 15.625 ms on a default
+    // install. Sleeping for "16 ms" would really sleep for 15.6, 31.2 or
+    // 46.9 ms, and a 60 Hz animation paced that way would run at sixteen
+    // frames a second. A high-resolution waitable timer fires to within a
+    // tenth of a millisecond.
+    //
+    // If the system will not create one, the loop still works; it just falls
+    // back to the coarse timeout.
+    HANDLE frameTimer = CreateWaitableTimerExW(nullptr, nullptr,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!frameTimer)
+        frameTimer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+
+    while (!quitting) {
+        // Wait for a message, but wake up on our own when a frame is due.
+        // syncAnimations() posts a message the moment a spring is aimed, so a
+        // transition starts on the very next pass rather than after a poll
+        // interval.
+        const DWORD wait = browser.millisecondsUntilNextFrame();
+        if (frameTimer) {
+            // A negative due time is relative to now, in units of 100 ns.
+            LARGE_INTEGER due { };
+            due.QuadPart = -(static_cast<LONGLONG>(wait) * 10000LL);
+            SetWaitableTimer(frameTimer, &due, 0, nullptr, nullptr, FALSE);
+            MsgWaitForMultipleObjectsEx(1, &frameTimer, FALSE, INFINITE, QS_ALLINPUT);
+        } else {
+            MsgWaitForMultipleObjectsEx(0, nullptr, FALSE, wait, QS_ALLINPUT);
         }
 
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-        pumpRecord(message.message, message.wParam, message.lParam, true);
+        MSG pending { };
+        while (PeekMessageW(&pending, nullptr, 0, 0, PM_REMOVE)) {
+            if (pending.message == WM_QUIT) {
+                message.wParam = pending.wParam;
+                quitting = true;
+                break;
+            }
+
+            pumpRecord(pending.message, pending.wParam, pending.lParam, false);
+
+            if (accelerators && TranslateAcceleratorW(window, accelerators, &pending)) {
+                pumpRecord(pending.message, pending.wParam, pending.lParam, true);
+                continue;
+            }
+
+            TranslateMessage(&pending);
+            DispatchMessageW(&pending);
+            pumpRecord(pending.message, pending.wParam, pending.lParam, true);
+        }
+
+        // The queue has run dry, which is the only moment the browser has
+        // nothing else to do. This is where the frame is drawn.
+        if (!quitting) {
+            browser.idleTick();
+
+            // The system only generates WM_PAINT when the message queue is
+            // otherwise empty, so the invalidation the tick just asked for
+            // would not be painted until the next pass through the loop - one
+            // frame late, every frame. UpdateWindow sends WM_PAINT straight
+            // away, so the frame the springs were stepped for is the frame
+            // that appears.
+            UpdateWindow(window);
+        }
     }
+
+    if (frameTimer)
+        CloseHandle(frameTimer);
 
     KillTimer(window, kPumpTimer);
     g_pumpStopping.store(true, std::memory_order_release);
