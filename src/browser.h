@@ -403,6 +403,15 @@ private:
     };
     std::vector<OverviewCard> overviewLayout(int width) const;
     int overviewMaxScroll(int width, int height) const;
+    // Where the tab overview's grid lives, and how wide it is.
+    //
+    // The grid is in the content area BESIDE the sidebar, not over it. Safari
+    // shows both at once: the sidebar is a column of its own and the grid
+    // fills the rest of the content area. The overview used to be painted
+    // across the whole content area, which hid the sidebar completely - the
+    // "the sidebar closes itself when I open the tab overview" report.
+    int overviewGridLeft() const;
+    int overviewGridWidth(int clientWidth) const;
     void showOverview();
     void hideOverview();
     void setOverview(bool up);
@@ -429,7 +438,8 @@ private:
     // slot in the grid into the whole content area while the grid dims behind
     // it. Without it the overview simply disappears and the page is abruptly
     // there, which is what "there is no tab select animation" was describing.
-    void paintSelectingCard(Gdiplus::Graphics& g, int width, int height, double progress);
+    void paintSelectingCard(Gdiplus::Graphics& g, int gridLeft, int gridWidth,
+        int height, double progress);
 
     // --- sidebar (Bookmarks, Reading List, History) ---
     struct SidebarLayout {

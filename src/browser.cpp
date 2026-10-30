@@ -2207,10 +2207,22 @@ void Browser::onMouseMove(POINT point)
     RECT client { };
     GetClientRect(m_window, &client);
     const POINT local { point.x, point.y - top };
-    if (m_overview)
+    // The sidebar and the overview share the screen now, so the pointer belongs
+    // to whichever one it is over.
+    const bool overSidebar = sidebarVisibleNow() && local.x < sidebarWidthNow();
+    if (m_overview && !overSidebar) {
         overviewMove(local, client.right);
-    else if (sidebarVisibleNow())
+    } else if (sidebarVisibleNow()) {
+        // The pointer left the grid for the sidebar, so no card is under it any
+        // more. Drop the highlight instead of leaving a card lit behind the
+        // panel.
+        if (m_overview && (m_overviewHoverCard != -1 || m_overviewHoverClose)) {
+            m_overviewHoverCard = -1;
+            m_overviewHoverClose = false;
+            invalidateContentArea();
+        }
         sidebarMove(local, std::max(0, static_cast<int>(client.bottom) - top));
+    }
 }
 
 void Browser::onMouseLeave()
@@ -2277,7 +2289,7 @@ bool Browser::onLeftButtonDown(POINT point)
         const int height = std::max(0, static_cast<int>(client.bottom - l.totalHeight));
         const POINT local { point.x, point.y - l.totalHeight };
 
-        if (m_overview)
+        if (m_overview && !(sidebarVisibleNow() && local.x < sidebarWidthNow()))
             return overviewClick(local, client.right, height);
         if (sidebarVisibleNow())
             return sidebarClick(local, height);
@@ -2593,7 +2605,17 @@ void Browser::onPaint(HDC target, const RECT& requested)
         // overview every time the pointer moved.
         if (update.bottom > content.top && update.top < content.bottom)
             paintOverview(target, width, contentHeight, contentOrigin);
-    } else if (sidebarWidth > 0) {
+    }
+
+    // The sidebar paints AFTER the overview, and always - not only when the
+    // overview is down.
+    //
+    // It used to be an `else if`, so the overview replaced it: the sidebar
+    // column was covered by the overview's opaque backdrop and the panel was
+    // simply not drawn. That is the "the sidebar closes itself when I open the
+    // tab overview" report, and it is also why Safari looks different - Safari
+    // shows the sidebar and the tab overview side by side.
+    if (sidebarWidth > 0) {
         // Clip to the update region here, unlike the overview above. The two
         // panels are the same shape and want opposite things. The overview's
         // alpha changes across the entire area on every frame of its spring, so
@@ -3286,6 +3308,24 @@ void Browser::setOverview(bool up)
     restorePageIfPending();
 }
 
+int Browser::overviewGridLeft() const
+{
+    // The sidebar's SETTLED width, not its animated one.
+    //
+    // Two things have to agree on this number. The page view is placed at the
+    // settled width (see resize), so the grid has to start there too or the
+    // tab-select transition would grow the card into a place the page is not.
+    // And the sidebar's backdrop is painted out to the settled width while it
+    // is opening (see paintSidebar), so a grid that started at the animated
+    // width would have its left column painted over.
+    return sidebarSettledWidth();
+}
+
+int Browser::overviewGridWidth(int clientWidth) const
+{
+    return std::max(0, clientWidth - overviewGridLeft());
+}
+
 std::vector<Browser::OverviewCard> Browser::overviewLayout(int width) const
 {
     std::vector<OverviewCard> cards;
@@ -3301,9 +3341,23 @@ std::vector<Browser::OverviewCard> Browser::overviewLayout(int width) const
     const int margin = px(48);
     const int top = px(40);
 
-    const int columns = std::clamp((width - margin * 2 + gap) / (cardWidth + gap), 1, count);
+    // The grid lives to the RIGHT of the sidebar, in the same place the page
+    // view sits, so the two can be on screen at once.
+    //
+    // Safari shows the sidebar and the tab overview together: the sidebar is a
+    // column of the window and the grid fills the content area beside it. The
+    // overview used to be laid out across the WHOLE content area, which put
+    // half the grid underneath the sidebar - and because the overview is
+    // painted opaquely over everything, the sidebar disappeared the moment the
+    // overview came up. That was the "the sidebar closes itself when I open
+    // the tab overview" report, and it is why the grid is offset here rather
+    // than centred.
+    const int gridLeft = overviewGridLeft();
+    const int available = std::max(0, width - gridLeft);
+
+    const int columns = std::clamp((available - margin * 2 + gap) / (cardWidth + gap), 1, count);
     const int gridWidth = columns * cardWidth + (columns - 1) * gap;
-    const int left = (width - gridWidth) / 2;
+    const int left = gridLeft + (available - gridWidth) / 2;
 
     for (int i = 0; i < count; ++i) {
         const int row = i / columns;
@@ -3330,7 +3384,8 @@ int Browser::overviewMaxScroll(int width, int height) const
 
     const int cardWidth = px(260);
     const int rowHeight = cardWidth * 10 / 16 + px(34) + px(28);
-    const int columns = std::clamp((width - px(48) * 2 + px(28)) / (cardWidth + px(28)), 1, count);
+    const int available = std::max(0, width - overviewGridLeft());
+    const int columns = std::clamp((available - px(48) * 2 + px(28)) / (cardWidth + px(28)), 1, count);
     const int rows = (count + columns - 1) / columns;
     const int total = px(40) + rows * rowHeight + px(20);
     return std::max(0, total - height);
@@ -3395,7 +3450,12 @@ void Browser::overviewMove(POINT local, int width)
 
     m_overviewHoverCard = hoverCard;
     m_overviewHoverClose = hoverClose;
-    InvalidateRect(m_window, nullptr, FALSE);
+
+    // Only the content area changed. A whole-window invalidate also repaints
+    // the chrome and the page area behind the web view, and with the sidebar
+    // now on screen beside the overview that meant the panel was redrawn on
+    // every card hover as well.
+    invalidateContentArea();
 }
 
 void Browser::releaseOverviewSurface()
@@ -3463,6 +3523,15 @@ void Browser::paintOverview(HDC dc, int width, int height, const POINT& destinat
     if (width <= 0 || height <= 0)
         return;
 
+    // The grid lives to the right of the sidebar, and the sidebar stays on
+    // screen beside it - Safari shows both at once. So the overview only
+    // covers the region to the right of the sidebar column, and the sidebar
+    // panel paints over the column to its left.
+    const int gridLeft = overviewGridLeft();
+    const int gridWidth = overviewGridWidth(width);
+    if (gridWidth <= 0)
+        return;
+
     // The overview eases in and out, so it is drawn offscreen and composited.
     // The whole grid no longer shares one global fade-and-shrink: that read as
     // a single 0.55s dissolve rather than as animation, and the report was
@@ -3511,7 +3580,7 @@ void Browser::paintOverview(HDC dc, int width, int height, const POINT& destinat
             Gdiplus::SolidBrush veilBrush(toGdiColor(overviewBackdrop(), veil));
             g.FillRectangle(&veilBrush, 0.0f, 0.0f,
                 static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height));
-            paintSelectingCard(g, width, height, close);
+            paintSelectingCard(g, gridLeft, gridWidth, height, close);
         }
 
         g.Flush(Gdiplus::FlushIntentionSync);
@@ -3530,10 +3599,16 @@ void Browser::paintOverview(HDC dc, int width, int height, const POINT& destinat
     // the buffer bought nothing and cost a second copy of the whole content
     // area on every frame of the animation - at 1920x700 that is 1.3 million
     // pixels, sixty times a second, for a picture that was already finished.
+    //
+    // The WHOLE content area is copied, backdrop included. The sidebar paints
+    // over its own column afterwards, so the overview's backdrop is what shows
+    // in the strip between the panel's moving edge and the grid - the same
+    // backdrop the panel itself is drawn against.
     BitBlt(dc, destination.x, destination.y, width, height, m_overviewDC, 0, 0, SRCCOPY);
 }
 
-void Browser::paintSelectingCard(Gdiplus::Graphics& g, int width, int height, double progress)
+void Browser::paintSelectingCard(Gdiplus::Graphics& g, int gridLeft, int gridWidth,
+    int height, double progress)
 {
     if (m_selectIndex < 0 || static_cast<size_t>(m_selectIndex) >= m_tabs.size())
         return;
@@ -3547,10 +3622,14 @@ void Browser::paintSelectingCard(Gdiplus::Graphics& g, int width, int height, do
     const Gdiplus::REAL fromRight = static_cast<Gdiplus::REAL>(m_selectFrom.right);
     const Gdiplus::REAL fromBottom = static_cast<Gdiplus::REAL>(m_selectFrom.bottom);
 
-    const Gdiplus::REAL left = fromLeft + (0.0f - fromLeft) * static_cast<Gdiplus::REAL>(e);
+    // It grows into the GRID region, not into the whole content area: the
+    // column to the left of the grid belongs to the sidebar, and the card must
+    // not grow over it.
+    const Gdiplus::REAL left = fromLeft
+        + (static_cast<Gdiplus::REAL>(gridLeft) - fromLeft) * static_cast<Gdiplus::REAL>(e);
     const Gdiplus::REAL top = fromTop + (0.0f - fromTop) * static_cast<Gdiplus::REAL>(e);
     const Gdiplus::REAL right = fromRight
-        + (static_cast<Gdiplus::REAL>(width) - fromRight) * static_cast<Gdiplus::REAL>(e);
+        + (static_cast<Gdiplus::REAL>(gridLeft + gridWidth) - fromRight) * static_cast<Gdiplus::REAL>(e);
     const Gdiplus::REAL bottom = fromBottom
         + (static_cast<Gdiplus::REAL>(height) - fromBottom) * static_cast<Gdiplus::REAL>(e);
 
@@ -3600,6 +3679,11 @@ void Browser::paintOverviewContent(Gdiplus::Graphics& g, int width, int height, 
     // The grid is drawn into the scratch surface, which has to be opaque from
     // the very first pixel: the surface is copied to the screen with a straight
     // blit, and a transparent pixel would come out as whatever was underneath.
+    //
+    // The backdrop covers the WHOLE content area, not just the grid region. It
+    // is what sits behind the sidebar column while the panel is over it, and
+    // covering only the grid would leave a strip of page fill between the
+    // panel and the first card.
     Gdiplus::SolidBrush backdropBrush(toGdiColor(overviewBackdrop()));
     g.FillRectangle(&backdropBrush, 0.0f, 0.0f,
         static_cast<Gdiplus::REAL>(width), static_cast<Gdiplus::REAL>(height));
@@ -3885,8 +3969,17 @@ void Browser::toggleSidebar()
     m_sidebarHoverRow = -1;
     m_sidebarHoverClose = false;
 
-    if (m_overview)
-        hideOverview();
+    // The overview is NOT closed here.
+    //
+    // It used to be, and that is the whole of the "the sidebar doesn't open
+    // with the tab overview open" report: pressing the sidebar button while
+    // the overview was up tore the overview down instead of opening the
+    // sidebar, so the two could never be on screen together.
+    //
+    // Safari shows them side by side - the sidebar is a column of the window
+    // and the tab grid fills the content area next to it - so that is what
+    // happens now. The grid's layout is offset by the sidebar's width
+    // (overviewGridLeft), which is what makes room for it.
 
     // Let the width spring to its new value rather than jumping the page
     // sideways; resize() reads the interpolated width every frame. The first
